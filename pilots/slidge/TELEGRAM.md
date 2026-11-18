@@ -2,7 +2,7 @@
 
 The opt-in pilot path is `Telegram Bot API ↔ Manolo Telegram bridge ↔ authenticated XMPP IQ ↔ Manolo relay ↔ Pi Durable worker`. It uses the existing BotFather token. Slidgram's documented registration uses Telegram user accounts and MTProto app credentials, not this bot-token flow.
 
-The bridge owns the Telegram token. The relay still owns authorizations, exact private user/chat routes, durable offsets, deduplication, and replies. Telegram user, chat, and update IDs survive the hop unchanged. The XMPP protocol in this spike is a private pair of IQ requests, not a generic XMPP messaging standard or a drop-in adapter for Slidge-WhatsApp rooms. Voice notes and Telegram groups are out of scope for this text pilot.
+The bridge owns the Telegram token. The relay still owns authorizations, exact private user/chat routes, durable offsets, deduplication, and replies. Telegram user, chat, and update IDs survive the hop unchanged. The XMPP protocol in this spike is a private pair of IQ requests, not a generic XMPP messaging standard or a drop-in adapter for Slidge-WhatsApp rooms. Telegram groups remain out of scope. With local speech configured on the bridge, authorized voice notes are transcribed on the bridge and answered with native Ogg/Opus using Telegram `sendVoice`. XMPP moves the file ID, transcript, and reply text, not audio bytes. Notes are limited to 60 seconds and 2 MiB.
 
 ## Run the offline test
 
@@ -28,5 +28,7 @@ Use a private Prosody service with TLS verified by both XMPP clients, dedicated 
 | `MANOLO_XMPP_JID` | Relay account including fixed resource | Bridge account including fixed resource |
 | `MANOLO_XMPP_PEER` | Exact bridge JID | Exact relay JID |
 | `MANOLO_XMPP_PASSWORD` | Relay account password | Bridge account password |
+
+For voice, set `MANOLO_STT_BASE_URL` and `MANOLO_TTS_BASE_URL` on the bridge, with optional `MANOLO_STT_API_KEY` and `MANOLO_TTS_API_KEY`. Keep endpoints fixed and private. Default models are `qwen3-asr-1.7b`, `qwen3-tts-1.7b`, voice `jarvis`; set `MANOLO_STT_MODEL`, `MANOLO_TTS_MODEL`, or `MANOLO_TTS_VOICE` to override. Without XMPP, those speech settings belong on the direct relay instead.
 
 Keep the XMPP accounts on the same domain and distinct. Keep the normal exact private DM route in the relay. The relay binds its existing cursor and sessions to the same numeric bot ID, so changing only the transport can retain context. **Run only one Telegram poller**: do not run the direct adapter and an XMPP bridge against the same bot concurrently. Do not enable a webhook on that bot. No cluster resources or public listener are installed by this pilot.

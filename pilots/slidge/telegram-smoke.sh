@@ -11,7 +11,8 @@ trap cleanup EXIT
 port=$("${compose[@]}" port prosody 5223)
 for ((i = 0; i < 40; i++)); do
   if timeout 1 openssl s_client -connect "$port" -servername localhost -verify_hostname localhost -verify_return_error -CAfile "$ca" </dev/null >/dev/null 2>&1; then
-    TEST_MANOLO_XMPP_SERVICE="xmpps://localhost:${port##*:}" NODE_EXTRA_CA_CERTS="$ca" node --test test/relay.test.mjs
+    TEST_MANOLO_XMPP_SERVICE="xmpps://localhost:${port##*:}" NODE_EXTRA_CA_CERTS="$ca" \
+      node --test --test-concurrency=1 test/relay.test.mjs test/relay-voice.test.mjs
     exit
   fi
   sleep .25

@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createDashboard } from './dashboard.mjs';
+import { createDeviceHandler } from './device-api.mjs';
 import { edgeKey, ID, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
+import { createSpeechFromEnv } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 
@@ -23,7 +25,7 @@ if (config.transports.has('discord') && !discordToken) throw new Error('Set MANO
 const botScope = useXmpp ? process.env.MANOLO_TELEGRAM_BOT_ID : telegramToken?.split(':')[0];
 const telegram = config.transports.has('telegram') && (useXmpp
   ? createTelegramXmppTransport(process.env, stop.signal)
-  : createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL }));
+  : createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL, speech: createSpeechFromEnv(process.env) }));
 const discordScope = config.transports.has('discord') ? Buffer.from(discordToken.split('.')[0], 'base64url').toString('ascii') : null;
 if (discordScope !== null && !SNOWFLAKE.test(discordScope)) throw new Error('Invalid MANOLO_DISCORD_TOKEN format');
 let discordClient;
@@ -34,6 +36,17 @@ try { writerLock.exec('BEGIN EXCLUSIVE'); } catch { throw new Error('Relay data 
 const store = openRelayStore(join(dataDir, 'relay.sqlite'));
 if (telegram) store.bindBot(botScope);
 const dashboard = createDashboard(store.db);
+const devicePath = process.env.MANOLO_DEVICE_CONFIG;
+const deviceConfig = devicePath ? JSON.parse(readFileSync(devicePath, 'utf8')) : null;
+const deviceOwner = subject => `device:${subject}`;
+const device = devicePath ? createDeviceHandler({
+  ...deviceConfig,
+  submit: (subject, agent, id, text) => store.webSubmit(deviceOwner(subject), agent, id, text),
+  get: (subject, agent, id) => store.webTurn(deviceOwner(subject), agent, id),
+}) : null;
+if (device && Object.values(deviceConfig.grants).some(grant => Object.keys(grant).some(agent => !config.agents.has(agent)))) {
+  throw new Error('Device grant references an unknown agent');
+}
 const WEB = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
@@ -177,7 +190,7 @@ function serve(handler, port, host) {
     limits(res, handler === web);
     try {
       const url = new URL(req.url, 'http://local.invalid');
-      if (url.pathname === '/healthz' && req.method === 'GET') return respond(res, 200, { ok: true });
+      if (handler !== device && url.pathname === '/healthz' && req.method === 'GET') return respond(res, 200, { ok: true });
       await handler(req, res, url.pathname);
     } catch (error) {
       if (res.headersSent || res.destroyed) return res.destroy();
@@ -215,8 +228,16 @@ async function runMessage(transport, adapter, job) {
   const advance = (...args) => store.advance(transport, job, ...args);
   if (config.routes.get(routeKey({ transport, userId, chatId })) !== agent) return advance('dead');
   try {
+    if (job.voice_file_id) {
+      const text = await adapter.transcribeVoice(job.voice_file_id, stop.signal);
+      return store.transcribed(job, text);
+    }
     if (job.state === 'send') {
-      await adapter.send({ chatId, userId, eventId: job.event_id, text: job.output }, stop.signal);
+      const delivery = { chatId, userId, eventId: job.event_id, text: job.output,
+        ...(job.reply_message_id != null && { messageId: job.reply_message_id }),
+      };
+      if (job.voice_reply) await adapter.sendVoice(delivery, stop.signal);
+      else await adapter.send(delivery, stop.signal);
       return advance('sent');
     }
     const turn = await worker(agent, id, job.state === 'submit' ? { sessionId, text: job.input } : undefined);
@@ -225,6 +246,8 @@ async function runMessage(transport, adapter, job) {
   } catch (err) {
     if (stop.signal.aborted) return;
     if (isFinal(err)) {
+      if (job.voice_file_id) return store.voiceFallback(job, 'I could not transcribe this voice note. Please try sending text.');
+      if (job.state === 'send' && job.voice_reply) return store.voiceFallback(job, job.output);
       if (job.state !== 'send') return advance('send', 'This turn could not be completed.');
       console.error(`${transport} rejected a delivery`);
       return advance('dead');
@@ -235,7 +258,11 @@ async function runMessage(transport, adapter, job) {
 
 async function runWebTurn(job) {
   const advance = (...args) => store.webAdvance(job, ...args);
-  if (config.owners.get(job.owner)?.agent !== job.agent) return advance('failed');
+  const allowed = job.owner.startsWith('device:')
+    ? Object.hasOwn(deviceConfig?.grants ?? {}, job.owner.slice(7)) &&
+      deviceConfig.grants[job.owner.slice(7)][job.agent]?.includes('submit')
+    : config.owners.get(job.owner)?.agent === job.agent;
+  if (!allowed) return advance('failed');
   try {
     const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? { sessionId: job.session_id, text: job.input } : undefined);
     if (turn.status === 'pending') return advance('wait', null, Date.now() + 500);
@@ -281,6 +308,7 @@ const listeners = [
   serve(web, Number(process.env.PORT ?? 8080), process.env.HOST ?? '127.0.0.1'),
   serve(internal, Number(process.env.MANOLO_INTERNAL_PORT ?? 8082), process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1'),
 ];
+if (device) listeners.push(serve(device, Number(process.env.MANOLO_DEVICE_PORT ?? 8083), process.env.MANOLO_DEVICE_HOST ?? '127.0.0.1'));
 const loops = [drain(store.webReady, runWebTurn)];
 if (telegram) loops.push(pollTelegram(), drain(store.due, job => runMessage('telegram', telegram, job)));
 if (discordScope) loops.push(runDiscord(), drain(now => discordClient ? store.discordReady(now, discordScope) : [], job => runMessage('discord', discordClient, job)));

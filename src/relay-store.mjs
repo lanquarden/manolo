@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { validTranscript, validVoiceFileId } from './speech.mjs';
 import { key, routeKey, SNOWFLAKE } from './relay-config.mjs';
 
 const conflict = () => Object.assign(new Error('Turn ID was already used'), { statusCode: 409 });
@@ -47,9 +48,21 @@ export function openRelayStore(path) {
     );
     CREATE INDEX IF NOT EXISTS relay_inbox_recipient ON relay_inbox(recipient, created_at);
   `);
+  const columns = new Set(db.prepare('PRAGMA table_info(telegram_jobs)').all().map(row => row.name));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!columns.has('voice_file_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_file_id TEXT');
+    if (!columns.has('reply_message_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN reply_message_id INTEGER');
+    if (!columns.has('voice_reply')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_reply INTEGER NOT NULL DEFAULT 0');
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
   const cursor = () => db.prepare('SELECT cursor FROM telegram_state WHERE id=1').get().cursor;
   const add = db.prepare(`INSERT INTO telegram_jobs
-    (update_id,turn_id,session_id,user_id,chat_id,agent,input,state) VALUES (?,?,?,?,?,?,?,'submit')`);
+    (update_id,turn_id,session_id,user_id,chat_id,agent,input,voice_file_id,reply_message_id,voice_reply,state)
+    VALUES (?,?,?,?,?,?,?,?,?,?,'submit')`);
   const active = "('submit','wait','send')";
   const selection = (table, extra, sequence, states) => db.prepare(`SELECT j.* FROM ${table} j WHERE j.state IN ${states} AND j.next_at<=? ${extra}
     AND NOT EXISTS(SELECT 1 FROM ${table} p WHERE p.session_id=j.session_id AND p.${sequence}<j.${sequence} AND p.state IN ${states})
@@ -74,13 +87,18 @@ export function openRelayStore(path) {
       try {
         let next = cursor();
         for (const { updateId, envelope } of updates) {
-          if (!Number.isSafeInteger(updateId) || updateId < next) continue;
+          if (!Number.isSafeInteger(updateId) || updateId < next || updateId >= Number.MAX_SAFE_INTEGER) continue;
           next = updateId + 1;
           if (envelope?.transport !== 'telegram') continue;
           const agent = routes.get(routeKey(envelope));
           if (agent) {
             const session = key('telegram', botScope, envelope.userId, envelope.chatId, agent);
-            add.run(updateId, key(session, updateId), session, envelope.userId, envelope.chatId, agent, envelope.text);
+            const { voiceFileId, messageId, text } = envelope;
+            if (validVoiceFileId(voiceFileId) && envelope.userId === envelope.chatId && Number.isSafeInteger(messageId) && messageId > 0) {
+              add.run(updateId, key(session, updateId), session, envelope.userId, envelope.chatId, agent, '', voiceFileId, messageId, 1);
+            } else if (typeof text === 'string' && text.length > 0 && text.length <= 4000) {
+              add.run(updateId, key(session, updateId), session, envelope.userId, envelope.chatId, agent, text, null, null, 0);
+            }
           }
         }
         db.prepare('UPDATE telegram_state SET cursor=? WHERE id=1').run(next);
@@ -107,12 +125,22 @@ export function openRelayStore(path) {
         ORDER BY j.update_id LIMIT 10`).all(now);
     },
     discordReady(now, bot) { return discordReady.all(now, bot); },
+    transcribed(job, text) {
+      if (!validTranscript(text)) throw new TypeError('Invalid stored transcript');
+      db.prepare(`UPDATE telegram_jobs SET input=?, voice_file_id=NULL, next_at=0, attempts=0 WHERE update_id=? AND voice_file_id IS NOT NULL`)
+        .run(text, job.update_id);
+    },
+    voiceFallback(job, text) {
+      db.prepare(`UPDATE telegram_jobs SET state='send', voice_file_id=NULL, voice_reply=0, output=?, next_at=0, attempts=0 WHERE update_id=?`)
+        .run(text, job.update_id);
+    },
     advance(transport, job, state, output = null, next = 0, attempts = 0) {
       const [table, column, id] = transport === 'telegram'
         ? ['telegram_jobs', 'update_id', job.update_id] : ['discord_jobs', 'seq', job.seq];
-      db.prepare(`UPDATE ${table} SET state=?, output=?, next_at=?, attempts=?,
-        input=CASE WHEN ? IN ('sent','dead') THEN '' ELSE input END WHERE ${column}=?`)
-        .run(state, ['sent', 'dead'].includes(state) ? null : output, next, attempts, state, id);
+      const terminal = ['sent', 'dead'].includes(state);
+      const cleanup = terminal ? ", input=''" + (transport === 'telegram' ? ', voice_file_id=NULL, reply_message_id=NULL, voice_reply=0' : '') : '';
+      db.prepare(`UPDATE ${table} SET state=?, output=?, next_at=?, attempts=?${cleanup} WHERE ${column}=?`)
+        .run(state, terminal ? null : output, next, attempts, id);
     },
     webSubmit(owner, agent, id, text) {
       const turnId = webId(owner, agent, id);
