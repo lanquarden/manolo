@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24 <25" },
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "test": "node --test",
     "relay": "node src/relay.mjs",
@@ -13,6 +15,7 @@
   "dependencies": {
     "@earendil-works/chord": "1.5.2",
     "@earendil-works/pi-ai": "1.5.2",
-    "@earendil-works/pi-durable": "1.5.2"
+    "@earendil-works/pi-durable": "1.5.2",
+    "discord.js": "14.28.1"
   }
 }

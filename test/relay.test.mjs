@@ -50,11 +50,12 @@ function start(t, filename, env) {
 
 const update = (id, user, text, type = 'private') => ({ update_id: id, message: { from: { id: user, is_bot: false }, chat: { id: user, type }, text } });
 
-test('real relay and Pi worker processes: Telegram recovery, private routing, web and inbox boundaries', { timeout: 30000 }, async t => {
+test('real relay and Pi worker processes: message recovery, private routing, web and inbox boundaries', { timeout: 30000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'manolo-relay-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const updates = [update(21, 101, 'primary-route-unique'), update(22, 999, 'denied-user'), update(23, 202, 'canary-route-unique'), update(24, 101, 'denied-group', 'group')];
   const sent = [];
+  const discordSent = [];
   const offsets = [];
   const mock = createServer(async (req, res) => {
     let raw = '';
@@ -64,6 +65,9 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
     if (req.url.endsWith('/getUpdates')) {
       offsets.push(data.offset);
       result = updates.filter(update => update.update_id >= data.offset);
+    } else if (req.url === '/mock-discord-reply') {
+      discordSent.push(data);
+      result = { message_id: discordSent.length };
     } else {
       sent.push(data);
       result = { message_id: sent.length };
@@ -74,6 +78,33 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
   await once(mock, 'listening');
   t.after(() => mock.close());
 
+  // Replace only the Discord adapter boundary in the child. The real routing, worker and
+  // SQLite recovery still run; adapter protocol behavior is covered in discord.test.mjs.
+  const loader = join(root, 'load-fixture.mjs');
+  await writeFile(loader, `import { registerHooks } from 'node:module';
+    registerHooks({ resolve(specifier, context, next) {
+      if (specifier === './discord.mjs' && context.parentURL.endsWith('/src/relay.mjs')) {
+        return { url: new URL('./fake-discord.mjs', import.meta.url).href, shortCircuit: true };
+      }
+      return next(specifier, context);
+    }});`);
+  const userId = '123456789012345678';
+  const chatId = '223456789012345678';
+  const discordEvent = (id, text, user = userId) => ({ transport: 'discord', chatId, userId: user, eventId: `62345678901234567${id}`, text });
+  const discordEvents = [discordEvent(0, 'denied-discord', chatId), discordEvent(1, 'first-discord-turn'), discordEvent(2, 'fixture:history')];
+  await writeFile(join(root, 'fake-discord.mjs'), `export function createDiscordTransport() {
+    const { promise: closed, resolve } = Promise.withResolvers();
+    return { closed, stop: resolve, async start(onEnvelope, signal) {
+      signal.addEventListener('abort', resolve, { once: true });
+      const fixtures = ${JSON.stringify(discordEvents)};
+      for (const envelope of process.env.DISCORD_TEST_FIRST === '1' ? fixtures : fixtures.slice(0, 2)) onEnvelope(envelope);
+      console.log('Discord fixture ready: 1');
+    }, async send(data, signal) {
+      await fetch(${JSON.stringify(`${addr(mock.address().port)}/mock-discord-reply`)}, {
+        method: 'POST', body: JSON.stringify(data), signal,
+      });
+    } };
+  }`);
   const env = { PRIMARY_TOKEN: secret(), CANARY_TOKEN: secret(), OWNER_PASSWORD: secret(), TESTER_PASSWORD: secret() };
   const conf = {
     agents: {
@@ -84,21 +115,26 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
     routes: [
       { transport: 'telegram', userId: '101', chatId: '101', agent: 'primary' },
       { transport: 'telegram', userId: '202', chatId: '202', agent: 'canary' },
+      { transport: 'discord', userId, chatId, agent: 'primary' },
     ],
     inbox: [{ from: 'primary', to: 'canary' }],
   };
   const configPath = join(root, 'relay.json');
   await writeFile(configPath, JSON.stringify(conf));
-  const launchRelay = (port = 0) => start(t, 'relay', {
+  const launchRelay = (port = 0, firstRun = false) => start(t, 'relay', {
     ...env, MANOLO_RELAY_CONFIG: configPath, MANOLO_DATA_DIR: join(root, 'relay'),
     MANOLO_TELEGRAM_TOKEN: '123456:fixture-key-not-real', MANOLO_TELEGRAM_BASE_URL: addr(mock.address().port),
+    MANOLO_DISCORD_TOKEN: `${Buffer.from('999456789012345678').toString('base64url')}.fake.token`,
+    NODE_OPTIONS: `--import=${loader}`, DISCORD_TEST_FIRST: firstRun ? '1' : '0',
     PORT: '0', MANOLO_INTERNAL_PORT: String(port),
   });
-  const first = launchRelay();
+  const first = launchRelay(0, true);
   await first.port(/web listening on .*:(\d+)/);
+  await first.port(/Discord fixture ready: (1)/);
   const relayInternalPort = await first.port(/internal listening on .*:(\d+)/);
   await until(() => offsets.includes(25), 'relay acknowledges four persisted updates before any worker is available');
   assert.deepEqual(sent, []);
+  assert.deepEqual(discordSent, []);
   await first.end('SIGKILL');
 
   for (const [id, token] of [['primary', env.PRIMARY_TOKEN], ['canary', env.CANARY_TOKEN]]) {
@@ -116,6 +152,10 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
   assert.deepEqual(sent.map(m => m.chat_id).sort(), ['101', '202']);
   assert.match(sent.find(m => m.chat_id === '101').text, /primary-route-unique/);
   assert.match(sent.find(m => m.chat_id === '202').text, /canary-route-unique/);
+  await until(() => discordSent.length >= 2, 'both Discord deliveries');
+  assert.deepEqual(discordSent.map(m => [m.userId, m.chatId, m.eventId]), discordEvents.slice(1).map(e => [e.userId, e.chatId, e.eventId]));
+  assert.equal(discordSent[0].text, 'Fixture: first-discord-turn');
+  assert.deepEqual(JSON.parse(discordSent[1].text), ['first-discord-turn'], 'Discord continues its own conversation, not Telegram');
   assert.equal((await request(conf.agents.canary.url, '/v1/turns/x', bearer(env.PRIMARY_TOKEN))).status, 401);
   assert.equal((await request(web, '/', {})).status, 401);
   const owner = basic('owner', env.OWNER_PASSWORD);
@@ -133,6 +173,12 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
     return payload.status === 'done' && payload;
   }, 'browser completion');
   assert.match(turn.text, /browser-only/);
+  const history = async (base, auth) => (await (await request(base, '/api/turns', auth)).json()).turns;
+  assert.deepEqual((await history(web, owner)).map(({ id, text, status, reply }) => ({ id, text, status, reply })), [
+    { id: 'web-turn', text: 'browser-only', status: 'done', reply: turn.text },
+  ]);
+  assert.deepEqual(await history(web, tester), []);
+  assert.equal((await request(web, '/api/turns', owner, 'POST', { id: 'web-turn', text: 'wrong replay' }, mutation)).status, 409);
 
   const event = { to: 'canary', text: 'For review only' };
   const idem = { 'idempotency-key': 'sample-1' };
@@ -168,4 +214,29 @@ test('real relay and Pi worker processes: Telegram recovery, private routing, we
   const publication = await (await request(web, '/api/dashboard/publish', owner, 'POST', { revision: draft.revision }, mutation)).json();
   assert.deepEqual(publication.current.spec, spec);
   assert.deepEqual(sent.map(m => m.chat_id).sort(), ['101', '202'], 'browser and inbox do not trigger Telegram delivery');
+
+  // Leave a durable browser turn parked behind an unavailable canary, kill the relay before
+  // the worker accepts it, then restart. The caller never resubmits POST.
+  await relay.end();
+  const canaryUrl = conf.agents.canary.url;
+  conf.agents.canary.url = addr(2);
+  await writeFile(configPath, JSON.stringify(conf));
+  const parked = launchRelay(relayInternalPort);
+  const parkedWeb = addr(await parked.port(/web listening on .*:(\d+)/));
+  const queued = await request(parkedWeb, '/api/turns', tester, 'POST', { id: 'parked', text: 'durable browser request' }, mutation);
+  assert.deepEqual(await queued.json(), { status: 'pending' });
+  assert.deepEqual((await history(parkedWeb, tester)).map(({ id, status }) => [id, status]), [['parked', 'pending']]);
+  await parked.end('SIGKILL');
+  conf.agents.canary.url = canaryUrl;
+  await writeFile(configPath, JSON.stringify(conf));
+  const recovered = launchRelay(relayInternalPort);
+  const recoveredWeb = addr(await recovered.port(/web listening on .*:(\d+)/));
+  const canaryHistory = await until(async () => {
+    const h = await history(recoveredWeb, tester);
+    return h[0]?.status === 'done' && h;
+  }, 'browser turn completes after relay restart');
+  assert.match(canaryHistory[0].reply, /durable browser request/);
+  assert.equal((await history(recoveredWeb, owner)).length, 3);
+  assert.equal((await request(recoveredWeb, '/api/turns/parked', owner)).status, 404);
+  assert.equal(discordSent.length, 2, 'replayed gateway events do not send a second reply');
 });

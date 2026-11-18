@@ -95,6 +95,19 @@ li + li { margin-block-start: .5rem; }
   overflow: auto;
 }
 
+#chat-log > li + li {
+  border-block-start: 1px solid GrayText;
+  padding-block-start: .5rem;
+}
+
+.chat-answer {
+  margin-block-start: .25rem;
+  border-inline-start: .2rem solid GrayText;
+  padding-inline-start: .5rem;
+}
+
+.chat-turn-state { font-style: italic; }
+
 [role="status"]:empty { margin: 0; }
 
 .visually-hidden {

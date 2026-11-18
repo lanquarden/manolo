@@ -153,74 +153,138 @@ const chatStatus = byId('chat-status');
 const chatLog = byId('chat-log');
 const sendButton = byId('send-chat');
 const checkButton = byId('check-turn');
-let activeTurn;
+const refreshHistoryButton = byId('refresh-chat');
+const HISTORY_LIMIT = 30;
+let turns = new Map();
+let unconfirmedTurn;
+let historyLoaded = false;
 let chatBusy = false;
 
-function appendChat(sender, text) {
-  const row = document.createElement('li');
-  row.append(textNode('strong', sender), textNode('div', text, 'plain-text'));
-  chatLog.append(row);
-  if (chatLog.childElementCount > 50) chatLog.firstElementChild.remove();
+function pendingTurn() {
+  return [...turns.values()].findLast((turn) => turn.status === 'pending');
+}
+
+function setChatBusy(busy) {
+  chatBusy = busy;
+  const pending = pendingTurn();
+  // Serialize history loads, submits and checks; a snapshot can't overwrite a newer reply.
+  refreshHistoryButton.disabled = busy;
+  sendButton.disabled = busy || !historyLoaded || Boolean(pending);
+  checkButton.disabled = busy;
+  checkButton.hidden = !pending;
+}
+
+function idleChatStatus() {
+  if (pendingTurn()) return 'A reply is pending. Use “Check reply” before sending another message.';
+  return turns.size ? '' : 'No saved messages yet.';
+}
+
+function renderHistory() {
+  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ text, status, reply }) => {
+    const row = document.createElement('li');
+    row.append(textNode('strong', 'You'), textNode('div', text, 'plain-text'));
+    const answer = document.createElement('div');
+    answer.className = 'chat-answer';
+    answer.append(textNode('strong', 'Manolo'));
+    if (status === 'done') {
+      answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
+    } else {
+      const message = status === 'failed' ? 'Turn failed.' : 'Reply pending.';
+      answer.append(textNode('div', message, 'chat-turn-state'));
+      if (status === 'failed' && reply) answer.append(textNode('div', reply, 'plain-text'));
+    }
+    row.append(answer);
+    return row;
+  });
+  chatLog.replaceChildren(...rows);
   chatLog.scrollTop = chatLog.scrollHeight;
 }
 
-async function runTurn(submit) {
-  if (chatBusy || !activeTurn) return;
-  chatBusy = true;
-  sendButton.disabled = checkButton.disabled = chatInput.disabled = true;
-  chatStatus.textContent = 'Waiting for Manolo…';
-  const turn = activeTurn;
-  const path = `/api/turns/${encodeURIComponent(turn.id)}`;
+async function refreshHistory() {
+  if (chatBusy) return;
+  setChatBusy(true);
+  chatStatus.textContent = 'Loading chat history…';
   try {
-    let reply = submit ? await api('/api/turns', 'POST', turn) : await api(path);
+    const history = await api('/api/turns');
+    const saved = new Map(history.turns.map((turn) => [turn.id, turn]));
+    const notSaved = unconfirmedTurn && !saved.has(unconfirmedTurn.id);
+    if (notSaved && !chatInput.value) chatInput.value = unconfirmedTurn.text;
+    unconfirmedTurn = undefined;
+    turns = saved;
+    historyLoaded = true;
+    renderHistory();
+    chatStatus.textContent = notSaved
+      ? 'The last submission was not found in history. Review before retrying. ' + idleChatStatus()
+      : idleChatStatus();
+  } catch (error) {
+    chatStatus.textContent = `${failure(error)} Use “Refresh history” to try again.`;
+  } finally {
+    setChatBusy(false);
+  }
+}
+
+function recordTurnStatus(turn, result) {
+  if (!['done', 'failed', 'pending'].includes(result?.status)) throw new Error('Unexpected turn status');
+  if (unconfirmedTurn?.id === turn.id) unconfirmedTurn = undefined;
+  if (result.status === 'pending') return;
+  turns.set(turn.id, { ...turn, status: result.status, reply: typeof result.text === 'string' ? result.text : undefined });
+  while (turns.size > HISTORY_LIMIT) turns.delete(turns.keys().next().value);
+  renderHistory();
+}
+
+async function runTurn(turn, submit) {
+  setChatBusy(true);
+  chatStatus.textContent = 'Waiting for Manolo…';
+  const { id, text } = turn;
+  const path = `/api/turns/${encodeURIComponent(id)}`;
+  try {
+    let result = submit ? await api('/api/turns', 'POST', { id, text }) : await api(path);
+    recordTurnStatus(turn, result);
     const deadline = performance.now() + POLL_WINDOW_MS;
-    for (let count = 0; reply?.status === 'pending' && count < MAX_POLLS; count++) {
+    for (let count = 0; result.status === 'pending' && count < MAX_POLLS; count++) {
       if (deadline - performance.now() <= POLL_INTERVAL_MS) break;
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       const remaining = Math.floor(deadline - performance.now());
       if (remaining <= 0) break;
-      reply = await api(path, 'GET', undefined, Math.min(REQUEST_TIMEOUT_MS, remaining));
+      result = await api(path, 'GET', undefined, Math.min(REQUEST_TIMEOUT_MS, remaining));
+      recordTurnStatus(turn, result);
     }
-    if (reply?.status === 'done') {
-      appendChat('Manolo', typeof reply.text === 'string' ? reply.text : '(No reply text.)');
-      activeTurn = null;
-      chatStatus.textContent = '';
-    } else if (reply?.status === 'failed') {
-      activeTurn = null;
-      chatStatus.textContent = typeof reply.text === 'string' && reply.text ? reply.text : 'Turn failed.';
-    } else if (reply?.status === 'pending') {
-      chatStatus.textContent = 'Still waiting. Use “Check reply” to check the same turn.';
-    } else {
-      throw new Error('Unexpected turn status');
-    }
+    chatStatus.textContent = idleChatStatus();
   } catch (error) {
-    const rejected = error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
-    if (rejected) {
-      activeTurn = null;
-      if (!chatInput.value) chatInput.value = turn.text;
+    const rejected = error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
+    if (submit && unconfirmedTurn?.id === id && rejected) {
+      unconfirmedTurn = undefined;
+      turns.delete(id);
+      if (!chatInput.value) chatInput.value = text;
+      renderHistory();
     }
-    chatStatus.textContent = failure(error) + (activeTurn ? ' Use “Check reply” to check the same turn.' : '');
+    chatStatus.textContent = failure(error) + (pendingTurn() ? ' Use “Check reply” or “Refresh history”.' : '');
   } finally {
-    chatBusy = false;
-    sendButton.disabled = checkButton.disabled = chatInput.disabled = false;
-    checkButton.hidden = !activeTurn;
+    setChatBusy(false);
   }
 }
 
 byId('chat-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const text = chatInput.value.trim();
-  if (chatBusy || !text) return;
+  if (chatBusy || !historyLoaded || pendingTurn() || !text) return;
   if (typeof crypto.randomUUID !== 'function') {
     chatStatus.textContent = 'Chat requires HTTPS or localhost.';
     return;
   }
-  activeTurn = { id: crypto.randomUUID(), text };
-  appendChat('You', text);
+  const turn = { id: crypto.randomUUID(), text, status: 'pending' };
+  turns.set(turn.id, turn);
+  unconfirmedTurn = turn;
   chatInput.value = '';
-  void runTurn(true);
+  renderHistory();
+  void runTurn(turn, true);
 });
-checkButton.addEventListener('click', () => { void runTurn(false); });
+checkButton.addEventListener('click', () => {
+  const turn = pendingTurn();
+  if (!chatBusy && turn) void runTurn(turn, false);
+});
+refreshHistoryButton.addEventListener('click', refreshHistory);
 
 void refreshDashboard();
 void refreshInbox();
+void refreshHistory();

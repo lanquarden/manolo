@@ -22,6 +22,7 @@ agents:
     storage: 2Gi
     provider: ""
     model: ""
+    instructions: "" # Non-secret behavior instructions; changing this restarts only this worker.
     fixture: false
   canary:
     image: ""
@@ -30,4 +31,5 @@ agents:
     storage: 2Gi
     provider: ""
     model: ""
+    instructions: ""
     fixture: false

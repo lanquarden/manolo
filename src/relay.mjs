@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createDashboard } from './dashboard.mjs';
-import { edgeKey, ID, key, loadRelayConfig, routeKey } from './relay-config.mjs';
+import { edgeKey, ID, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 
@@ -13,9 +13,14 @@ const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG);
 const dataDir = process.env.MANOLO_DATA_DIR;
 if (!dataDir) throw new Error('Set MANOLO_DATA_DIR');
 const telegramToken = process.env.MANOLO_TELEGRAM_TOKEN;
-if (config.routes.size && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for Telegram routes');
-const telegram = telegramToken && createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL });
+const discordToken = process.env.MANOLO_DISCORD_TOKEN;
+if (config.transports.has('telegram') && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for Telegram routes');
+if (config.transports.has('discord') && !discordToken) throw new Error('Set MANOLO_DISCORD_TOKEN for Discord routes');
+const telegram = config.transports.has('telegram') && createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL });
 const botScope = telegramToken?.split(':')[0];
+const discordScope = config.transports.has('discord') ? Buffer.from(discordToken.split('.')[0], 'base64url').toString('ascii') : null;
+if (discordScope !== null && !SNOWFLAKE.test(discordScope)) throw new Error('Invalid MANOLO_DISCORD_TOKEN format');
+let discordClient;
 process.umask(0o077);
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 const writerLock = new DatabaseSync(join(dataDir, 'writer-lock.sqlite'), { timeout: 0 });
@@ -119,8 +124,13 @@ async function web(req, res, path) {
   }
   if (req.method === 'GET' && path === '/api/dashboard') return respond(res, 200, dashboard.state(owner.agent));
   if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, { messages: store.messages(owner.agent) });
+  if (req.method === 'GET' && path === '/api/turns') return respond(res, 200, { turns: store.webHistory(owner.name, owner.agent) });
   const turn = /^\/api\/turns\/([A-Za-z0-9_-]{1,128})$/.exec(path);
-  if (req.method === 'GET' && turn) return respond(res, 200, await worker(owner.agent, key('web', owner.name, owner.agent, turn[1])));
+  if (req.method === 'GET' && turn) {
+    const result = store.webTurn(owner.name, owner.agent, turn[1]);
+    if (!result) throw fail(404);
+    return respond(res, 200, result);
+  }
   if (req.method === 'POST' || req.method === 'PUT') {
     if (req.headers['x-manolo-request'] !== '1') throw fail(403);
     if (req.method === 'PUT' && path === '/api/dashboard/draft') return respond(res, 200, dashboard.draft(owner.agent, await readJson(req, 256 * 1024)));
@@ -133,9 +143,7 @@ async function web(req, res, path) {
     if (req.method === 'POST' && path === '/api/turns') {
       const body = await readJson(req);
       if (!ownFields(body, 'id', 'text') || typeof body.id !== 'string' || !ID.test(body.id) || !isText(body.text)) throw fail(400);
-      return respond(res, 200, await worker(owner.agent, key('web', owner.name, owner.agent, body.id), {
-        sessionId: key('web-session', owner.name, owner.agent), text: body.text,
-      }));
+      return respond(res, 200, store.webSubmit(owner.name, owner.agent, body.id, body.text));
     }
   }
   throw fail(404);
@@ -194,35 +202,73 @@ async function pollTelegram() {
   }
 }
 
-async function runJob(job) {
+const isFinal = err => err.permanent || (err.statusCode >= 400 && err.statusCode < 500 && ![408, 429].includes(err.statusCode));
+const retryAt = attempts => Date.now() + Math.min(2 ** Math.min(attempts, 9) * 1000, 300_000);
+
+async function runMessage(transport, adapter, job) {
   const { agent, user_id: userId, chat_id: chatId, turn_id: id, session_id: sessionId } = job;
-  if (config.routes.get(routeKey({ transport: 'telegram', userId, chatId })) !== agent) return store.advance(job, 'dead');
+  const advance = (...args) => store.advance(transport, job, ...args);
+  if (config.routes.get(routeKey({ transport, userId, chatId })) !== agent) return advance('dead');
   try {
     if (job.state === 'send') {
-      await telegram.send({ chatId, text: job.output }, stop.signal);
-      return store.advance(job, 'sent');
+      await adapter.send({ chatId, userId, eventId: job.event_id, text: job.output }, stop.signal);
+      return advance('sent');
     }
     const turn = await worker(agent, id, job.state === 'submit' ? { sessionId, text: job.input } : undefined);
-    if (turn.status === 'pending') return store.advance(job, 'wait', null, Date.now() + 1000);
-    return store.advance(job, 'send', turn.text || 'The agent returned no text.');
+    if (turn.status === 'pending') return advance('wait', null, Date.now() + 1000);
+    return advance('send', turn.text || 'The agent returned no text.');
   } catch (err) {
     if (stop.signal.aborted) return;
-    if (err.permanent || (job.state !== 'send' && err.statusCode >= 400 && err.statusCode < 500 && ![408, 429].includes(err.statusCode))) {
-      if (job.state !== 'send') return store.advance(job, 'send', 'This turn could not be completed.');
-      console.error(`Telegram delivery rejected for update ${job.update_id}`);
-      return store.advance(job, 'dead');
+    if (isFinal(err)) {
+      if (job.state !== 'send') return advance('send', 'This turn could not be completed.');
+      console.error(`${transport} rejected a delivery`);
+      return advance('dead');
     }
-    const attempts = job.attempts + 1;
-    const backoff = Math.min(2 ** Math.min(attempts, 9) * 1000, 300_000);
-    store.advance(job, job.state, job.output, Date.now() + backoff, attempts);
+    advance(job.state, job.output, retryAt(job.attempts + 1), job.attempts + 1);
   }
 }
 
-async function drainTelegram() {
+async function runWebTurn(job) {
+  const advance = (...args) => store.webAdvance(job, ...args);
+  if (config.owners.get(job.owner)?.agent !== job.agent) return advance('failed');
+  try {
+    const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? { sessionId: job.session_id, text: job.input } : undefined);
+    if (turn.status === 'pending') return advance('wait', null, Date.now() + 500);
+    advance(turn.status, turn.status === 'done' ? turn.text : null);
+  } catch (err) {
+    if (stop.signal.aborted) return;
+    if (isFinal(err)) return advance('failed');
+    advance(job.state, null, retryAt(job.attempts + 1), job.attempts + 1);
+  }
+}
+
+async function drain(read, run) {
   while (!stop.signal.aborted) {
-    const jobs = store.due(Date.now());
-    await Promise.all(jobs.map(runJob));
+    await Promise.all(read(Date.now()).map(run));
     await sleep(350, undefined, { signal: stop.signal });
+  }
+}
+
+async function runDiscord() {
+  const { createDiscordTransport } = await import('./discord.mjs');
+  while (!stop.signal.aborted) {
+    const adapter = createDiscordTransport({ token: discordToken });
+    try {
+      await adapter.start(envelope => {
+        if (stop.signal.aborted) return;
+        try { store.ingestDiscord(envelope, config.routes, discordScope); }
+        catch { console.error('Discord message could not be persisted'); process.exit(1); }
+      }, stop.signal);
+      if (stop.signal.aborted) break;
+      discordClient = adapter;
+      await adapter.closed;
+    } catch {
+      if (!stop.signal.aborted) console.error('Discord connection failed; retrying');
+    } finally {
+      discordClient = undefined;
+      await adapter.stop();
+    }
+    if (!stop.signal.aborted) await sleep(30_000, undefined, { signal: stop.signal });
   }
 }
 
@@ -230,7 +276,9 @@ const listeners = [
   serve(web, Number(process.env.PORT ?? 8080), process.env.HOST ?? '127.0.0.1'),
   serve(internal, Number(process.env.MANOLO_INTERNAL_PORT ?? 8082), process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1'),
 ];
-const loops = telegram ? [pollTelegram(), drainTelegram()] : [];
+const loops = [drain(store.webReady, runWebTurn)];
+if (telegram) loops.push(pollTelegram(), drain(store.due, job => runMessage('telegram', telegram, job)));
+if (discordScope) loops.push(runDiscord(), drain(now => discordClient ? store.discordReady(now, discordScope) : [], job => runMessage('discord', discordClient, job)));
 for (const loop of loops) loop.catch(() => { if (!stop.signal.aborted) { console.error('Relay loop stopped unexpectedly'); process.exit(1); } });
 for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => {
   if (stop.signal.aborted) return;

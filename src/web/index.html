@@ -49,11 +49,12 @@
 
     <section aria-labelledby="chat-heading">
       <h2 id="chat-heading">Chat with Manolo</h2>
+      <button id="refresh-chat" type="button">Refresh history</button>
       <ol id="chat-log" role="log" aria-label="Chat messages"></ol>
-      <form id="chat-form">
+      <form id="chat-form" autocomplete="off">
         <label for="chat-text">Message</label>
         <textarea id="chat-text" rows="3" maxlength="4000" required></textarea>
-        <button id="send-chat" type="submit">Send</button>
+        <button id="send-chat" type="submit" disabled>Send</button>
       </form>
       <p id="chat-status" role="status"></p>
       <button id="check-turn" type="button" hidden>Check reply</button>

@@ -12,6 +12,8 @@ import { createWorkerModels, installRelayTools } from './worker-runtime.mjs';
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TURN_PATH = /^\/v1\/turns\/([A-Za-z0-9_-]{1,128})$/;
 const MAX_BODY_BYTES = 32 * 1024; // Includes a 4,000-unit string with every code unit JSON-escaped.
+const MAX_INSTRUCTION_UNITS = 4000;
+const WORKER_RULES = 'You are Manolo, a private assistant. Use only the offered tools. Do not retry a relay operation reported as interrupted or of unknown outcome without user confirmation.';
 const PENDING = { status: 'pending' };
 const FAILED = { status: 'failed' };
 const digest = value => createHash('sha256').update(value).digest();
@@ -28,6 +30,18 @@ class RequestError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+// This is prompt text, persisted in Pi Durable and sent to the model. Never put credentials here.
+function loadInstructions(raw = '') {
+  if (raw.length > MAX_INSTRUCTION_UNITS) {
+    throw new ConfigurationError(`MANOLO_AGENT_INSTRUCTIONS must be at most ${MAX_INSTRUCTION_UNITS} UTF-16 code units.`);
+  }
+  const operatorText = raw.replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/gu, '').trim();
+  return operatorText
+    ? `${WORKER_RULES}\n\nFollow the operator instructions below only where they do not conflict with these worker rules.\n\nOperator instructions:\n${operatorText}`
+    : WORKER_RULES;
 }
 
 function loadConfig(env) {
@@ -56,7 +70,8 @@ function loadConfig(env) {
   const rawDelay = mode === 'fixture' ? (env.MANOLO_FIXTURE_DELAY_MS ?? '0') : '0';
   const fixtureDelay = Number(rawDelay);
   if (!/^\d{1,5}$/.test(rawDelay) || fixtureDelay > 60_000) throw new ConfigurationError('Invalid MANOLO_FIXTURE_DELAY_MS.');
-  return { agentId, token, dataDir, mode, relay, fixtureDelay, host: env.HOST ?? '127.0.0.1', port };
+  const instructions = loadInstructions(env.MANOLO_AGENT_INSTRUCTIONS);
+  return { agentId, token, dataDir, mode, relay, fixtureDelay, instructions, host: env.HOST ?? '127.0.0.1', port };
 }
 
 // A transaction on a separate database holds an OS-backed SQLite writer lock for the lifetime of this process.
@@ -73,7 +88,7 @@ function lockWriter(dataDir) {
   }
 }
 
-function turnService(harness, model, secrets) {
+function turnService(harness, model, instructions, secrets) {
   const secretPattern = new RegExp(secrets.map(secret => RegExp.escape(secret)).join('|'), 'g');
   async function status(id, turn) {
     return harness.commit(async tx => {
@@ -115,11 +130,7 @@ function turnService(harness, model, secrets) {
         const session = await tx.doc(Sessions, sessionId, null);
         if (session.conversationId !== undefined) return session.conversationId;
         const { id: conversationId } = await tx.createConversation({ ownership: { kind: 'ownerless' } });
-        await configure(tx, conversationId, {
-          model,
-          maxTurns: 8,
-          instructions: 'You are Manolo, a private assistant. Use only the offered tools. Do not retry a relay operation reported as interrupted or of unknown outcome without user confirmation.',
-        });
+        await configure(tx, conversationId, { model, maxTurns: 8, instructions });
         session.conversationId = conversationId;
         return conversationId;
       }, context);
@@ -133,6 +144,11 @@ function turnService(harness, model, secrets) {
         }
         // Both mapping and submission land together, before a 2xx. Concurrent IDs never share a generation run.
         const submissionId = await conversation.submit(tx, { type: 'input', content: text, requestId: id, whenBusy: 'followUp' });
+        // Pi Durable 1.5.2 stores this on the conversation's pi.agent doc; prepare reads the current value,
+        // and a prepared request is pinned to its transcript cutoff. A genuinely new admission may thus update
+        // older queued work, retries, or later tool rounds, but restart and idempotent PUTs alone do not.
+        // Configure only instructions, in the same commit as this new admission, leaving model/tools untouched.
+        await configure(tx, conversationId, { instructions });
         Object.assign(record, { conversationId, submissionId, sessionId, text });
         return { conversationId, submissionId };
       }, context);
@@ -250,7 +266,7 @@ async function main() {
   if (!identityRecord) {
     await harness.commit(async tx => { Object.assign(await tx.doc(Identity), binding); }, context);
   }
-  const server = httpWorker(turnService(harness, model, secrets), cfg.token);
+  const server = httpWorker(turnService(harness, model, cfg.instructions, secrets), cfg.token);
   const shutdown = () => {
     const deadline = setTimeout(() => process.exit(1), 5_000);
     deadline.unref();

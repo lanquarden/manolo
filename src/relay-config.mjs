@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 export const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TG_ID = /^[1-9][0-9]{0,15}$/;
+export const SNOWFLAKE = /^[1-9][0-9]{16,19}$/;
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/;
 export const key = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 export const routeKey = ({ transport, userId, chatId }) => JSON.stringify([transport, userId, chatId]);
@@ -57,7 +58,12 @@ export function loadRelayConfig(path, env = process.env) {
   invariant(Array.isArray(raw.routes) && Array.isArray(raw.inbox), 'Expected routes and inbox arrays');
   for (const entry of raw.routes) {
     object(entry, 'route', ['transport', 'userId', 'chatId', 'agent']);
-    invariant(entry.transport === 'telegram' && typeof entry.userId === 'string' && TG_ID.test(entry.userId) && entry.chatId === entry.userId && Number.isSafeInteger(Number(entry.userId)), 'Configure an exact Telegram private user/chat pair');
+    const { transport, userId, chatId } = entry;
+    if (transport === 'telegram') {
+      invariant(typeof userId === 'string' && TG_ID.test(userId) && chatId === userId && Number.isSafeInteger(Number(userId)), 'Configure an exact Telegram private user/chat pair');
+    } else if (transport === 'discord') {
+      invariant(typeof userId === 'string' && SNOWFLAKE.test(userId) && typeof chatId === 'string' && SNOWFLAKE.test(chatId), 'Configure exact Discord user and DM channel snowflakes as strings');
+    } else throw new Error('Unknown transport in route');
     const id = routeKey(entry);
     invariant(!routes.has(id), 'Duplicate transport route');
     routes.set(id, agentId(entry.agent));
@@ -70,5 +76,5 @@ export function loadRelayConfig(path, env = process.env) {
     invariant(from !== to, 'Inbox edges must connect different agents');
     inbox.add(edgeKey(from, to));
   }
-  return { agents, owners, routes, inbox };
+  return { agents, owners, routes, inbox, transports: new Set(raw.routes.map(route => route.transport)) };
 }

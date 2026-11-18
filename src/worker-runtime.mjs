@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai';
+import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage } from '@earendil-works/pi-ai';
 import { defineExtension, defineTool, ProviderDoc } from '@earendil-works/pi-durable';
 
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
@@ -19,10 +19,18 @@ export async function createWorkerModels(cfg, env) {
   if (cfg.mode === 'fixture') {
     const models = createModels();
     const faux = fauxProvider({ provider: 'manolo-fixture', models: [{ id: 'fixture', input: ['text'] }] });
+    const inspectSetup = env.MANOLO_FIXTURE_INSPECT_SETUP === '1';
     const answer = async ({ messages }, options) => {
       if (cfg.fixtureDelay) await sleep(cfg.fixtureDelay, undefined, { signal: options?.signal });
       const inputs = messages.filter(message => message.role === 'user').map(message => contentText(message.content));
       const text = inputs.at(-1) ?? '';
+      if (inspectSetup && text === 'fixture:setup') {
+        const system = getCurrentSystemMessage(messages);
+        // Inspect what arrived at the fixture provider, without echoing prompt text, env or auth options.
+        const instructionsSha256 = createHash('sha256').update(system?.sections?.instructions ?? '').digest('hex');
+        const tools = system?.toolsAdded?.map(tool => tool.name) ?? [];
+        return fauxAssistantMessage(JSON.stringify({ instructionsSha256, tools }));
+      }
       if (text === 'fixture:history') return fauxAssistantMessage(JSON.stringify(inputs.slice(0, -1)));
       if (text === 'fixture:fail') {
         return fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'Fixture failure' });

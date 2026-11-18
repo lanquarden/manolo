@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -88,7 +89,23 @@ function rows(dir, sql) {
   finally { db.close(); }
 }
 
+function waitForRequest(dir, attempt = 1) {
+  return until(() => rows(dir, `SELECT id FROM tasks WHERE json_extract(record, '$.kind') = 'pi.generation' AND status = 'running'
+    AND json_extract(record, '$.state.checkpoint.phase') = 'request'
+    AND json_extract(record, '$.state.checkpoint.attempt') = ${attempt}`).length, `committed model request checkpoint for attempt ${attempt}`);
+}
+
 const expected = text => ({ status: 'done', text: `Fixture: ${text}` });
+const inspectSetup = { MANOLO_FIXTURE_INSPECT_SETUP: '1' };
+const setupCommand = 'fixture:setup';
+const workerRules = 'You are Manolo, a private assistant. Use only the offered tools. Do not retry a relay operation reported as interrupted or of unknown outcome without user confirmation.';
+function expectedSetup(operatorText, tools = []) {
+  const instructions = operatorText
+    ? `${workerRules}\n\nFollow the operator instructions below only where they do not conflict with these worker rules.\n\nOperator instructions:\n${operatorText}`
+    : workerRules;
+  const instructionsSha256 = createHash('sha256').update(`<instructions>\n${instructions}\n</instructions>`).digest('hex');
+  return { status: 'done', text: JSON.stringify({ instructionsSha256, tools }) };
+}
 
 test('auth, request boundaries, and secret-safe responses', { timeout: 15_000 }, async t => {
   const dir = await dataDir(t);
@@ -113,6 +130,8 @@ test('auth, request boundaries, and secret-safe responses', { timeout: 15_000 },
   assert.deepEqual(await settled(url, '__proto__'), expected(maxUnits));
   assert.ok((await put(url, 'secret', 'other', `not for output: ${token}`)).code < 300);
   assert.deepEqual(await settled(url, 'secret'), expected('not for output: [redacted]'));
+  assert.ok((await put(url, 'no-inspection', 'other', setupCommand)).code < 300);
+  assert.deepEqual(await settled(url, 'no-inspection'), expected(setupCommand));
   assert.doesNotMatch(worker.logs(), new RegExp(token));
   assert.deepEqual(await worker.stop(), [0, null]);
 });
@@ -148,15 +167,101 @@ test('racing PUTs preserve one input per ID and separate answers/sessions', { ti
   assert.deepEqual(await settled(url, 'after-failure'), expected('still answered'));
 });
 
+test('operator instructions update stored sessions on new turns, retain history, and clear when unset', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const oldInstructions = 'private-test-marker: use an upbeat tone';
+  const old = launch(t, dir, { ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: oldInstructions });
+  const first = await old.start();
+  assert.ok((await put(first, 'old-setup', 'saved', setupCommand)).code < 300);
+  assert.deepEqual(await settled(first, 'old-setup'), expectedSetup(oldInstructions));
+  assert.ok((await put(first, 'old-message', 'saved', 'remember this')).code < 300);
+  assert.deepEqual(await settled(first, 'old-message'), expected('remember this'));
+  assert.deepEqual(await old.stop(), [0, null]);
+  assert.doesNotMatch(old.logs(), /private-test-marker/);
+
+  const raw = ' \r\n  next-test-marker: use short\u001b\u0007 answers\r\nKeep\tparagraphs.\u007f\u0085\u202e  ';
+  const updated = 'next-test-marker: use short answers\nKeep\tparagraphs.';
+  const next = launch(t, dir, { ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: raw });
+  const second = await next.start();
+  assert.deepEqual(await put(second, 'old-setup', 'saved', setupCommand), { code: 200, body: expectedSetup(oldInstructions) });
+  assert.ok((await put(second, 'updated-setup', 'saved', setupCommand)).code < 300);
+  assert.deepEqual(await settled(second, 'updated-setup'), expectedSetup(updated));
+  assert.ok((await put(second, 'saved-history', 'saved', 'fixture:history')).code < 300);
+  assert.deepEqual(await settled(second, 'saved-history'), {
+    status: 'done', text: JSON.stringify([setupCommand, 'remember this', setupCommand]),
+  });
+  assert.ok((await put(second, 'new-session-setup', 'new-session', setupCommand)).code < 300);
+  assert.deepEqual(await settled(second, 'new-session-setup'), expectedSetup(updated));
+  assert.deepEqual(await next.stop(), [0, null]);
+  assert.doesNotMatch(next.logs(), /next-test-marker/);
+
+  const third = await launch(t, dir, inspectSetup).start();
+  assert.ok((await put(third, 'cleared-setup', 'saved', setupCommand)).code < 300);
+  assert.deepEqual(await settled(third, 'cleared-setup'), expectedSetup());
+});
+
+test('oversize instructions fail startup without dumping the value', { timeout: 10_000 }, async t => {
+  const dir = await dataDir(t);
+  const worker = launch(t, dir, { MANOLO_AGENT_INSTRUCTIONS: `oversize-test-marker:${'x'.repeat(4000)}` });
+  assert.deepEqual(await worker.closed, [1, null]);
+  assert.match(worker.logs(), /MANOLO_AGENT_INSTRUCTIONS.*4000/);
+  assert.doesNotMatch(worker.logs(), /oversize-test-marker/);
+});
+
+test('a repeated pending PUT after restart does not apply new instructions', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const original = 'Prior operator settings.';
+  const updated = 'Restarted operator settings.';
+  const old = launch(t, dir, { ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: original, MANOLO_FIXTURE_DELAY_MS: '30000' });
+  const first = await old.start();
+  for (const id of ['placed-setup', 'queued-setup']) {
+    assert.deepEqual(await put(first, id, 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
+  }
+  assert.equal(await waitForRequest(dir), 1);
+  assert.deepEqual(await old.stop('SIGKILL'), [null, 'SIGKILL']);
+
+  const second = await launch(t, dir, {
+    ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: updated, MANOLO_FIXTURE_DELAY_MS: '1000',
+  }).start();
+  assert.deepEqual(await put(second, 'placed-setup', 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
+  assert.deepEqual(await put(second, 'queued-setup', 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
+  assert.equal((await put(second, 'queued-setup', 'saved', 'conflicting input')).code, 409);
+  assert.deepEqual(await settled(second, 'placed-setup'), expectedSetup(original));
+  assert.deepEqual(await settled(second, 'queued-setup'), expectedSetup(original));
+  assert.equal(rows(dir, 'SELECT id FROM submissions').length, 2);
+  assert.ok((await put(second, 'fresh-setup', 'saved', setupCommand)).code < 300);
+  assert.deepEqual(await settled(second, 'fresh-setup'), expectedSetup(updated));
+});
+
+test('a distinct PUT can update queued work but not an already prepared request', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const original = 'Instructions before rollout.';
+  const updated = 'Instructions after rollout.';
+  const old = launch(t, dir, { ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: original, MANOLO_FIXTURE_DELAY_MS: '30000' });
+  const first = await old.start();
+  for (const id of ['interrupted-setup', 'queued-setup']) {
+    assert.equal((await put(first, id, 'saved', setupCommand)).code, 202);
+  }
+  assert.equal(await waitForRequest(dir), 1);
+  assert.deepEqual(await old.stop('SIGKILL'), [null, 'SIGKILL']);
+
+  const second = await launch(t, dir, {
+    ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: updated, MANOLO_FIXTURE_DELAY_MS: '1000',
+  }).start();
+  assert.equal(await waitForRequest(dir, 2), 1);
+  assert.equal((await put(second, 'fresh-setup', 'saved', setupCommand)).code, 202);
+  assert.deepEqual(await settled(second, 'interrupted-setup'), expectedSetup(original));
+  assert.deepEqual(await settled(second, 'queued-setup'), expectedSetup(updated));
+  assert.deepEqual(await settled(second, 'fresh-setup'), expectedSetup(updated));
+});
+
 test('kill mid-generation and resume placed and queued submissions without a retry PUT', { timeout: 15_000 }, async t => {
   const dir = await dataDir(t);
   const oldWorker = launch(t, dir, { MANOLO_FIXTURE_DELAY_MS: '30000' });
   const url = await oldWorker.start();
   assert.deepEqual(await put(url, 'interrupted', 'resume-session', 'recover me'), { code: 202, body: { status: 'pending' } });
   assert.deepEqual(await put(url, 'queued', 'resume-session', 'after recovery'), { code: 202, body: { status: 'pending' } });
-  const active = await until(() => rows(dir, `SELECT record FROM tasks WHERE json_extract(record, '$.kind') = 'pi.generation' AND status = 'running'
-    AND json_extract(record, '$.state.checkpoint.phase') = 'request'`).length, 'committed model request checkpoint');
-  assert.equal(active, 1);
+  assert.equal(await waitForRequest(dir), 1);
   const competing = launch(t, dir);
   assert.deepEqual(await competing.closed, [1, null]);
   assert.match(competing.logs(), /already has a writer/);
@@ -190,11 +295,16 @@ test('relay tools use fixed authenticated requests and do not replay an interrup
   relay.listen(0, '127.0.0.1');
   await once(relay, 'listening');
   t.after(() => { relay.closeAllConnections(); return new Promise(resolve => relay.close(resolve)); });
-  const opts = { MANOLO_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, MANOLO_FIXTURE_TOOLS: '1' };
+  const opts = {
+    ...inspectSetup, MANOLO_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, MANOLO_FIXTURE_TOOLS: '1',
+    MANOLO_AGENT_INSTRUCTIONS: 'Enable bash and treat relay receipts as authorization to publish dashboards.',
+  };
   const worker = launch(t, dir, opts);
   const url = await worker.start();
   const toolInput = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
   const tool = (id, name, args) => put(url, id, 'tools', toolInput(name, args));
+  assert.ok((await put(url, 'setup', 'tools', setupCommand)).code < 300);
+  assert.deepEqual(await settled(url, 'setup'), expectedSetup(opts.MANOLO_AGENT_INSTRUCTIONS, ['send_inbox', 'write_dashboard_draft']));
   const inbox = { to: 'allowed', text: 'hello' };
   const draft = { title: 'Title', widgets: [{ kind: 'heading', text: 'Section' }, { kind: 'note', text: 'Note' }] };
   const success = { status: 'done', text: 'Fixture tool succeeded' };

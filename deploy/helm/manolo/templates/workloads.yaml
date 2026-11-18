@@ -99,6 +99,9 @@ spec:
             {{- else }}
             - {name: MANOLO_AGENT_ID, value: {{ $w.agentId | quote }}}
             - {name: MANOLO_RELAY_URL, value: "http://manolo-relay:8082"}
+            {{- with $w.instructions }}
+            - {name: MANOLO_AGENT_INSTRUCTIONS, value: {{ . | quote }}}
+            {{- end }}
             {{- if $w.fixture }}
             - {name: MANOLO_MODE, value: fixture}
             {{- else }}
