@@ -1,0 +1,33 @@
+# Image fields must be immutable digests. The canary can be promoted independently.
+relayImage: ""
+relaySecret: manolo-relay
+relayStorage: 1Gi
+storageClassName: longhorn
+# The PoC uses Basic Auth; expose through HTTPS or kubectl port-forward only.
+# A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
+webIngressFrom: []
+relayConfig:
+  owners:
+    owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
+    tester: {agent: canary, passwordEnv: MANOLO_TESTER_PASSWORD}
+  routes: []
+  inbox:
+    - {from: primary, to: canary}
+
+agents:
+  primary:
+    image: ""
+    secret: manolo-primary
+    tokenEnv: MANOLO_PRIMARY_TOKEN
+    storage: 2Gi
+    provider: ""
+    model: ""
+    fixture: false
+  canary:
+    image: ""
+    secret: manolo-canary
+    tokenEnv: MANOLO_CANARY_TOKEN
+    storage: 2Gi
+    provider: ""
+    model: ""
+    fixture: false

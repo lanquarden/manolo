@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manolo</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="page-header">
+    <h1>Manolo</h1>
+  </header>
+  <main>
+    <section aria-labelledby="dashboard-heading">
+      <h2 id="dashboard-heading">Dashboard</h2>
+      <p id="dashboard-status" role="status"></p>
+      <fieldset id="dashboard-controls">
+        <legend class="visually-hidden">Dashboard controls</legend>
+        <button id="refresh-dashboard" type="button">Refresh dashboard</button>
+
+        <h3>Published dashboard</h3>
+        <div id="published-dashboard" class="dashboard-view"><p>Loading…</p></div>
+
+        <h3>Draft preview</h3>
+        <div id="draft-dashboard" class="dashboard-view"><p>Loading…</p></div>
+        <button id="publish-dashboard" type="button" disabled>Publish draft</button>
+
+        <details>
+          <summary>Edit draft JSON</summary>
+          <form id="draft-form">
+            <label for="draft-spec">Dashboard spec</label>
+            <p id="draft-help">Use a title (up to 120 characters) and up to 20 note or heading widgets (up to 2,000 characters each). No links or HTML.</p>
+            <textarea id="draft-spec" rows="9" spellcheck="false" required aria-describedby="draft-help">{
+  "title": "Manolo at home",
+  "widgets": [
+    { "kind": "heading", "text": "Today" },
+    { "kind": "note", "text": "Write a short update here." }
+  ]
+}</textarea>
+            <button type="submit">Save draft</button>
+          </form>
+        </details>
+
+        <h3>Revision history</h3>
+        <ul id="dashboard-history"></ul>
+      </fieldset>
+    </section>
+
+    <section aria-labelledby="chat-heading">
+      <h2 id="chat-heading">Chat with Manolo</h2>
+      <ol id="chat-log" role="log" aria-label="Chat messages"></ol>
+      <form id="chat-form">
+        <label for="chat-text">Message</label>
+        <textarea id="chat-text" rows="3" maxlength="4000" required></textarea>
+        <button id="send-chat" type="submit">Send</button>
+      </form>
+      <p id="chat-status" role="status"></p>
+      <button id="check-turn" type="button" hidden>Check reply</button>
+    </section>
+
+    <section aria-labelledby="inbox-heading">
+      <h2 id="inbox-heading">Inbox</h2>
+      <button id="refresh-inbox" type="button">Refresh inbox</button>
+      <p id="inbox-status" role="status"></p>
+      <ul id="inbox"></ul>
+    </section>
+  </main>
+  <noscript><p>Manolo needs JavaScript to load the dashboard and chat.</p></noscript>
+</body>
+</html>

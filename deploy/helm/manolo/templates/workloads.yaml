@@ -1,0 +1,171 @@
+{{- define "manolo.image" -}}
+{{- if not (regexMatch "^[^[:space:]@]+@sha256:[a-f0-9]{64}$" .) -}}
+{{- fail "Manolo requires an immutable image reference ending in @sha256:<digest>" -}}
+{{- end -}}
+{{- . -}}
+{{- end -}}
+{{- $entries := dict -}}
+{{- range $id, $agent := .Values.agents -}}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,31}$" $id) -}}{{ fail "Agent IDs must be Kubernetes name segments" }}{{- end -}}
+{{- $_ := set $entries $id (dict "url" (printf "http://manolo-%s:8081" $id) "tokenEnv" $agent.tokenEnv) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: manolo-relay
+  namespace: {{ .Release.Namespace }}
+data:
+  relay.json: {{ (merge (dict "agents" $entries) .Values.relayConfig) | mustToJson | quote }}
+{{- $workloads := list (dict "name" "manolo-relay" "kind" "relay" "image" .Values.relayImage "secret" .Values.relaySecret "storage" .Values.relayStorage "port" 8080) -}}
+{{- range $id, $agent := .Values.agents -}}
+{{- if eq $id "relay" }}{{ fail "relay is a reserved agent ID" }}{{ end -}}
+{{- $workloads = append $workloads (merge (dict "name" (printf "manolo-%s" $id) "kind" "worker" "agentId" $id "port" 8081) $agent) -}}
+{{- end -}}
+{{- range $w := $workloads }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $w.name }}-data
+  namespace: {{ $.Release.Namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $.Values.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ $w.storage | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $w.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ $w.name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: {{ $w.name }}, manolo.lan/component: {{ $w.kind }} }
+      {{- if eq $w.kind "relay" }}
+      annotations:
+        manolo.lan/config-checksum: {{ (merge (dict "agents" $entries) $.Values.relayConfig) | mustToJson | sha256sum }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 25
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $w.kind }}
+          image: {{ include "manolo.image" $w.image | quote }}
+          args: ["node", "src/{{ $w.kind }}.mjs"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          ports:
+            - {name: http, containerPort: {{ $w.port }}}
+            {{- if eq $w.kind "relay" }}
+            - {name: internal, containerPort: 8082}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            failureThreshold: 30
+            periodSeconds: 2
+          envFrom:
+            - secretRef: {name: {{ $w.secret }}}
+          env:
+            - {name: HOME, value: /data}
+            - {name: PORT, value: {{ $w.port | quote }}}
+            {{- if eq $w.kind "relay" }}
+            - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
+            - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- else }}
+            - {name: MANOLO_AGENT_ID, value: {{ $w.agentId | quote }}}
+            - {name: MANOLO_RELAY_URL, value: "http://manolo-relay:8082"}
+            {{- if $w.fixture }}
+            - {name: MANOLO_MODE, value: fixture}
+            {{- else }}
+            - {name: MANOLO_PROVIDER, value: {{ required (printf "%s provider required outside fixture mode" $w.agentId) $w.provider | quote }}}
+            - {name: MANOLO_MODEL, value: {{ required (printf "%s model required outside fixture mode" $w.agentId) $w.model | quote }}}
+            {{- end }}
+            {{- end }}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+            {{- if eq $w.kind "relay" }}
+            - {name: config, mountPath: /config, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: {{ $w.name }}-data}
+        - name: tmp
+          emptyDir: {sizeLimit: 32Mi}
+        {{- if eq $w.kind "relay" }}
+        - name: config
+          configMap: {name: manolo-relay}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $w.name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  selector: {app.kubernetes.io/name: {{ $w.name }}}
+  ports:
+    - {name: http, port: {{ $w.port }}, targetPort: http}
+    {{- if eq $w.kind "relay" }}
+    - {name: internal, port: 8082, targetPort: internal}
+    {{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: manolo-workers
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector: {matchLabels: {manolo.lan/component: worker}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {manolo.lan/component: relay}}
+      ports: [{port: 8081, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: manolo-relay
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector: {matchLabels: {manolo.lan/component: relay}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {manolo.lan/component: worker}}
+      ports: [{port: 8082, protocol: TCP}]
+    {{- with .Values.webIngressFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports: [{port: 8080, protocol: TCP}]
+    {{- end }}
