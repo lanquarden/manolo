@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage } from '@earendil-works/pi-ai';
+import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { defineExtension, defineTool, ProviderDoc } from '@earendil-works/pi-durable';
 
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
@@ -11,6 +11,7 @@ const PROVIDERS = new Map(Object.entries({
   groq: ['groqProvider', 'GROQ_API_KEY'],
   mistral: ['mistralProvider', 'MISTRAL_API_KEY'],
   openai: ['openaiProvider', 'OPENAI_API_KEY'],
+  'opencode-go': ['opencodeGoProvider', 'OPENCODE_API_KEY'],
   openrouter: ['openrouterProvider', 'OPENROUTER_API_KEY'],
   xai: ['xaiProvider', 'XAI_API_KEY'],
 }));
@@ -69,10 +70,15 @@ export async function createWorkerModels(cfg, env) {
   });
   const provider = (await import(`@earendil-works/pi-ai/providers/${providerId}`))[factory]();
   models.setProvider({ ...provider, auth: { apiKey: provider.auth.apiKey } });
-  if (!models.getModel(providerId, modelId) || (await models.checkAuth(providerId))?.type !== 'api_key') {
+  const catalogModel = models.getModel(providerId, modelId);
+  if (!catalogModel || (await models.checkAuth(providerId))?.type !== 'api_key') {
     throw new Error('Unsupported model or missing key');
   }
-  return { models, model: { provider: providerId, modelId }, apiKey };
+  const thinkingLevel = env.MANOLO_THINKING_LEVEL || (providerId === 'opencode-go' && modelId === 'deepseek-v4.1-flash' ? 'high' : undefined);
+  if (thinkingLevel && !getSupportedThinkingLevels(catalogModel).includes(thinkingLevel)) {
+    throw new Error('Unsupported thinking level');
+  }
+  return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey };
 }
 
 function schema(properties) {

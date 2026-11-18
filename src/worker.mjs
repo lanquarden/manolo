@@ -88,7 +88,8 @@ function lockWriter(dataDir) {
   }
 }
 
-function turnService(harness, model, instructions, secrets) {
+function turnService(harness, model, thinkingLevel, instructions, secrets) {
+  const thinking = thinkingLevel ? { thinkingLevel } : {};
   const secretPattern = new RegExp(secrets.map(secret => RegExp.escape(secret)).join('|'), 'g');
   async function status(id, turn) {
     return harness.commit(async tx => {
@@ -130,7 +131,7 @@ function turnService(harness, model, instructions, secrets) {
         const session = await tx.doc(Sessions, sessionId, null);
         if (session.conversationId !== undefined) return session.conversationId;
         const { id: conversationId } = await tx.createConversation({ ownership: { kind: 'ownerless' } });
-        await configure(tx, conversationId, { model, maxTurns: 8, instructions });
+        await configure(tx, conversationId, { model, maxTurns: 8, instructions, ...thinking });
         session.conversationId = conversationId;
         return conversationId;
       }, context);
@@ -147,8 +148,8 @@ function turnService(harness, model, instructions, secrets) {
         // Pi Durable 1.5.2 stores this on the conversation's pi.agent doc; prepare reads the current value,
         // and a prepared request is pinned to its transcript cutoff. A genuinely new admission may thus update
         // older queued work, retries, or later tool rounds, but restart and idempotent PUTs alone do not.
-        // Configure only instructions, in the same commit as this new admission, leaving model/tools untouched.
-        await configure(tx, conversationId, { instructions });
+        // Apply operator settings with this new admission, leaving model and tools untouched.
+        await configure(tx, conversationId, { instructions, ...thinking });
         Object.assign(record, { conversationId, submissionId, sessionId, text });
         return { conversationId, submissionId };
       }, context);
@@ -227,9 +228,9 @@ function httpWorker(turns, token) {
 async function main() {
   const cfg = loadConfig(process.env);
   const runtime = await createWorkerModels(cfg, process.env).catch(() => {
-    throw new ConfigurationError('Invalid MANOLO_PROVIDER, MANOLO_MODEL, or missing upstream API key.');
+    throw new ConfigurationError('Invalid MANOLO_PROVIDER, MANOLO_MODEL, MANOLO_THINKING_LEVEL, or missing upstream API key.');
   });
-  const { models, model, apiKey } = runtime;
+  const { models, model, thinkingLevel, apiKey } = runtime;
   const registry = createRegistry();
   installRelayTools(registry, cfg);
   const secrets = [cfg.token, apiKey].filter(Boolean).sort((a, b) => b.length - a.length);
@@ -266,7 +267,7 @@ async function main() {
   if (!identityRecord) {
     await harness.commit(async tx => { Object.assign(await tx.doc(Identity), binding); }, context);
   }
-  const server = httpWorker(turnService(harness, model, cfg.instructions, secrets), cfg.token);
+  const server = httpWorker(turnService(harness, model, thinkingLevel, cfg.instructions, secrets), cfg.token);
   const shutdown = () => {
     const deadline = setTimeout(() => process.exit(1), 5_000);
     deadline.unref();

@@ -107,6 +107,9 @@ spec:
             {{- else }}
             - {name: MANOLO_PROVIDER, value: {{ required (printf "%s provider required outside fixture mode" $w.agentId) $w.provider | quote }}}
             - {name: MANOLO_MODEL, value: {{ required (printf "%s model required outside fixture mode" $w.agentId) $w.model | quote }}}
+            {{- with $w.thinkingLevel }}
+            - {name: MANOLO_THINKING_LEVEL, value: {{ . | quote }}}
+            {{- end }}
             {{- end }}
             {{- end }}
           resources:

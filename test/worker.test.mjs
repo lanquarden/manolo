@@ -2,14 +2,14 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const workerPath = fileURLToPath(new URL('../src/worker.mjs', import.meta.url));
 const token = 'fixture-private-bearer-long-enough';
@@ -347,4 +347,38 @@ test('live-mode startup validates the pinned provider catalog and explicit keys 
   assert.deepEqual(await request(url, '/healthz'), { code: 200, body: { status: 'ok' } });
   assert.deepEqual(await worker.stop(), [0, null]);
   assert.doesNotMatch(worker.logs(), /test-not-a-real-key/);
+});
+
+test('OpenCode Go DeepSeek V4.1 Flash sends high reasoning by default', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const preload = join(dir, 'capture.mjs');
+  const capture = join(dir, 'request.json');
+  await writeFile(preload, `import { writeFileSync } from 'node:fs';
+    globalThis.fetch = async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url !== 'https://opencode.ai/inference/go/openai/v1/chat/completions') throw new Error('Unexpected outbound destination');
+      const body = await req.json();
+      writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
+        model: body.model, effort: body.reasoning_effort, thinking: body.thinking,
+        authCorrect: req.headers.get('authorization') === 'Bearer fake-opencode-key',
+      }));
+      const base = { id: 'fixture', object: 'chat.completion.chunk', created: 1, model: body.model };
+      const chunk = (delta, finish_reason) => 'data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason }] }) + '\\n\\n';
+      return new Response(chunk({ role: 'assistant', content: 'Offline provider reply' }, null) + chunk({}, 'stop') + 'data: [DONE]\\n\\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };`);
+  const options = {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'opencode-go', MANOLO_MODEL: 'deepseek-v4.1-flash', OPENCODE_API_KEY: 'fake-opencode-key',
+    NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+  };
+  const bad = launch(t, dir, { ...options, MANOLO_THINKING_LEVEL: 'invalid' });
+  assert.deepEqual(await bad.closed, [1, null]);
+  const worker = launch(t, dir, options);
+  const url = await worker.start();
+  await put(url, 'deepseek', 'chat', 'Verify the provider');
+  assert.deepEqual(await settled(url, 'deepseek'), { status: 'done', text: 'Offline provider reply' });
+  assert.deepEqual(JSON.parse(await readFile(capture, 'utf8')), {
+    model: 'deepseek-v4.1-flash', effort: 'high', thinking: { type: 'enabled' }, authCorrect: true,
+  });
 });
