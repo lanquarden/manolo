@@ -1,0 +1,13 @@
+name: manolo-slidge-pilot
+services:
+  prosody:
+    image: codeberg.org/slidge/prosody-slidge-dev@sha256:1b9a2da88c010b41c10273f28b2f8f97aaf33bfd5ee4cd93100c0017eaa08458
+    networks: [pilot]
+  slidge:
+    image: codeberg.org/slidge/slidge-whatsapp@sha256:bb142dc0f13634847ae72228261b55e9ca6c440eac7caa7e4703fff18846f940
+    command: [--jid, slidge.localhost, --secret, secret, --server, prosody, --home-dir, /tmp/slidge-pilot]
+    depends_on: [prosody]
+    networks: [pilot]
+networks:
+  pilot:
+    internal: true
