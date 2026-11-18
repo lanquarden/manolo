@@ -59,7 +59,11 @@ async function openBrowser(t) {
       return result.value;
     };
     await send('Page.navigate', { url }, sessionId);
-    return { run, reload: () => send('Page.reload', {}, sessionId) };
+    return {
+      run,
+      reload: () => send('Page.reload', {}, sessionId),
+      resize: (width, height) => send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 500 }, sessionId),
+    };
   };
 }
 
@@ -140,14 +144,31 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   const url = `http://127.0.0.1:${server.address().port}/`;
   const openTab = await openBrowser(t);
   const firstTab = await openTab(url);
+  await firstTab.resize(1200, 800);
   const { run } = firstTab;
-  await waitFor(run, `${logCount} === 4`);
+  await waitFor(run, `${logCount} === 4 && document.getElementById('workspace-tabs').getAttribute('aria-orientation') === 'vertical'`);
   assert.deepEqual(await run(`[...document.querySelector('#chat-log').children].map(row => row.children[1].textContent)`),
     [literal, 'Saved failure', 'Older pending', 'Latest pending']);
   assert.equal(await run(`document.querySelectorAll('[data-untrusted]').length`), 0);
   assert.ok(await run(`${logText}.includes(${JSON.stringify(literal)}) && ${logText}.includes('Turn failed.')`));
   assert.equal(await run(sendDisabled), true);
   assert.equal(await run(checkHidden), false);
+
+  const visible = (id) => `!document.getElementById('${id}-panel').hidden`;
+  const press = (id, key) => `document.getElementById('${id}-tab').dispatchEvent(new KeyboardEvent('keydown', { key: '${key}', bubbles: true }))`;
+  assert.ok(await run(`${visible('chat')} && !(${visible('dashboard')}) && !(${visible('inbox')})`));
+  await run(press('chat', 'ArrowDown'));
+  assert.ok(await run(`${visible('dashboard')} && document.activeElement.id === 'dashboard-tab'`));
+  await run(click('inbox-tab'));
+  assert.ok(await run(visible('inbox')));
+  await run(press('inbox', 'Home'));
+  assert.ok(await run(visible('chat')));
+  await firstTab.resize(390, 760);
+  await waitFor(run, `document.getElementById('workspace-tabs').getAttribute('aria-orientation') === 'horizontal'`);
+  await run(press('chat', 'ArrowRight'));
+  assert.ok(await run(`${visible('dashboard')} && document.documentElement.scrollWidth === innerWidth`));
+  await run(click('chat-tab'));
+  assert.ok(await run(`${visible('chat')} && document.querySelector('#send-chat').getBoundingClientRect().bottom <= innerHeight`));
   await run(`${fill('New draft')}; document.querySelector('#chat-form').requestSubmit()`);
   await run(click('check-turn'));
   assert.equal(await run(refreshDisabled), true);
@@ -164,7 +185,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
 
   const { run: second } = await openTab(url);
   await waitFor(second, `${logCount} === 4 && !${sendDisabled}`);
-  await second(`${fill('Sent from another tab')}; ${click('send-chat')}`);
+  await second(`${fill('Sent from another tab')}; document.getElementById('chat-text').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }))`);
   await waitFor(second, `${logText}.includes('Second tab reply')`);
   assert.equal(await run(logCount), 4);
   await run(click('refresh-chat'));

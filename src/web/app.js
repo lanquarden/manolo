@@ -36,6 +36,40 @@ function failure(error) {
   return error.status ? error.message : 'Could not complete the request.';
 }
 
+const tabList = byId('workspace-tabs');
+const tabs = [...tabList.querySelectorAll('[role="tab"]')];
+const compactNav = matchMedia('(max-width: 48.999rem)');
+function orientTabs() {
+  tabList.setAttribute('aria-orientation', compactNav.matches ? 'horizontal' : 'vertical');
+}
+function showTab(selected) {
+  for (const tab of tabs) {
+    const active = selected === tab;
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+    byId(tab.getAttribute('aria-controls')).hidden = !active;
+  }
+  if (selected.id === 'chat-tab') scrollChatToEnd();
+}
+for (const tab of tabs) tab.addEventListener('click', () => showTab(tab));
+tabList.addEventListener('keydown', (event) => {
+  const index = tabs.indexOf(event.target);
+  if (index < 0) return;
+  const previous = compactNav.matches ? 'ArrowLeft' : 'ArrowUp';
+  const next = compactNav.matches ? 'ArrowRight' : 'ArrowDown';
+  let destination;
+  if (event.key === previous) destination = (index + tabs.length - 1) % tabs.length;
+  else if (event.key === next) destination = (index + 1) % tabs.length;
+  else if (event.key === 'Home') destination = 0;
+  else if (event.key === 'End') destination = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  showTab(tabs[destination]);
+  tabs[destination].focus();
+});
+compactNav.addEventListener('change', orientTabs);
+orientTabs();
+
 const dashboardControls = byId('dashboard-controls');
 const dashboardStatus = byId('dashboard-status');
 const publishButton = byId('publish-dashboard');
@@ -50,11 +84,11 @@ function renderVersion(target, version, emptyText) {
     return;
   }
   target.append(
-    textNode('p', `Revision ${version.revision}`),
-    textNode('h4', version.spec.title, 'plain-text'),
+    textNode('p', `Revision ${version.revision}`, 'revision-tag'),
+    textNode('h3', version.spec.title, 'plain-text'),
   );
   for (const widget of version.spec.widgets) {
-    if (widget.kind === 'heading') target.append(textNode('h5', widget.text, 'plain-text'));
+    if (widget.kind === 'heading') target.append(textNode('h4', widget.text, 'plain-text'));
     if (widget.kind === 'note') target.append(textNode('p', widget.text, 'plain-text'));
   }
 }
@@ -134,7 +168,10 @@ async function refreshInbox() {
     const { messages } = await api('/api/inbox');
     const entries = messages.map(({ from, text, createdAt }) => {
       const item = document.createElement('li');
-      item.append(textNode('strong', from), textNode('div', createdAt), textNode('div', text, 'plain-text'));
+      const date = new Date(createdAt);
+      const time = textNode('time', Number.isNaN(date.getTime()) ? '' : date.toLocaleString());
+      if (!Number.isNaN(date.getTime())) time.dateTime = date.toISOString();
+      item.append(textNode('strong', from), time, textNode('div', text, 'plain-text'));
       return item;
     });
     byId('inbox').replaceChildren(...entries);
@@ -151,6 +188,9 @@ refreshInboxButton.addEventListener('click', refreshInbox);
 const chatInput = byId('chat-text');
 const chatStatus = byId('chat-status');
 const chatLog = byId('chat-log');
+const chatEmpty = byId('chat-empty');
+const transcript = byId('chat-transcript');
+const chatPanel = byId('chat-panel');
 const sendButton = byId('send-chat');
 const checkButton = byId('check-turn');
 const refreshHistoryButton = byId('refresh-chat');
@@ -176,15 +216,21 @@ function setChatBusy(busy) {
 
 function idleChatStatus() {
   if (pendingTurn()) return 'A reply is pending. Use “Check reply” before sending another message.';
-  return turns.size ? '' : 'No saved messages yet.';
+  return '';
+}
+
+function scrollChatToEnd() {
+  if (!chatPanel.hidden) transcript.scrollTop = transcript.scrollHeight;
 }
 
 function renderHistory() {
   const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ text, status, reply }) => {
     const row = document.createElement('li');
-    row.append(textNode('strong', 'You'), textNode('div', text, 'plain-text'));
+    row.className = 'chat-turn';
+    row.append(textNode('strong', 'You', 'chat-user'), textNode('div', text, 'chat-prompt plain-text'));
     const answer = document.createElement('div');
     answer.className = 'chat-answer';
+    answer.dataset.state = status;
     answer.append(textNode('strong', 'Manolo'));
     if (status === 'done') {
       answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
@@ -197,7 +243,8 @@ function renderHistory() {
     return row;
   });
   chatLog.replaceChildren(...rows);
-  chatLog.scrollTop = chatLog.scrollHeight;
+  chatEmpty.hidden = !historyLoaded || rows.length > 0;
+  scrollChatToEnd();
 }
 
 async function refreshHistory() {
@@ -264,7 +311,14 @@ async function runTurn(turn, submit) {
   }
 }
 
-byId('chat-form').addEventListener('submit', (event) => {
+const chatForm = byId('chat-form');
+chatInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+    event.preventDefault();
+    if (!sendButton.disabled) chatForm.requestSubmit(sendButton);
+  }
+});
+chatForm.addEventListener('submit', (event) => {
   event.preventDefault();
   const text = chatInput.value.trim();
   if (chatBusy || !historyLoaded || pendingTurn() || !text) return;
