@@ -8,16 +8,22 @@ import { createDashboard } from './dashboard.mjs';
 import { edgeKey, ID, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
 import { createTelegramTransport } from './telegram.mjs';
+import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 
 const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG);
 const dataDir = process.env.MANOLO_DATA_DIR;
 if (!dataDir) throw new Error('Set MANOLO_DATA_DIR');
 const telegramToken = process.env.MANOLO_TELEGRAM_TOKEN;
+const useXmpp = process.env.MANOLO_TELEGRAM_MODE === 'xmpp';
 const discordToken = process.env.MANOLO_DISCORD_TOKEN;
-if (config.transports.has('telegram') && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for Telegram routes');
+const stop = new AbortController();
+if (config.transports.has('telegram') && !useXmpp && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for direct Telegram routes');
+if (config.transports.has('telegram') && useXmpp && telegramToken) throw new Error('Remove MANOLO_TELEGRAM_TOKEN from the relay when using the XMPP bridge');
 if (config.transports.has('discord') && !discordToken) throw new Error('Set MANOLO_DISCORD_TOKEN for Discord routes');
-const telegram = config.transports.has('telegram') && createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL });
-const botScope = telegramToken?.split(':')[0];
+const botScope = useXmpp ? process.env.MANOLO_TELEGRAM_BOT_ID : telegramToken?.split(':')[0];
+const telegram = config.transports.has('telegram') && (useXmpp
+  ? createTelegramXmppTransport(process.env, stop.signal)
+  : createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL }));
 const discordScope = config.transports.has('discord') ? Buffer.from(discordToken.split('.')[0], 'base64url').toString('ascii') : null;
 if (discordScope !== null && !SNOWFLAKE.test(discordScope)) throw new Error('Invalid MANOLO_DISCORD_TOKEN format');
 let discordClient;
@@ -28,7 +34,6 @@ try { writerLock.exec('BEGIN EXCLUSIVE'); } catch { throw new Error('Relay data 
 const store = openRelayStore(join(dataDir, 'relay.sqlite'));
 if (telegram) store.bindBot(botScope);
 const dashboard = createDashboard(store.db);
-const stop = new AbortController();
 const WEB = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],

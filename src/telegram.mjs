@@ -63,7 +63,7 @@ function boundedText(text) {
   return text.slice(0, MAX_SEND_UNITS - TRUNCATED.length).replace(/[\uD800-\uDBFF]$/u, '') + TRUNCATED;
 }
 
-export function createTelegramTransport({ token, baseUrl = 'https://api.telegram.org', fetchImpl = fetch }) {
+export function createTelegramTransport({ token, baseUrl = 'https://api.telegram.org', fetchImpl = fetch, limit }) {
   if (typeof token !== 'string' || !token || /[^a-zA-Z0-9:_-]/u.test(token)) {
     throw new TypeError('Invalid Telegram token');
   }
@@ -116,7 +116,7 @@ export function createTelegramTransport({ token, baseUrl = 'https://api.telegram
     async poll(offset = 0, signal) {
       if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid Telegram offset');
       const updates = await request('getUpdates', {
-        offset, timeout: POLL_SECONDS, allowed_updates: ['message'],
+        offset, timeout: POLL_SECONDS, allowed_updates: ['message'], ...(limit && { limit }),
       }, signal, POLL_DEADLINE_MS);
       if (!Array.isArray(updates)) throw new TelegramTransportError('Invalid Telegram updates');
       const entries = [];

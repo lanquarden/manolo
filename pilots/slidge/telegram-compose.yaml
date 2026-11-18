@@ -1,0 +1,16 @@
+services:
+  prosody:
+    image: codeberg.org/slidge/prosody-slidge-dev@sha256:1b9a2da88c010b41c10273f28b2f8f97aaf33bfd5ee4cd93100c0017eaa08458
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        cp /etc/prosody/prosody.cfg.lua /tmp/manolo.cfg.lua
+        ln -sfn /etc/prosody/certs /tmp/certs
+        printf '\n' >>/tmp/manolo.cfg.lua
+        # Put the global listener settings before the first virtual host.
+        { printf 'c2s_direct_tls_ports = { 5223 }\nssl = { key = "/etc/prosody/certs/localhost.key"; certificate = "/etc/prosody/certs/localhost.crt"; }\n'; tee </tmp/manolo.cfg.lua; } >/tmp/prosody.cfg.lua
+        prosodyctl --config /tmp/prosody.cfg.lua register manolo localhost fixture-relay-password
+        prosodyctl --config /tmp/prosody.cfg.lua register telegram localhost fixture-bridge-password
+        exec prosody -F --config /tmp/prosody.cfg.lua
+    ports:
+      - '127.0.0.1::5223'

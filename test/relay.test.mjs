@@ -40,7 +40,12 @@ function start(t, filename, env) {
     await exited;
   };
   t.after(() => end('SIGKILL'));
-  return { end, async port(re) {
+  return { end, async online(message) {
+    await until(() => {
+      assert.equal(child.exitCode, null, log);
+      return log.includes(message);
+    }, `waiting for ${filename} startup`);
+  }, async port(re) {
     return until(() => {
       assert.equal(child.exitCode, null, log);
       return Number(re.exec(log)?.[1]) || null;
@@ -121,9 +126,38 @@ test('real relay and Pi worker processes: message recovery, private routing, web
   };
   const configPath = join(root, 'relay.json');
   await writeFile(configPath, JSON.stringify(conf));
+  const telegramBase = addr(mock.address().port);
+  const xmppService = process.env.TEST_MANOLO_XMPP_SERVICE;
+  const xmppEnv = {
+    MANOLO_XMPP_SERVICE: xmppService, NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    MANOLO_TELEGRAM_BOT_ID: '123456',
+  };
+  if (xmppService) {
+    const bridge = start(t, 'telegram-bridge', {
+      ...xmppEnv, MANOLO_XMPP_JID: 'telegram@localhost/bridge', MANOLO_XMPP_PEER: 'manolo@localhost/relay',
+      MANOLO_XMPP_PASSWORD: 'fixture-bridge-password', MANOLO_TELEGRAM_TOKEN: '123456:fixture-key-not-real',
+      MANOLO_TELEGRAM_BASE_URL: telegramBase,
+    });
+    await bridge.online('Telegram XMPP bridge online');
+    const { client, xml } = await import('@xmpp/client');
+    const stranger = client({ service: xmppService, domain: 'localhost', username: 'test', password: 'password', resource: 'stranger' });
+    stranger.on('error', () => {});
+    const online = once(stranger, 'online');
+    try {
+      await stranger.start();
+      await online;
+      await assert.rejects(stranger.iqCaller.request(xml('iq', { type: 'set', to: 'telegram@localhost/bridge' },
+        xml('send', { xmlns: 'urn:manolo:telegram-bridge:0', bot: '123456', chat: '101' }, '"unauthorized"')), 3000),
+      { condition: 'forbidden' });
+      assert.deepEqual(sent, []);
+    } finally { await stranger.stop(); }
+  }
   const launchRelay = (port = 0, firstRun = false) => start(t, 'relay', {
     ...env, MANOLO_RELAY_CONFIG: configPath, MANOLO_DATA_DIR: join(root, 'relay'),
-    MANOLO_TELEGRAM_TOKEN: '123456:fixture-key-not-real', MANOLO_TELEGRAM_BASE_URL: addr(mock.address().port),
+    ...(xmppService ? {
+      ...xmppEnv, MANOLO_TELEGRAM_MODE: 'xmpp', MANOLO_XMPP_JID: 'manolo@localhost/relay',
+      MANOLO_XMPP_PEER: 'telegram@localhost/bridge', MANOLO_XMPP_PASSWORD: 'fixture-relay-password',
+    } : { MANOLO_TELEGRAM_TOKEN: '123456:fixture-key-not-real', MANOLO_TELEGRAM_BASE_URL: telegramBase }),
     MANOLO_DISCORD_TOKEN: `${Buffer.from('999456789012345678').toString('base64url')}.fake.token`,
     NODE_OPTIONS: `--import=${loader}`, DISCORD_TEST_FIRST: firstRun ? '1' : '0',
     PORT: '0', MANOLO_INTERNAL_PORT: String(port),
