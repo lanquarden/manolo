@@ -127,8 +127,11 @@ export function openRelayStore(path) {
     discordReady(now, bot) { return discordReady.all(now, bot); },
     transcribed(job, text) {
       if (!validTranscript(text)) throw new TypeError('Invalid stored transcript');
+      // Persist the exact worker input before submission so a retry uses the same payload.
+      const source = '[Telegram voice note — automatically transcribed; respond to the transcript, not as if the user sent typed text.]\n\n';
+      const transcript = text.slice(0, 4000 - source.length).replace(/[\uD800-\uDBFF]$/u, '');
       db.prepare(`UPDATE telegram_jobs SET input=?, voice_file_id=NULL, next_at=0, attempts=0 WHERE update_id=? AND voice_file_id IS NOT NULL`)
-        .run(text, job.update_id);
+        .run(source + transcript, job.update_id);
     },
     voiceFallback(job, text) {
       db.prepare(`UPDATE telegram_jobs SET state='send', voice_file_id=NULL, voice_reply=0, output=?, next_at=0, attempts=0 WHERE update_id=?`)

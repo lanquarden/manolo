@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
 
+const voiceInput = '[Telegram voice note — automatically transcribed; respond to the transcript, not as if the user sent typed text.]\n\nauthorized voice transcript';
 const audio = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(24), Buffer.from('OpusHead')]);
 const note = (update_id, user, file_id) => ({ update_id, message: { message_id: update_id * 10,
   from: { id: user }, chat: { id: user, type: 'private' }, voice: { file_id, duration: 2 } } });
@@ -110,7 +111,7 @@ test('relay authorizes voice before Bot API download; durably retries and replie
   const job = id => db.prepare('SELECT * FROM telegram_jobs WHERE update_id=?').get(id);
   assert.equal(db.prepare('SELECT cursor FROM telegram_state').get().cursor, 4);
   assert.equal(job(1), undefined);
-  assert.equal(job(2).input, 'authorized voice transcript');
+  assert.equal(job(2).input, voiceInput);
   assert.equal(job(2).voice_file_id, null);
   assert.equal(job(3).voice_file_id, 'unreadable_file');
   assert.deepEqual(fileIds, ['allowed_file']);
@@ -120,7 +121,7 @@ test('relay authorizes voice before Bot API download; durably retries and replie
   await until(() => { second.assertRunning(); return job(3)?.state === 'sent'; }, 'durable voice send retry and permanent STT fallback');
   assert.deepEqual(fileIds, ['allowed_file', 'unreadable_file']);
   assert.deepEqual(speechCalls, ['stt', ['tts', 'spoken reply'], ['tts', 'spoken reply']]);
-  assert.deepEqual(workerInputs.map(x => x.text), Array(workerInputs.length).fill('authorized voice transcript'));
+  assert.deepEqual(workerInputs.map(x => x.text), Array(workerInputs.length).fill(voiceInput));
   assert.equal(voiceSends.length, 2);
   for (const voice of voiceSends) {
     assert.match(voice.toString(), /name="chat_id"\r\n\r\n101/);
