@@ -122,6 +122,10 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
+            # The image root filesystem is read-only. Give the runtime user a
+            # writable home so operator tools run via `kubectl exec` can keep
+            # state (git config, mise runtimes); it holds no application data.
+            - {name: home, mountPath: /home/node}
             {{- if eq $w.kind "relay" }}
             - {name: config, mountPath: /config, readOnly: true}
             {{- end }}
@@ -130,6 +134,8 @@ spec:
           persistentVolumeClaim: {claimName: {{ $w.name }}-data}
         - name: tmp
           emptyDir: {sizeLimit: 32Mi}
+        - name: home
+          emptyDir: {sizeLimit: 1Gi}
         {{- if eq $w.kind "relay" }}
         - name: config
           configMap: {name: manolo-relay}
