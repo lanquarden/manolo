@@ -4,6 +4,7 @@ relaySecret: manolo-relay
 relayStorage: 1Gi
 storageClassName: longhorn
 # The PoC uses Basic Auth; expose through HTTPS or kubectl port-forward only.
+relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passwords load. Isolated smoke tests only.
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
 relayConfig:

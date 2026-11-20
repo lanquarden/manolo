@@ -96,6 +96,10 @@ spec:
             {{- if eq $w.kind "relay" }}
             - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- if $.Values.relayDemoCredentials }}
+            - {name: MANOLO_DEMO, value: "1"}
+            - {name: MANOLO_DEMO_ALLOW_NETWORK, value: "1"}
+            {{- end }}
             {{- else }}
             - {name: MANOLO_AGENT_ID, value: {{ $w.agentId | quote }}}
             - {name: MANOLO_RELAY_URL, value: "http://manolo-relay:8082"}

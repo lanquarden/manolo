@@ -5,6 +5,8 @@ export const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TG_ID = /^[1-9][0-9]{0,15}$/;
 export const SNOWFLAKE = /^[1-9][0-9]{16,19}$/;
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/;
+const CREDENTIAL = /^[\x21-\x7e]{32,256}$/;
+const DEMO_CREDENTIAL = /^[\x21-\x7e]{1,256}$/;
 export const key = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 export const routeKey = ({ transport, userId, chatId }) => JSON.stringify([transport, userId, chatId]);
 export const edgeKey = (from, to) => JSON.stringify([from, to]);
@@ -24,14 +26,20 @@ function identifier(value, label) {
   return value;
 }
 
-export function loadRelayConfig(path, env = process.env) {
+/**
+ * `demo` relaxes only the 32-character minimum on owner passwords. The relay
+ * enables it for loopback-only listeners so a local smoke test can use short
+ * credentials without weakening an ordinary deployment.
+ */
+export function loadRelayConfig(path, env = process.env, { demo = false } = {}) {
   if (!path) throw new Error('Set MANOLO_RELAY_CONFIG to a JSON config file');
   const raw = object(JSON.parse(readFileSync(path, 'utf8')), 'config', ['agents', 'owners', 'routes', 'inbox']);
   const secrets = new Set();
   function credential(name) {
     invariant(typeof name === 'string' && ENV_NAME.test(name), 'Invalid credentials env var name');
     const value = env[name];
-    invariant(typeof value === 'string' && /^[\x21-\x7e]{32,256}$/.test(value), `Set ${name} to an independent 32–256 character credential`);
+    invariant(typeof value === 'string' && (demo ? DEMO_CREDENTIAL : CREDENTIAL).test(value),
+      demo ? `Set ${name} to a printable ASCII demo credential` : `Set ${name} to an independent 32–256 character credential`);
     invariant(!secrets.has(value), `Reused credential: ${name}`);
     secrets.add(value);
     return value;

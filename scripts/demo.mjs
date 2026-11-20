@@ -11,8 +11,8 @@ const secret = () => randomBytes(24).toString('hex');
 const env = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot };
 const primary = secret();
 const canary = secret();
-const owner = secret();
-const tester = secret();
+const owner = 'owner';
+const tester = 'tester';
 const config = join(root, 'relay.json');
 const host = '127.0.0.1';
 let stopping = false;
@@ -68,7 +68,7 @@ try {
     routes: [], inbox: [{ from: 'primary', to: 'canary' }],
   }));
   const relay = run('relay', {
-    MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: join(root, 'relay'),
+    MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: join(root, 'relay'), MANOLO_DEMO: '1',
     PRIMARY_TOKEN: primary, CANARY_TOKEN: canary, OWNER_PASSWORD: owner, TESTER_PASSWORD: tester,
     PORT: '0', MANOLO_INTERNAL_PORT: '0',
   });

@@ -12,7 +12,16 @@ import { createSpeechFromEnv } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 
-const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG);
+const webHost = process.env.HOST ?? '127.0.0.1';
+const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
+const deviceHost = process.env.MANOLO_DEVICE_HOST ?? '127.0.0.1';
+const demo = process.env.MANOLO_DEMO === '1';
+const demoNetwork = process.env.MANOLO_DEMO_ALLOW_NETWORK === '1';
+const isLoopback = host => host === '127.0.0.1' || host === '::1' || host === 'localhost';
+const loopbackOnly = [webHost, internalHost, deviceHost].every(isLoopback);
+if (demo && !loopbackOnly && !demoNetwork) throw new Error('MANOLO_DEMO requires loopback listeners or MANOLO_DEMO_ALLOW_NETWORK=1');
+if (demo && !loopbackOnly) console.warn('WARNING: weak demo passwords on a non-loopback listener; use only for an isolated smoke test');
+const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG, process.env, { demo });
 const dataDir = process.env.MANOLO_DATA_DIR;
 if (!dataDir) throw new Error('Set MANOLO_DATA_DIR');
 const telegramToken = process.env.MANOLO_TELEGRAM_TOKEN;
@@ -305,10 +314,10 @@ async function runDiscord() {
 }
 
 const listeners = [
-  serve(web, Number(process.env.PORT ?? 8080), process.env.HOST ?? '127.0.0.1'),
-  serve(internal, Number(process.env.MANOLO_INTERNAL_PORT ?? 8082), process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1'),
+  serve(web, Number(process.env.PORT ?? 8080), webHost),
+  serve(internal, Number(process.env.MANOLO_INTERNAL_PORT ?? 8082), internalHost),
 ];
-if (device) listeners.push(serve(device, Number(process.env.MANOLO_DEVICE_PORT ?? 8083), process.env.MANOLO_DEVICE_HOST ?? '127.0.0.1'));
+if (device) listeners.push(serve(device, Number(process.env.MANOLO_DEVICE_PORT ?? 8083), deviceHost));
 const loops = [drain(store.webReady, runWebTurn)];
 if (telegram) loops.push(pollTelegram(), drain(store.due, job => runMessage('telegram', telegram, job)));
 if (discordScope) loops.push(runDiscord(), drain(now => discordClient ? store.discordReady(now, discordScope) : [], job => runMessage('discord', discordClient, job)));
