@@ -8,6 +8,7 @@ import { createDashboard } from './dashboard.mjs';
 import { createDeviceHandler } from './device-api.mjs';
 import { edgeKey, ID, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
+import { createRuntimeRelay } from './runtime-relay.mjs';
 import { createSpeechFromEnv } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
@@ -15,6 +16,8 @@ import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
 const deviceHost = process.env.MANOLO_DEVICE_HOST ?? '127.0.0.1';
+const runtimeAgent = process.env.MANOLO_RUNTIME_AGENT;
+const runtimeHost = process.env.MANOLO_RUNTIME_HOST ?? '127.0.0.1';
 const demo = process.env.MANOLO_DEMO === '1';
 const demoNetwork = process.env.MANOLO_DEMO_ALLOW_NETWORK === '1';
 const isLoopback = host => host === '127.0.0.1' || host === '::1' || host === 'localhost';
@@ -22,6 +25,10 @@ const loopbackOnly = [webHost, internalHost, deviceHost].every(isLoopback);
 if (demo && !loopbackOnly && !demoNetwork) throw new Error('MANOLO_DEMO requires loopback listeners or MANOLO_DEMO_ALLOW_NETWORK=1');
 if (demo && !loopbackOnly) console.warn('WARNING: weak demo passwords on a non-loopback listener; use only for an isolated smoke test');
 const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG, process.env, { demo });
+if (runtimeAgent && (demo || !config.agents.has(runtimeAgent) || ![...config.owners.values()].some(owner => owner.agent === runtimeAgent) ||
+    [...config.routes.values()].includes(runtimeAgent))) {
+  throw new Error('A runtime agent requires non-demo authentication and must be web-only');
+}
 const dataDir = process.env.MANOLO_DATA_DIR;
 if (!dataDir) throw new Error('Set MANOLO_DATA_DIR');
 const telegramToken = process.env.MANOLO_TELEGRAM_TOKEN;
@@ -43,6 +50,12 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 const writerLock = new DatabaseSync(join(dataDir, 'writer-lock.sqlite'), { timeout: 0 });
 try { writerLock.exec('BEGIN EXCLUSIVE'); } catch { throw new Error('Relay data directory already has a writer or cannot be locked'); }
 const store = openRelayStore(join(dataDir, 'relay.sqlite'));
+// Live progress is presentation only: kept in memory, replaced on every worker poll and dropped as soon as a turn ends.
+const liveTurns = new Map();
+const setLive = (id, live) => {
+  if (!liveTurns.has(id) && liveTurns.size >= 100) liveTurns.delete(liveTurns.keys().next().value);
+  liveTurns.set(id, live);
+};
 if (telegram) store.bindBot(botScope);
 const dashboard = createDashboard(store.db);
 const devicePath = process.env.MANOLO_DEVICE_CONFIG;
@@ -56,6 +69,11 @@ const device = devicePath ? createDeviceHandler({
 if (device && Object.values(deviceConfig.grants).some(grant => Object.keys(grant).some(agent => !config.agents.has(agent)))) {
   throw new Error('Device grant references an unknown agent');
 }
+if (runtimeAgent && Object.values(deviceConfig?.grants ?? {}).some(grant => grant[runtimeAgent]?.includes('submit'))) {
+  throw new Error('A runtime agent cannot accept Device API submissions');
+}
+const runtimes = runtimeAgent ? createRuntimeRelay(store.db, runtimeAgent, { readJson, respond, signal: stop.signal }) : null;
+const runtimeOwner = name => config.owners.get(name)?.agent === runtimeAgent;
 const WEB = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
@@ -77,7 +95,7 @@ function limits(res, web) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (web) {
-    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
     res.setHeader('Referrer-Policy', 'no-referrer');
   }
 }
@@ -118,6 +136,92 @@ function agentAuth(req) {
   return id;
 }
 
+const TOOL_STATUS = new Set(['ok', 'error', 'pending']);
+const TOOL_SEVERITY = new Set(['info', 'warn', 'error']);
+const TOOL_IMAGE_TYPE = /^image\/(png|jpeg|gif|webp)$/;
+const MAX_TURN_TOOLS = 24;
+const MAX_TOOL_IMAGE = 4_500_000;
+const MAX_TURN_IMAGE = 8_000_000;
+const clipText = (value, limit) => typeof value === 'string' ? value.slice(0, limit) : undefined;
+
+// The worker is the only source of tool transcripts, but the relay still bounds and reshapes what it stores and serves.
+function relayTools(value) {
+  if (!Array.isArray(value)) return [];
+  let imageBudget = MAX_TURN_IMAGE;
+  const tools = value.slice(0, MAX_TURN_TOOLS).flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const name = clipText(item.name, 64);
+    if (!name) return [];
+    const tool = { name, status: TOOL_STATUS.has(item.status) ? item.status : 'pending' };
+    const args = clipText(item.args, 2000);
+    if (args !== undefined) tool.args = args;
+    const output = clipText(item.output, 8000);
+    if (output !== undefined) tool.output = output;
+    const diff = clipText(item.diff, 8000);
+    if (diff !== undefined) tool.diff = diff;
+    if (Number.isFinite(item.durationMs)) tool.durationMs = Math.round(item.durationMs);
+    if (Array.isArray(item.diagnostics)) {
+      const diagnostics = item.diagnostics.slice(0, 20).flatMap(each => {
+        if (!each || typeof each !== 'object') return [];
+        const message = clipText(each.message, 500);
+        if (!message) return [];
+        return [{ severity: TOOL_SEVERITY.has(each.severity) ? each.severity : 'info', code: clipText(each.code, 64) ?? '', message }];
+      });
+      if (diagnostics.length) tool.diagnostics = diagnostics;
+    }
+    if (Array.isArray(item.images)) {
+      const images = item.images.slice(0, 2).flatMap(image => {
+        if (!image || typeof image !== 'object' || !TOOL_IMAGE_TYPE.test(image.mimeType ?? '')) return [];
+        if (typeof image.data !== 'string' || image.data.length > MAX_TOOL_IMAGE || image.data.length > imageBudget) return [];
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(image.data)) return [];
+        imageBudget -= image.data.length;
+        return [{ mimeType: image.mimeType, data: image.data }];
+      });
+      if (images.length) tool.images = images;
+    }
+    return [tool];
+  });
+  return tools;
+}
+
+const LIVE_STATUS = new Set(['pending', 'running', 'done']);
+
+// What the browser may show while a turn runs: bounded streamed text, reasoning and running tool output.
+function relayLive(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const live = {};
+  const text = clipText(value.text, 16_000);
+  if (text) live.text = text;
+  const thinking = clipText(value.thinking, 16_000);
+  if (thinking) live.thinking = thinking;
+  const retry = clipText(value.retry, 500);
+  if (retry) live.retry = retry;
+  if (Number.isSafeInteger(value.turns) && value.turns >= 0) live.turns = value.turns;
+  if (Number.isSafeInteger(value.attempt) && value.attempt >= 0) live.attempt = value.attempt;
+  if (Array.isArray(value.tools)) {
+    const tools = value.tools.slice(0, MAX_TURN_TOOLS).flatMap(slot => {
+      if (!slot || typeof slot !== 'object' || typeof slot.name !== 'string') return [];
+      const tool = { name: clipText(slot.name, 64), status: LIVE_STATUS.has(slot.status) ? slot.status : 'pending' };
+      const output = clipText(slot.output, 4000);
+      if (output) tool.output = output;
+      if (Number.isSafeInteger(slot.droppedLines) && slot.droppedLines > 0) tool.droppedLines = slot.droppedLines;
+      if (Number.isSafeInteger(slot.droppedBytes) && slot.droppedBytes > 0) tool.droppedBytes = slot.droppedBytes;
+      if (Array.isArray(slot.diagnostics)) {
+        const diagnostics = slot.diagnostics.slice(0, 20).flatMap(each => {
+          if (!each || typeof each !== 'object') return [];
+          const message = clipText(each.message, 500);
+          if (!message) return [];
+          return [{ severity: TOOL_SEVERITY.has(each.severity) ? each.severity : 'info', code: clipText(each.code, 64) ?? '', message }];
+        });
+        if (diagnostics.length) tool.diagnostics = diagnostics;
+      }
+      return [tool];
+    });
+    if (tools.length) live.tools = tools;
+  }
+  return Object.keys(live).length > 0 ? live : undefined;
+}
+
 async function worker(agent, id, input) {
   const { url, token } = config.agents.get(agent);
   let result;
@@ -136,8 +240,14 @@ async function worker(agent, id, input) {
   let turn;
   try { turn = await result.json(); } catch { throw fail(503); }
   if (!['pending', 'done', 'failed'].includes(turn?.status)) throw fail(503);
-  if (turn.status === 'done' && typeof turn.text === 'string') return { status: 'done', text: turn.text.slice(0, 16000) };
-  if (turn.status === 'pending') return { status: 'pending' };
+  if (turn.status === 'done' && typeof turn.text === 'string') {
+    const tools = relayTools(turn.tools);
+    return { status: 'done', text: turn.text.slice(0, 16000), ...(tools.length > 0 && { tools }) };
+  }
+  if (turn.status === 'pending') {
+    const live = relayLive(turn.live);
+    return live === undefined ? { status: 'pending' } : { status: 'pending', live };
+  }
   return { status: 'failed', text: 'This turn could not be completed.' };
 }
 
@@ -149,13 +259,32 @@ async function web(req, res, path) {
     res.writeHead(200, { 'content-type': type });
     return res.end(body);
   }
+  if (runtimes && owner.agent === runtimeAgent && /^\/api\/runtimes(?:\/|$)/.test(path)) {
+    if (req.method !== 'GET' && req.headers['x-manolo-request'] !== '1') throw fail(403);
+    return runtimes.owner(req, res, path);
+  }
   if (req.method === 'GET' && path === '/api/dashboard') return respond(res, 200, dashboard.state(owner.agent));
   if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, { messages: store.messages(owner.agent) });
-  if (req.method === 'GET' && path === '/api/turns') return respond(res, 200, { turns: store.webHistory(owner.name, owner.agent) });
+  if (req.method === 'GET' && path === '/api/turns') {
+    const turns = store.webHistory(owner.name, owner.agent).map(turn =>
+      turn.status === 'pending' && liveTurns.has(turn.id) ? { ...turn, live: liveTurns.get(turn.id) } : turn);
+    return respond(res, 200, { turns });
+  }
+  const image = /^\/api\/turn-image\/([A-Za-z0-9_-]{1,128})\/(\d{1,3})$/.exec(path);
+  if (req.method === 'GET' && image) {
+    const blob = store.webImage(owner.name, owner.agent, image[1], Number(image[2]));
+    if (!blob) throw fail(404);
+    res.writeHead(200, {
+      'content-type': blob.mimeType, 'content-length': blob.data.length, 'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    return res.end(blob.data);
+  }
   const turn = /^\/api\/turns\/([A-Za-z0-9_-]{1,128})$/.exec(path);
   if (req.method === 'GET' && turn) {
     const result = store.webTurn(owner.name, owner.agent, turn[1]);
     if (!result) throw fail(404);
+    if (result.status === 'pending' && liveTurns.has(turn[1])) result.live = liveTurns.get(turn[1]);
     return respond(res, 200, result);
   }
   if (req.method === 'POST' || req.method === 'PUT') {
@@ -179,6 +308,9 @@ async function web(req, res, path) {
 async function internal(req, res, path) {
   const agent = agentAuth(req);
   if (!agent) throw fail(401);
+  if (runtimes && req.method === 'POST' && path === '/v1/runtime/execute') {
+    return runtimes.execute(req, res, agent, runtimeOwner);
+  }
   if (req.method === 'PUT' && path === '/v1/dashboard/draft') {
     const { draft } = dashboard.draft(agent, await readJson(req, 256 * 1024));
     return respond(res, 200, { revision: draft.revision });
@@ -271,15 +403,29 @@ async function runWebTurn(job) {
     ? Object.hasOwn(deviceConfig?.grants ?? {}, job.owner.slice(7)) &&
       deviceConfig.grants[job.owner.slice(7)][job.agent]?.includes('submit')
     : config.owners.get(job.owner)?.agent === job.agent;
-  if (!allowed) return advance('failed');
+  if (!allowed) {
+    liveTurns.delete(job.id);
+    return advance('failed');
+  }
   try {
-    const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? { sessionId: job.session_id, text: job.input } : undefined);
-    if (turn.status === 'pending') return advance('wait', null, Date.now() + 500);
-    advance(turn.status, turn.status === 'done' ? turn.text : null);
+    const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? {
+      sessionId: job.session_id, text: job.input,
+      ...(runtimes && job.agent === runtimeAgent && runtimeOwner(job.owner) && { runtimes: runtimes.targets() }),
+    } : undefined);
+    if (turn.status === 'pending') {
+      if (turn.live) setLive(job.id, turn.live);
+      else liveTurns.delete(job.id);
+      return advance('wait', { next: Date.now() + 500 });
+    }
+    liveTurns.delete(job.id);
+    advance(turn.status, { output: turn.status === 'done' ? turn.text : null, tools: turn.tools ?? null });
   } catch (err) {
     if (stop.signal.aborted) return;
-    if (isFinal(err)) return advance('failed');
-    advance(job.state, null, retryAt(job.attempts + 1), job.attempts + 1);
+    if (isFinal(err)) {
+      liveTurns.delete(job.id);
+      return advance('failed');
+    }
+    advance(job.state, { next: retryAt(job.attempts + 1), attempts: job.attempts + 1 });
   }
 }
 
@@ -318,6 +464,7 @@ const listeners = [
   serve(internal, Number(process.env.MANOLO_INTERNAL_PORT ?? 8082), internalHost),
 ];
 if (device) listeners.push(serve(device, Number(process.env.MANOLO_DEVICE_PORT ?? 8083), deviceHost));
+if (runtimes) listeners.push(serve(runtimes.device, Number(process.env.MANOLO_RUNTIME_PORT ?? 8084), runtimeHost));
 const loops = [drain(store.webReady, runWebTurn)];
 if (telegram) loops.push(pollTelegram(), drain(store.due, job => runMessage('telegram', telegram, job)));
 if (discordScope) loops.push(runDiscord(), drain(now => discordClient ? store.discordReady(now, discordScope) : [], job => runMessage('discord', discordClient, job)));

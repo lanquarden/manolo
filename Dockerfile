@@ -1,9 +1,9 @@
 FROM node:24.16.0-bookworm-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203
 WORKDIR /app
 
-# Operator tooling for `kubectl exec` debugging. Nothing in src/ shells out to
-# these; models and Pi tools cannot reach them. Versions are pinned so a rebuild
-# does not silently change what is in the pod.
+# Operator tooling for `kubectl exec` debugging and for a worker's own bash tool.
+# Nothing in src/ shells out to these; the coding tools reach them as the node user.
+# Versions are pinned so a rebuild does not silently change what is in the pod.
 ARG MISE_VERSION=2026.11.11
 ARG YQ_VERSION=v4.54.3
 RUN set -eux; \

@@ -9,6 +9,44 @@
 {{- if not (regexMatch "^[a-z][a-z0-9-]{0,31}$" $id) -}}{{ fail "Agent IDs must be Kubernetes name segments" }}{{- end -}}
 {{- $_ := set $entries $id (dict "url" (printf "http://manolo-%s:8081" $id) "tokenEnv" $agent.tokenEnv) -}}
 {{- end -}}
+{{- $runtimeAgent := .Values.runtimeAgent -}}
+{{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
+{{- if $runtimeAgent -}}
+{{- if not (hasKey $entries $runtimeAgent) -}}{{ fail (printf "runtimeAgent %q is not configured in agents" $runtimeAgent) }}{{- end -}}
+{{- if hasKey $entries "runtimes" -}}{{ fail "runtimes is a reserved agent ID when the runtime companion listener is enabled" }}{{- end -}}
+{{- if .Values.relayDemoCredentials -}}{{ fail "runtimeAgent cannot be enabled with relayDemoCredentials" }}{{- end -}}
+{{- with .Values.relayConfig.routes -}}
+{{- if not (kindIs "slice" .) -}}{{ fail "relayConfig.routes must be a list" }}{{- end -}}
+{{- range . -}}
+{{- if not (kindIs "map" .) -}}{{ fail "relayConfig.routes entries must be mappings" }}{{- end -}}
+{{- if and (kindIs "string" .agent) (eq .agent $runtimeAgent) -}}
+{{- fail (printf "runtimeAgent %q must be web-only: relayConfig.routes must not target it" $runtimeAgent) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "slice" .Values.runtimeIngressFrom) .Values.runtimeIngressFrom) -}}
+{{- fail "runtimeAgent requires a nonempty runtimeIngressFrom list" -}}
+{{- end -}}
+{{- range $i, $peer := .Values.runtimeIngressFrom -}}
+{{- $path := printf "runtimeIngressFrom[%d]" $i -}}
+{{- if not (kindIs "map" $peer) -}}{{ fail (printf "%s must be a NetworkPolicy peer mapping" $path) }}{{- end -}}
+{{- $restricted := false -}}
+{{- range $key, $value := $peer -}}
+{{- if not (kindIs "map" $value) -}}{{ fail (printf "%s.%s must be a mapping" $path $key) }}{{- end -}}
+{{- if eq $key "ipBlock" -}}
+{{- if or (ne (len $peer) 1) (not (kindIs "string" $value.cidr)) (not ($value.cidr | trim)) (regexMatch "/0+$" ($value.cidr | trim)) -}}
+{{- fail (printf "%s.ipBlock requires a restricted CIDR and cannot be combined with selectors" $path) -}}
+{{- end -}}
+{{- $restricted = true -}}
+{{- else if or (eq $key "podSelector") (eq $key "namespaceSelector") -}}
+{{- if or $value.matchLabels $value.matchExpressions -}}{{- $restricted = true -}}{{- end -}}
+{{- else -}}
+{{- fail (printf "%s.%s is not a NetworkPolicy peer field" $path $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $restricted -}}{{ fail (printf "%s must not be empty or allow unrestricted ingress" $path) }}{{- end -}}
+{{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -79,6 +117,9 @@ spec:
             - {name: http, containerPort: {{ $w.port }}}
             {{- if eq $w.kind "relay" }}
             - {name: internal, containerPort: 8082}
+            {{- if $runtimeAgent }}
+            - {name: runtimes, containerPort: 8084}
+            {{- end }}
             {{- end }}
           readinessProbe:
             httpGet: {path: /healthz, port: http}
@@ -96,6 +137,10 @@ spec:
             {{- if eq $w.kind "relay" }}
             - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- if $runtimeAgent }}
+            - {name: MANOLO_RUNTIME_AGENT, value: {{ $runtimeAgent | quote }}}
+            - {name: MANOLO_RUNTIME_HOST, value: "0.0.0.0"}
+            {{- end }}
             {{- if $.Values.relayDemoCredentials }}
             - {name: MANOLO_DEMO, value: "1"}
             - {name: MANOLO_DEMO_ALLOW_NETWORK, value: "1"}
@@ -103,8 +148,17 @@ spec:
             {{- else }}
             - {name: MANOLO_AGENT_ID, value: {{ $w.agentId | quote }}}
             - {name: MANOLO_RELAY_URL, value: "http://manolo-relay:8082"}
+            {{- if hasKey $w "codingTools" }}
+            {{- if not (kindIs "bool" $w.codingTools) }}{{ fail "agents.<id>.codingTools must be a boolean" }}{{ end }}
+            {{- if not $w.codingTools }}
+            - {name: MANOLO_CODING_TOOLS, value: "0"}
+            {{- end }}
+            {{- end }}
             {{- with $w.instructions }}
             - {name: MANOLO_AGENT_INSTRUCTIONS, value: {{ . | quote }}}
+            {{- end }}
+            {{- with $w.bashEnv }}
+            - {name: MANOLO_BASH_ENV, value: {{ join "," . | quote }}}
             {{- end }}
             {{- if $w.fixture }}
             - {name: MANOLO_MODE, value: fixture}
@@ -118,7 +172,11 @@ spec:
             {{- end }}
           resources:
             requests: {cpu: 50m, memory: 128Mi}
+            {{- if eq $w.kind "worker" }}
+            limits: {memory: 1Gi}
+            {{- else }}
             limits: {memory: 512Mi}
+            {{- end }}
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
@@ -133,7 +191,7 @@ spec:
         - name: data
           persistentVolumeClaim: {claimName: {{ $w.name }}-data}
         - name: tmp
-          emptyDir: {sizeLimit: 32Mi}
+          emptyDir: {sizeLimit: {{ if eq $w.kind "worker" }}256Mi{{ else }}32Mi{{ end }}}
         - name: home
           emptyDir: {sizeLimit: 1Gi}
         {{- if eq $w.kind "relay" }}
@@ -153,6 +211,19 @@ spec:
     {{- if eq $w.kind "relay" }}
     - {name: internal, port: 8082, targetPort: internal}
     {{- end }}
+{{- end }}
+{{- if $runtimeAgent }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: manolo-runtimes
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: manolo-relay}
+  ports:
+    - {name: runtimes, port: 8084, targetPort: runtimes}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -184,4 +255,9 @@ spec:
     - from:
         {{- toYaml . | nindent 8 }}
       ports: [{port: 8080, protocol: TCP}]
+    {{- end }}
+    {{- if $runtimeAgent }}
+    - from:
+        {{- toYaml .Values.runtimeIngressFrom | nindent 8 }}
+      ports: [{port: 8084, protocol: TCP}]
     {{- end }}

@@ -87,11 +87,20 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
 }, async (t) => {
   const literal = '<b data-untrusted>plain text</b>';
+  const tools = [
+    { name: 'bash', status: 'ok', args: '{"command":"echo hi"}', output: 'hi\n', durationMs: 12,
+      diagnostics: [{ severity: 'info', code: 'full_output', message: 'Full output: /tmp/manolo/tool-output' }] },
+    { name: 'edit', status: 'error', args: '{"path":"notes.txt"}', diff: '- old\n+ new', output: 'Could not edit the file.' },
+    { name: 'read', status: 'ok', images: [{ mimeType: 'image/png', index: 0 }] },
+  ];
   const turns = [
-    { id: 'saved', text: literal, createdAt: 1, status: 'done', reply: literal },
+    { id: 'saved', text: literal, createdAt: 1, status: 'done', reply: literal, tools },
     { id: 'failed', text: 'Saved failure', createdAt: 2, status: 'failed' },
     { id: 'older', text: 'Older pending', createdAt: 3, status: 'pending' },
-    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending' },
+    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending', live: {
+      text: 'streamed partial', thinking: 'streamed reasoning',
+      tools: [{ name: 'bash', status: 'running', output: 'live output line' }],
+    } },
   ];
   const checked = [];
   const posts = [];
@@ -150,6 +159,20 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.deepEqual(await run(`[...document.querySelector('#chat-log').children].map(row => row.children[1].textContent)`),
     [literal, 'Saved failure', 'Older pending', 'Latest pending']);
   assert.equal(await run(`document.querySelectorAll('[data-untrusted]').length`), 0);
+  const saved = `document.querySelector('#chat-log > li:first-child')`;
+  assert.equal(await run(`${saved}.querySelectorAll('.chat-tool').length`), 3);
+  assert.deepEqual(await run(`[...${saved}.querySelectorAll('.chat-tool .tool-name')].map(node => node.textContent)`), ['bash', 'edit', 'read']);
+  assert.deepEqual(await run(`[...${saved}.querySelectorAll('.chat-tool .tool-status')].map(node => node.textContent)`), ['ok', 'failed', 'ok']);
+  assert.ok(await run(`${saved}.querySelector('.chat-tool').textContent.includes('echo hi')`));
+  assert.ok(await run(`${saved}.querySelector('.chat-tool').textContent.includes('Full output: /tmp/manolo/tool-output')`));
+  assert.ok(await run(`${saved}.querySelector('.chat-tool .tool-diff').textContent.includes('- old')`));
+  assert.equal(await run(`${saved}.querySelector('.chat-tool[data-status="error"] .tool-status').textContent`), 'failed');
+  assert.equal(await run(`${saved}.querySelector('.tool-image img').getAttribute('src')`), '/api/turn-image/saved/0');
+  assert.equal(await run(`${saved}.querySelector('.chat-tool:has(.tool-image)').open`), true);
+  assert.equal(await run(`document.querySelector('.chat-stream').textContent`), 'streamed partial');
+  assert.equal(await run(`document.querySelector('.chat-thinking-text').textContent`), 'streamed reasoning');
+  assert.equal(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-status').textContent`), 'running');
+  assert.ok(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-output').textContent.includes('live output line')`));
   assert.ok(await run(`${logText}.includes(${JSON.stringify(literal)}) && ${logText}.includes('Turn failed.')`));
   assert.equal(await run(sendDisabled), true);
   assert.equal(await run(checkHidden), false);

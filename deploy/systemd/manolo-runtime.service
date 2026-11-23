@@ -1,0 +1,15 @@
+[Unit]
+Description=Manolo paired execution runtime
+ConditionPathExists=%h/.local/state/manolo-runtime/pairing.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.local/lib/manolo/runtime-companion.mjs run
+WorkingDirectory=%h
+UMask=0077
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

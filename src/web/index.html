@@ -94,6 +94,19 @@
                 <div id="draft-dashboard" class="dashboard-view"><p>Loading…</p></div>
               </section>
             </div>
+            <section id="paired-runtimes" class="panel-card" aria-labelledby="runtimes-heading" hidden>
+              <fieldset id="runtime-controls" aria-labelledby="runtimes-heading">
+                <div class="card-header">
+                  <h2 id="runtimes-heading">Paired runtimes</h2>
+                  <button id="refresh-runtimes" type="button" aria-label="Refresh paired runtimes">Refresh</button>
+                </div>
+                <p>The agent chooses which runtime to use.</p>
+                <ul id="runtime-list" class="revision-list"></ul>
+                <div><button id="generate-pairing-code" type="button">Generate pairing code</button></div>
+                <p id="runtime-pairing" hidden>Pairing code: <code id="runtime-code" class="plain-text"></code><br>Expires at <time id="runtime-code-expiry"></time>.</p>
+                <p id="runtime-status" class="status" role="status"></p>
+              </fieldset>
+            </section>
             <details class="panel-card">
               <summary>Advanced · Edit draft JSON</summary>
               <form id="draft-form">

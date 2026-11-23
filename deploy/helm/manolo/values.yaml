@@ -7,6 +7,11 @@ storageClassName: longhorn
 relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passwords load. Isolated smoke tests only.
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
+# Optional cluster-internal runtime companion listener. The agent must be web-only
+# (not targeted by relayConfig.routes), and relayDemoCredentials must be disabled.
+runtimeAgent: ''
+# Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
+runtimeIngressFrom: []
 relayConfig:
   owners:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
@@ -24,6 +29,10 @@ agents:
     provider: ""
     model: ""
     instructions: "" # Non-secret behavior instructions; changing this restarts only this worker.
+    codingTools: true # Set false to keep the pod shell and file tools unavailable to this agent.
+    # Extra environment names the worker's bash tool receives. Only an allowlist reaches the shell; the agent token
+    # and provider key are refused even when named here.
+    bashEnv: []
     fixture: false
   canary:
     image: ""
@@ -33,4 +42,6 @@ agents:
     provider: ""
     model: ""
     instructions: ""
+    codingTools: true
+    bashEnv: []
     fixture: false

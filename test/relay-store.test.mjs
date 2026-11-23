@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { loadRelayConfig, routeKey } from '../src/relay-config.mjs';
+import { key, loadRelayConfig, routeKey } from '../src/relay-config.mjs';
 import { openRelayStore } from '../src/relay-store.mjs';
 
 const userId = '1234567890123456789';
@@ -78,5 +79,40 @@ test('browser recent history is ordered and bounded without forgetting earlier t
     assert.deepEqual(store.webHistory('owner', 'primary').map(t => t.id), Array.from({ length: 30 }, (_, i) => `t${i + 6}`));
     assert.deepEqual(store.webHistory('other', 'primary'), []);
     assert.deepEqual(store.webHistory('owner', 'canary'), []);
+    // Tool transcripts ride along with a done turn and ignore a corrupt stored value.
+    const [job] = store.webReady(Date.now());
+    const tools = [{ name: 'bash', status: 'ok', output: 'hi', images: [{ mimeType: 'image/png', data: 'AA==' }] }];
+    store.webAdvance(job, 'done', { output: 'answered', tools });
+    const stored = [{ name: 'bash', status: 'ok', output: 'hi', images: [{ mimeType: 'image/png', index: 0 }] }];
+    assert.deepEqual(store.webTurn('owner', 'primary', job.id), { status: 'done', text: 'answered', tools: stored });
+    assert.deepEqual([...store.webImage('owner', 'primary', job.id, 0).data], [0]);
+    assert.equal(store.webImage('owner', 'primary', job.id, 1), undefined);
+    assert.equal(store.webImage('owner', 'canary', job.id, 0), undefined);
+    store.db.prepare('UPDATE web_turns SET tools=? WHERE seq=?').run('not json', job.seq);
+    assert.deepEqual(store.webTurn('owner', 'primary', job.id), { status: 'done', text: 'answered' });
+  } finally { store.db.close(); }
+});
+
+test('a relay database from before tool transcripts keeps working and gains them', t => {
+  const path = join(workspace(t), 'legacy.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE web_turns (
+    seq INTEGER PRIMARY KEY, id TEXT NOT NULL, owner TEXT NOT NULL, agent TEXT NOT NULL,
+    turn_id TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL, input TEXT NOT NULL, created_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('submit','wait','done','failed')),
+    output TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0
+  )`);
+  legacy.prepare(`INSERT INTO web_turns(id,owner,agent,turn_id,session_id,input,created_at,state,output)
+    VALUES('old','owner','primary',?,?,'earlier question','2026-01-01T00:00:00.000Z','done','earlier answer')`)
+    .run(key('web', 'owner', 'primary', 'old'), key('web-session', 'owner', 'primary'));
+  legacy.close();
+  const store = openRelayStore(path);
+  try {
+    assert.deepEqual(store.webTurn('owner', 'primary', 'old'), { status: 'done', text: 'earlier answer' });
+    store.webSubmit('owner', 'primary', 'new', 'new question');
+    const [job] = store.webReady(Date.now());
+    const tools = [{ name: 'bash', status: 'ok', output: 'hi' }];
+    store.webAdvance(job, 'done', { output: 'new answer', tools });
+    assert.deepEqual(store.webTurn('owner', 'primary', 'new'), { status: 'done', text: 'new answer', tools });
   } finally { store.db.close(); }
 });
