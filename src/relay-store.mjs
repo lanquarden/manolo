@@ -12,10 +12,11 @@ const webTools = row => {
     return {};
   }
 };
-const webStatus = row => {
+const webActivity = row => row.state === 'submit' ? 'queued' : 'running';
+const webStatus = (row, includeActivity) => {
   if (row.state === 'done') return { status: 'done', text: row.output, ...webTools(row) };
   if (row.state === 'failed') return { status: 'failed', text: 'This turn could not be completed.' };
-  return { status: 'pending' };
+  return { status: 'pending', ...(includeActivity && { activity: webActivity(row) }) };
 };
 
 export function openRelayStore(path) {
@@ -163,23 +164,25 @@ export function openRelayStore(path) {
       db.prepare(`UPDATE ${table} SET state=?, output=?, next_at=?, attempts=?${cleanup} WHERE ${column}=?`)
         .run(state, terminal ? null : output, next, attempts, id);
     },
-    webSubmit(owner, agent, id, text) {
+    webSubmit(owner, agent, id, text, { includeActivity = false } = {}) {
       const turnId = webId(owner, agent, id);
       db.prepare(`INSERT INTO web_turns(id,owner,agent,turn_id,session_id,input,created_at,state)
         VALUES(?,?,?,?,?,?,?,'submit') ON CONFLICT(turn_id) DO NOTHING`)
         .run(id, owner, agent, turnId, webSession(owner, agent), text, new Date().toISOString());
       const row = webLookup.get(turnId);
       if (row.input !== text) throw conflict();
-      return webStatus(row);
+      return webStatus(row, includeActivity);
     },
-    webTurn(owner, agent, id) {
+    webTurn(owner, agent, id, { includeActivity = false } = {}) {
       const row = webLookup.get(webId(owner, agent, id));
-      return row && webStatus(row);
+      return row && webStatus(row, includeActivity);
     },
     webHistory(owner, agent) {
       return db.prepare('SELECT * FROM web_turns WHERE session_id=? ORDER BY seq DESC LIMIT 30').all(webSession(owner, agent)).reverse().map(row => ({
         id: row.id, text: row.input, createdAt: row.created_at,
-        status: webStatus(row).status, ...(row.state === 'done' && { reply: row.output }), ...webTools(row),
+        status: webStatus(row).status,
+        ...(['submit', 'wait'].includes(row.state) && { activity: webActivity(row) }),
+        ...(row.state === 'done' && { reply: row.output }), ...webTools(row),
       }));
     },
     webReady(now) { return webReady.all(now); },

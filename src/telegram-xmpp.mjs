@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import { client, xml } from '@xmpp/client';
 import { boundedSpeechText, MAX_SPEECH_TEXT, speechError, validTranscript, validVoiceFileId } from './speech.mjs';
 
 const NS = 'urn:manolo:telegram-bridge:0';
 const STANZA = 'urn:ietf:params:xml:ns:xmpp-stanzas';
 const TIMEOUT = 40_000;
+const TYPING_TIMEOUT = 3000;
 const BATCH = 4; // Bound the escaped IQ size on standard Prosody listeners.
 const MAX_RESPONSE = 150_000;
 const ACCOUNT = /^([a-z0-9_.-]+)@([a-z0-9.-]+)\/([a-z0-9_-]+)$/;
@@ -57,14 +59,19 @@ function validateBatch(batch, offset) {
   return batch;
 }
 
-export function createTelegramXmppTransport(env, lifecycle, clientFactory = client) {
+function botId(env) {
   const bot = env.MANOLO_TELEGRAM_BOT_ID;
-  if (!/^[1-9][0-9]*$/.test(bot ?? '')) throw new Error('Configure the Telegram bot ID for XMPP');
+  if (typeof bot !== 'string' || !/^[1-9][0-9]*$/.test(bot)) throw new Error('Configure the Telegram bot ID for XMPP');
+  return bot;
+}
+
+export function createTelegramXmppTransport(env, lifecycle, clientFactory = client) {
+  const bot = botId(env);
   const { xmpp, peer } = connect(env, lifecycle, undefined, clientFactory);
-  async function call(name, type, attrs, content, signal) {
+  async function call(name, type, attrs, content, signal, timeout = TIMEOUT) {
     signal?.throwIfAborted();
     if (lifecycle.aborted || xmpp.status !== 'online') throw new Error('Telegram XMPP bridge is not online');
-    const result = await xmpp.iqCaller.request(xml('iq', { to: peer, type, id: randomUUID() }, xml(name, { xmlns: NS, bot, ...attrs }, content)), TIMEOUT);
+    const result = await xmpp.iqCaller.request(xml('iq', { to: peer, type, id: randomUUID() }, xml(name, { xmlns: NS, bot, ...attrs }, content)), timeout);
     signal?.throwIfAborted();
     if (result.attrs.from !== peer) throw new Error('Unexpected Telegram XMPP reply sender');
     const payload = result.getChild(name, NS);
@@ -82,6 +89,24 @@ export function createTelegramXmppTransport(env, lifecycle, clientFactory = clie
     },
     async send({ chatId, text, messageId }, signal) {
       await call('send', 'set', { chat: chatId, ...(messageId !== undefined && { message: String(messageId) }) }, json(text), signal);
+    },
+    async typing({ chatId }, signal) {
+      if (!validChat(chatId)) throw new TypeError('Invalid Telegram chat ID');
+      // The IQ library starts its reply timer after writing the stanza. Also
+      // bound the caller's wait if the write stalls or the turn is cancelled.
+      const deadline = AbortSignal.timeout(TYPING_TIMEOUT);
+      const pendingSignal = AbortSignal.any(signal == null ? [lifecycle, deadline] : [signal, lifecycle, deadline]);
+      pendingSignal.throwIfAborted();
+      const { promise: aborted, reject } = Promise.withResolvers();
+      const listener = addAbortListener(pendingSignal, () => reject(pendingSignal.reason));
+      try {
+        const response = await Promise.race([
+          call('typing', 'set', { chat: chatId }, undefined, pendingSignal, TYPING_TIMEOUT), aborted,
+        ]);
+        if (response.children.length) throw new Error('Invalid Telegram XMPP typing response');
+      } finally {
+        listener[Symbol.dispose]();
+      }
     },
     async transcribeVoice(fileId, signal) {
       if (!validVoiceFileId(fileId)) throw speechError('Invalid Telegram voice file ID', true);
@@ -102,12 +127,13 @@ export function createTelegramXmppTransport(env, lifecycle, clientFactory = clie
 }
 
 export function serveTelegramOverXmpp(env, telegram, lifecycle, clientFactory = client) {
+  const bot = botId(env);
   const err = () => xml('error', { type: 'auth' }, xml('forbidden', { xmlns: STANZA }));
   let polling = false;
   return connect(env, lifecycle, (xmpp, peer) => {
     function handler(name, operation) {
       return async ({ stanza, element }) => {
-        if (stanza.attrs.from !== peer || element.attrs.bot !== env.MANOLO_TELEGRAM_BOT_ID) return err();
+        if (stanza.attrs.from !== peer || element.attrs.bot !== bot) return err();
         const response = (result, payload) => xml(name, { xmlns: NS, result }, payload);
         try {
           const data = await operation(element);
@@ -136,6 +162,11 @@ export function serveTelegramOverXmpp(env, telegram, lifecycle, clientFactory = 
       if (!validChat(chatId) || (element.attrs.message !== undefined && !messageId) ||
           typeof text !== 'string' || !text.length || text.length > 16000) throw new Error('Invalid delivery');
       await telegram.send({ chatId, text, messageId }, lifecycle);
+    }));
+    xmpp.iqCallee.set(NS, 'typing', handler('typing', async element => {
+      const chatId = element.attrs.chat;
+      if (!validChat(chatId) || element.children.length) throw speechError('Invalid typing request', true);
+      await telegram.typing({ chatId }, lifecycle);
     }));
     // The exact authenticated relay account is the authorization authority. It
     // requests STT only after routing an update, and voice sends from its outbox.

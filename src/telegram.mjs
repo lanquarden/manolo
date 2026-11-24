@@ -3,6 +3,7 @@ import { MAX_VOICE_BYTES, MAX_VOICE_SECONDS, readBounded, speechError, validVoic
 const POLL_SECONDS = 25;
 const POLL_DEADLINE_MS = 35_000;
 const SEND_DEADLINE_MS = 10_000;
+const TYPING_DEADLINE_MS = 2000;
 const MAX_INPUT_UNITS = 4000;
 const MAX_SEND_UNITS = 4096;
 const TRUNCATED = '\n\n[truncated]';
@@ -181,6 +182,13 @@ export function createTelegramTransport({ token, baseUrl = 'https://api.telegram
       await request('sendMessage', { chat_id: telegramChatId(chatId), text: boundedText(text),
         ...(messageId !== undefined && { reply_parameters: replyParameters(messageId) }),
       }, signal, SEND_DEADLINE_MS);
+    },
+
+    async typing({ chatId }, signal) {
+      const id = telegramChatId(chatId);
+      if (id.startsWith('-')) throw new TypeError('Expected a private Telegram chat');
+      const result = await request('sendChatAction', { chat_id: id, action: 'typing' }, signal, TYPING_DEADLINE_MS);
+      if (result !== true) throw new TelegramTransportError('Invalid Telegram typing response');
     },
 
     async transcribeVoice(fileId, signal) {

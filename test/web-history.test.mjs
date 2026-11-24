@@ -77,6 +77,7 @@ async function waitFor(run, expression) {
 
 const logCount = `document.querySelector('#chat-log')?.childElementCount`;
 const logText = `document.querySelector('#chat-log').textContent`;
+const pendingStates = `[...document.querySelectorAll('.chat-answer[data-state="pending"] .chat-turn-state')].map(node => node.textContent)`;
 const sendDisabled = `document.querySelector('#send-chat')?.disabled`;
 const checkHidden = `document.querySelector('#check-turn')?.hidden`;
 const refreshDisabled = `document.querySelector('#refresh-chat')?.disabled`;
@@ -96,8 +97,8 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   const turns = [
     { id: 'saved', text: literal, createdAt: 1, status: 'done', reply: literal, tools },
     { id: 'failed', text: 'Saved failure', createdAt: 2, status: 'failed' },
-    { id: 'older', text: 'Older pending', createdAt: 3, status: 'pending' },
-    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending', live: {
+    { id: 'older', text: 'Older pending', createdAt: 3, status: 'pending', activity: 'queued' },
+    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending', activity: 'running', live: {
       text: 'streamed partial', thinking: 'streamed reasoning',
       tools: [{ name: 'bash', status: 'running', output: 'live output line' }],
     } },
@@ -105,6 +106,10 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   const checked = [];
   const posts = [];
   const authorizations = [];
+  const finishLatest = Promise.withResolvers();
+  const finishOlder = Promise.withResolvers();
+  const acceptSubmit = Promise.withResolvers();
+  const finishSubmit = Promise.withResolvers();
   const assets = new Map(await Promise.all([
     ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
   ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
@@ -131,18 +136,29 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
       posts.push({ id, text, headers: req.headers, body: JSON.parse(body) });
       if (text === 'Reject this') return json({}, 400);
       const uncertain = text === 'Saved but response lost';
-      const status = uncertain ? 'pending' : 'done';
-      const reply = uncertain ? undefined : 'Second tab reply';
-      turns.push({ id, text, createdAt: turns.length + 1, status, reply });
-      return uncertain ? json({}, 503) : json({ status, text: reply });
+      if (!uncertain) await acceptSubmit.promise;
+      turns.push({ id, text, createdAt: turns.length + 1, status: 'pending', activity: 'running' });
+      return uncertain ? json({}, 503) : json({ status: 'pending', activity: 'running' });
     }
     if (url.startsWith('/api/turns/')) {
       const turn = turns.find(({ id }) => url === `/api/turns/${id}`);
       if (!turn) return json({}, 404);
       checked.push(turn.id);
-      if (turn.id === 'latest' && checked.length === 1) return json({ status: 'pending' });
+      const checks = checked.filter((id) => id === turn.id).length;
+      const fromSecondTab = turn.text === 'Sent from another tab';
+      if (turn.id === 'latest') {
+        if (checks === 1) return json({ status: 'pending' }); // An older relay omits activity.
+        await finishLatest.promise;
+      } else if (turn.id === 'older') {
+        if (checks < 3) return json({ status: 'pending', activity: checks === 1 ? 'queued' : 'running' });
+        await finishOlder.promise;
+      } else if (fromSecondTab) {
+        await finishSubmit.promise;
+      }
       turn.status = turn.id === 'older' ? 'failed' : 'done';
-      turn.reply = turn.id === 'older' ? 'Check failed' : 'Recovered reply';
+      turn.reply = turn.id === 'older' ? 'Check failed' : fromSecondTab ? 'Second tab reply' : 'Recovered reply';
+      delete turn.activity;
+      delete turn.live;
       return json({ status: turn.status, text: turn.reply });
     }
     return json({}, 404);
@@ -169,6 +185,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.equal(await run(`${saved}.querySelector('.chat-tool[data-status="error"] .tool-status').textContent`), 'failed');
   assert.equal(await run(`${saved}.querySelector('.tool-image img').getAttribute('src')`), '/api/turn-image/saved/0');
   assert.equal(await run(`${saved}.querySelector('.chat-tool:has(.tool-image)').open`), true);
+  assert.deepEqual(await run(pendingStates), ['Queued.', 'Running.']);
   assert.equal(await run(`document.querySelector('.chat-stream').textContent`), 'streamed partial');
   assert.equal(await run(`document.querySelector('.chat-thinking-text').textContent`), 'streamed reasoning');
   assert.equal(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-status').textContent`), 'running');
@@ -195,21 +212,36 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   await run(`${fill('New draft')}; document.querySelector('#chat-form').requestSubmit()`);
   await run(click('check-turn'));
   assert.equal(await run(refreshDisabled), true);
+  await waitFor(run, `${pendingStates}.at(-1) === 'Reply pending.'`);
+  assert.ok(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-output').textContent.includes('live output line')`));
+  finishLatest.resolve();
   await waitFor(run, `!${refreshDisabled} && ${logText}.includes('Recovered reply')`);
+  assert.deepEqual(await run(pendingStates), ['Queued.']);
+  assert.equal(await run(`document.querySelector('#chat-log > li:last-child .chat-turn-state')`), null);
+  assert.equal(await run(`document.querySelector('.chat-stream')`), null);
   assert.deepEqual(checked, ['latest', 'latest']);
   assert.equal(posts.length, 0);
   assert.equal(await run(logCount), 4);
   assert.equal(await run(sendDisabled), true);
   await run(click('check-turn'));
+  await waitFor(run, `${pendingStates}.at(-1) === 'Running.'`);
+  finishOlder.resolve();
   await waitFor(run, `!${sendDisabled}`);
-  assert.deepEqual(checked, ['latest', 'latest', 'older']);
+  assert.deepEqual(checked, ['latest', 'latest', 'older', 'older', 'older']);
+  assert.deepEqual(await run(pendingStates), []);
+  assert.equal(await run(`document.querySelector('#chat-log > li:nth-last-child(2) .chat-turn-state').textContent`), 'Turn failed.');
   assert.ok(await run(`${logText}.includes('Check failed')`));
   assert.equal(await run(`document.querySelector('#chat-text').value`), 'New draft');
 
   const { run: second } = await openTab(url);
   await waitFor(second, `${logCount} === 4 && !${sendDisabled}`);
   await second(`${fill('Sent from another tab')}; document.getElementById('chat-text').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }))`);
+  assert.deepEqual(await second(pendingStates), ['Queued.']);
+  acceptSubmit.resolve();
+  await waitFor(second, `${pendingStates}.at(-1) === 'Running.'`);
+  finishSubmit.resolve();
   await waitFor(second, `${logText}.includes('Second tab reply')`);
+  assert.deepEqual(await second(pendingStates), []);
   assert.equal(await run(logCount), 4);
   await run(click('refresh-chat'));
   await waitFor(run, `${logCount} === 5 && !${sendDisabled}`);
@@ -230,6 +262,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.equal(await run(sendDisabled), true);
   await run(click('refresh-chat'));
   await waitFor(run, `!${refreshDisabled} && ${logCount} === 6`);
+  assert.deepEqual(await run(pendingStates), ['Running.']);
   assert.equal(await run(checkHidden), false);
   await run(click('check-turn'));
   await waitFor(run, `!${sendDisabled}`);

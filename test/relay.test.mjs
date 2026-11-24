@@ -86,6 +86,8 @@ test('real relay and Pi worker processes: message recovery, private routing, web
     if (req.url.endsWith('/getUpdates')) {
       offsets.push(data.offset);
       result = updates.filter(update => update.update_id >= data.offset);
+    } else if (req.url.endsWith('/sendChatAction')) {
+      result = true;
     } else if (req.url === '/mock-discord-reply') {
       discordSent.push(data);
       result = { message_id: discordSent.length };
@@ -308,7 +310,7 @@ test('real relay and Pi worker processes: message recovery, private routing, web
   const parked = launchRelay(relayInternalPort);
   const parkedWeb = addr(await parked.port(/web listening on .*:(\d+)/));
   const queued = await request(parkedWeb, '/api/turns', tester, 'POST', { id: 'parked', text: 'durable browser request' }, mutation);
-  assert.deepEqual(await queued.json(), { status: 'pending' });
+  assert.deepEqual(await queued.json(), { status: 'pending', activity: 'queued' });
   assert.deepEqual((await history(parkedWeb, tester)).map(({ id, status }) => [id, status]), [['parked', 'pending']]);
   await parked.end('SIGKILL');
   conf.agents.canary.url = canaryUrl;
@@ -325,4 +327,67 @@ test('real relay and Pi worker processes: message recovery, private routing, web
   assert.deepEqual(persisted.find(({ id }) => id === 'draft-tool')?.tools?.map(({ name }) => name), ['write_dashboard_draft']);
   assert.equal((await request(recoveredWeb, '/api/turns/parked', owner)).status, 404);
   assert.equal(discordSent.length, 2, 'replayed gateway events do not send a second reply');
+});
+
+test('slow accepted turns show activity without sending a holding message', { timeout: 20000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-activity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let ready = false;
+  const typing = [];
+  const replies = [];
+  const mock = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const payload = body && JSON.parse(body);
+    res.setHeader('content-type', 'application/json');
+    if (req.url.startsWith('/v1/turns/')) {
+      res.statusCode = ready ? 200 : 202;
+      res.end(JSON.stringify(ready ? { status: 'done', text: 'Final answer' } : { status: 'pending' }));
+    } else if (req.url.endsWith('/getUpdates')) {
+      res.end(JSON.stringify({ ok: true, result: payload.offset === 0
+        ? [update(1, 101, 'Allowed'), update(2, 999, 'Denied')]
+        : [] }));
+    } else if (req.url.endsWith('/sendChatAction')) {
+      typing.push(payload);
+      res.end(JSON.stringify({ ok: true, result: true }));
+    } else if (req.url.endsWith('/sendMessage')) {
+      replies.push(payload);
+      res.end(JSON.stringify({ ok: true, result: { message_id: 123 } }));
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  mock.listen(0, '127.0.0.1');
+  await once(mock, 'listening');
+  t.after(() => mock.close());
+  const base = addr(mock.address().port);
+  const env = { PRIMARY_TOKEN: secret(), OWNER_PASSWORD: secret() };
+  const config = join(root, 'relay.json');
+  await writeFile(config, JSON.stringify({
+    agents: { primary: { url: base, tokenEnv: 'PRIMARY_TOKEN' } },
+    owners: { owner: { agent: 'primary', passwordEnv: 'OWNER_PASSWORD' } },
+    routes: [{ transport: 'telegram', userId: '101', chatId: '101', agent: 'primary' }], inbox: [],
+  }));
+  const relay = start(t, 'relay', { ...env, MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: root,
+    MANOLO_TELEGRAM_TOKEN: '123456:fixture-key-not-real', MANOLO_TELEGRAM_BASE_URL: base,
+    PORT: '0', MANOLO_INTERNAL_PORT: '0' });
+  const web = addr(await relay.port(/web listening on .*:(\d+)/));
+  const auth = basic('owner', env.OWNER_PASSWORD);
+  const submission = await request(web, '/api/turns', auth, 'POST', { id: 'web-activity', text: 'Slow' }, { 'x-manolo-request': '1' });
+  assert.deepEqual(await submission.json(), { status: 'pending', activity: 'queued' });
+  await until(async () => (await (await request(web, '/api/turns/web-activity', auth)).json()).activity === 'running', 'worker accepted');
+  const history = await (await request(web, '/api/turns', auth)).json();
+  assert.equal(history.turns[0].activity, 'running');
+  await until(() => typing.length > 0, 'typing while work is running');
+  assert.deepEqual(typing[0], { chat_id: '101', action: 'typing' });
+  assert.deepEqual(replies, []);
+  ready = true;
+  await until(() => replies.length > 0, 'only the final chat reply');
+  assert.deepEqual(replies.map(r => [r.chat_id, r.text]), [['101', 'Final answer']]);
+  assert.ok(typing.every(r => r.chat_id === '101'));
+  const result = await until(async () => {
+    const data = await (await request(web, '/api/turns/web-activity', auth)).json();
+    return data.status === 'done' && data;
+  }, 'final web reply');
+  assert.deepEqual(result, { status: 'done', text: 'Final answer' });
 });

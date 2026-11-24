@@ -6,12 +6,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createDashboard } from './dashboard.mjs';
 import { createDeviceHandler } from './device-api.mjs';
-import { edgeKey, ID, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
+import { edgeKey, ID, key, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
 import { createRuntimeRelay } from './runtime-relay.mjs';
 import { createSpeechFromEnv } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
+import { createTypingActivity } from './typing-activity.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
@@ -52,10 +53,13 @@ try { writerLock.exec('BEGIN EXCLUSIVE'); } catch { throw new Error('Relay data 
 const store = openRelayStore(join(dataDir, 'relay.sqlite'));
 // Live progress is presentation only: kept in memory, replaced on every worker poll and dropped as soon as a turn ends.
 const liveTurns = new Map();
+const webLiveId = (owner, id) => key('web', owner.name, owner.agent, id);
 const setLive = (id, live) => {
   if (!liveTurns.has(id) && liveTurns.size >= 100) liveTurns.delete(liveTurns.keys().next().value);
   liveTurns.set(id, live);
 };
+const telegramTyping = telegram && typeof telegram.typing === 'function'
+  ? createTypingActivity(telegram.typing.bind(telegram), stop.signal) : null;
 if (telegram) store.bindBot(botScope);
 const dashboard = createDashboard(store.db);
 const devicePath = process.env.MANOLO_DEVICE_CONFIG;
@@ -266,8 +270,10 @@ async function web(req, res, path) {
   if (req.method === 'GET' && path === '/api/dashboard') return respond(res, 200, dashboard.state(owner.agent));
   if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, { messages: store.messages(owner.agent) });
   if (req.method === 'GET' && path === '/api/turns') {
-    const turns = store.webHistory(owner.name, owner.agent).map(turn =>
-      turn.status === 'pending' && liveTurns.has(turn.id) ? { ...turn, live: liveTurns.get(turn.id) } : turn);
+    const turns = store.webHistory(owner.name, owner.agent).map(turn => {
+      const live = turn.status === 'pending' && liveTurns.get(webLiveId(owner, turn.id));
+      return live ? { ...turn, live } : turn;
+    });
     return respond(res, 200, { turns });
   }
   const image = /^\/api\/turn-image\/([A-Za-z0-9_-]{1,128})\/(\d{1,3})$/.exec(path);
@@ -282,9 +288,10 @@ async function web(req, res, path) {
   }
   const turn = /^\/api\/turns\/([A-Za-z0-9_-]{1,128})$/.exec(path);
   if (req.method === 'GET' && turn) {
-    const result = store.webTurn(owner.name, owner.agent, turn[1]);
+    const result = store.webTurn(owner.name, owner.agent, turn[1], { includeActivity: true });
     if (!result) throw fail(404);
-    if (result.status === 'pending' && liveTurns.has(turn[1])) result.live = liveTurns.get(turn[1]);
+    const live = result.status === 'pending' && liveTurns.get(webLiveId(owner, turn[1]));
+    if (live) result.live = live;
     return respond(res, 200, result);
   }
   if (req.method === 'POST' || req.method === 'PUT') {
@@ -299,7 +306,7 @@ async function web(req, res, path) {
     if (req.method === 'POST' && path === '/api/turns') {
       const body = await readJson(req);
       if (!ownFields(body, 'id', 'text') || typeof body.id !== 'string' || !ID.test(body.id) || !isText(body.text)) throw fail(400);
-      return respond(res, 200, store.webSubmit(owner.name, owner.agent, body.id, body.text));
+      return respond(res, 200, store.webSubmit(owner.name, owner.agent, body.id, body.text, { includeActivity: true }));
     }
   }
   throw fail(404);
@@ -367,7 +374,13 @@ const retryAt = attempts => Date.now() + Math.min(2 ** Math.min(attempts, 9) * 1
 async function runMessage(transport, adapter, job) {
   const { agent, user_id: userId, chat_id: chatId, turn_id: id, session_id: sessionId } = job;
   const advance = (...args) => store.advance(transport, job, ...args);
-  if (config.routes.get(routeKey({ transport, userId, chatId })) !== agent) return advance('dead');
+  const typing = transport === 'telegram' ? telegramTyping : null;
+  if (config.routes.get(routeKey({ transport, userId, chatId })) !== agent) {
+    typing?.end(chatId);
+    return advance('dead');
+  }
+  if (job.state === 'send') typing?.end(chatId);
+  else typing?.begin(chatId);
   try {
     if (job.voice_file_id) {
       const text = await adapter.transcribeVoice(job.voice_file_id, stop.signal);
@@ -383,8 +396,10 @@ async function runMessage(transport, adapter, job) {
     }
     const turn = await worker(agent, id, job.state === 'submit' ? { sessionId, text: job.input } : undefined);
     if (turn.status === 'pending') return advance('wait', null, Date.now() + 1000);
+    typing?.end(chatId);
     return advance('send', turn.text || 'The agent returned no text.');
   } catch (err) {
+    typing?.end(chatId);
     if (stop.signal.aborted) return;
     if (isFinal(err)) {
       if (job.voice_file_id) return store.voiceFallback(job, 'I could not transcribe this voice note. Please try sending text.');
@@ -404,7 +419,7 @@ async function runWebTurn(job) {
       deviceConfig.grants[job.owner.slice(7)][job.agent]?.includes('submit')
     : config.owners.get(job.owner)?.agent === job.agent;
   if (!allowed) {
-    liveTurns.delete(job.id);
+    liveTurns.delete(job.turn_id);
     return advance('failed');
   }
   try {
@@ -413,16 +428,16 @@ async function runWebTurn(job) {
       ...(runtimes && job.agent === runtimeAgent && runtimeOwner(job.owner) && { runtimes: runtimes.targets() }),
     } : undefined);
     if (turn.status === 'pending') {
-      if (turn.live) setLive(job.id, turn.live);
-      else liveTurns.delete(job.id);
+      if (turn.live) setLive(job.turn_id, turn.live);
+      else liveTurns.delete(job.turn_id);
       return advance('wait', { next: Date.now() + 500 });
     }
-    liveTurns.delete(job.id);
+    liveTurns.delete(job.turn_id);
     advance(turn.status, { output: turn.status === 'done' ? turn.text : null, tools: turn.tools ?? null });
   } catch (err) {
     if (stop.signal.aborted) return;
     if (isFinal(err)) {
-      liveTurns.delete(job.id);
+      liveTurns.delete(job.turn_id);
       return advance('failed');
     }
     advance(job.state, { next: retryAt(job.attempts + 1), attempts: job.attempts + 1 });

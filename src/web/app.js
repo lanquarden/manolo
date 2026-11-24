@@ -378,8 +378,14 @@ function renderTools(tools, turnId) {
   return list;
 }
 
+function pendingActivityLabel(activity) {
+  if (activity === 'queued') return 'Queued.';
+  if (activity === 'running') return 'Running.';
+  return 'Reply pending.';
+}
+
 function renderHistory() {
-  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ id, text, status, reply, tools, live }) => {
+  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ id, text, status, activity, reply, tools, live }) => {
     const row = document.createElement('li');
     row.className = 'chat-turn';
     row.append(textNode('strong', 'You', 'chat-user'), textNode('div', text, 'chat-prompt plain-text'));
@@ -391,7 +397,7 @@ function renderHistory() {
       if (Array.isArray(tools) && tools.length > 0) answer.append(renderTools(tools, id));
       answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
     } else {
-      const message = status === 'failed' ? 'Turn failed.' : 'Reply pending.';
+      const message = status === 'failed' ? 'Turn failed.' : pendingActivityLabel(activity);
       answer.append(textNode('div', message, 'chat-turn-state'));
       if (status === 'failed' && reply) answer.append(textNode('div', reply, 'plain-text'));
       if (status === 'pending' && live) {
@@ -432,18 +438,22 @@ async function refreshHistory() {
   }
 }
 
-function recordTurnStatus(turn, result) {
+function recordTurnStatus(id, result) {
   if (!['done', 'failed', 'pending'].includes(result?.status)) throw new Error('Unexpected turn status');
-  if (unconfirmedTurn?.id === turn.id) unconfirmedTurn = undefined;
+  if (unconfirmedTurn?.id === id) unconfirmedTurn = undefined;
+  const turn = turns.get(id);
   if (result.status === 'pending') {
-    if (result.live) {
-      turns.set(turn.id, { ...turn, status: 'pending', live: result.live });
+    const { activity } = result;
+    // A status-only update should not discard the last live output.
+    const live = result.live ?? turn.live;
+    if (activity !== turn.activity || live !== turn.live) {
+      turns.set(id, { ...turn, activity, live });
       renderHistory();
     }
     return;
   }
-  turns.set(turn.id, {
-    ...turn, status: result.status, live: undefined,
+  turns.set(id, {
+    ...turn, status: result.status, activity: undefined, live: undefined,
     reply: typeof result.text === 'string' ? result.text : undefined,
     tools: Array.isArray(result.tools) ? result.tools : undefined,
   });
@@ -458,7 +468,7 @@ async function runTurn(turn, submit) {
   const path = `/api/turns/${encodeURIComponent(id)}`;
   try {
     let result = submit ? await api('/api/turns', 'POST', { id, text }) : await api(path);
-    recordTurnStatus(turn, result);
+    recordTurnStatus(id, result);
     // Stream while the turn runs: poll the relay faster than history refreshes, but never more than the window.
     const deadline = performance.now() + POLL_WINDOW_MS;
     while (result.status === 'pending') {
@@ -468,7 +478,7 @@ async function runTurn(turn, submit) {
       const left = Math.floor(deadline - performance.now());
       if (left <= 0) break;
       result = await api(path, 'GET', undefined, Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, left)));
-      recordTurnStatus(turn, result);
+      recordTurnStatus(id, result);
     }
     chatStatus.textContent = idleChatStatus();
   } catch (error) {
@@ -500,7 +510,7 @@ chatForm.addEventListener('submit', (event) => {
     chatStatus.textContent = 'Chat requires HTTPS or localhost.';
     return;
   }
-  const turn = { id: crypto.randomUUID(), text, status: 'pending' };
+  const turn = { id: crypto.randomUUID(), text, status: 'pending', activity: 'queued' };
   turns.set(turn.id, turn);
   unconfirmedTurn = turn;
   chatInput.value = '';
