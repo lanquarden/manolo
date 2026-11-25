@@ -9,10 +9,11 @@ import { createDeviceHandler } from './device-api.mjs';
 import { edgeKey, ID, key, loadRelayConfig, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { openRelayStore } from './relay-store.mjs';
 import { createRuntimeRelay } from './runtime-relay.mjs';
-import { createSpeechFromEnv } from './speech.mjs';
+import { createSpeechFromEnv, readBounded } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
+import { BLUEPRINT_ID } from './work-blueprints.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
@@ -26,6 +27,11 @@ const loopbackOnly = [webHost, internalHost, deviceHost].every(isLoopback);
 if (demo && !loopbackOnly && !demoNetwork) throw new Error('MANOLO_DEMO requires loopback listeners or MANOLO_DEMO_ALLOW_NETWORK=1');
 if (demo && !loopbackOnly) console.warn('WARNING: weak demo passwords on a non-loopback listener; use only for an isolated smoke test');
 const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG, process.env, { demo });
+const workSessionAgent = process.env.MANOLO_WORK_SESSION_AGENT;
+if (workSessionAgent && (!config.agents.has(workSessionAgent) ||
+    ![...config.owners.values()].some(owner => owner.agent === workSessionAgent))) {
+  throw new Error('Work sessions require a configured agent with a browser owner');
+}
 if (runtimeAgent && (demo || !config.agents.has(runtimeAgent) || ![...config.owners.values()].some(owner => owner.agent === runtimeAgent) ||
     [...config.routes.values()].includes(runtimeAgent))) {
   throw new Error('A runtime agent requires non-demo authentication and must be web-only');
@@ -88,6 +94,8 @@ const fail = (statusCode) => Object.assign(new Error('Request rejected'), { stat
 const digest = (s) => createHash('sha256').update(s).digest();
 const equal = (a, b) => timingSafeEqual(digest(a), digest(b));
 const isText = value => typeof value === 'string' && value.length > 0 && value.length <= 4000 && value.trim().length > 0;
+// Reserve room for the IDs and the owner's answer in the worker's 4000-unit input.
+const isInboxPrompt = value => isText(value) && value.length <= 2000 && JSON.stringify(value).length <= 2500;
 const ownFields = (obj, ...fields) => fields.length === Object.keys(obj).length && fields.every(field => Object.hasOwn(obj, field));
 
 function respond(res, status, body, additional) {
@@ -226,6 +234,55 @@ function relayLive(value) {
   return Object.keys(live).length > 0 ? live : undefined;
 }
 
+async function workerWorkSessions(owner, id) {
+  if (owner.agent !== workSessionAgent) throw fail(404);
+  const { url, token } = config.agents.get(owner.agent);
+  // Never accept a worker scope or an internal turn ID from the browser.
+  const scope = store.webSession(owner.name, owner.agent);
+  const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(5000)]);
+  let payload;
+  try {
+    const result = await fetch(`${url}/v1/work-sessions/${scope}${id ? `/${id}` : ''}`, {
+      redirect: 'error', headers: { authorization: `Bearer ${token}` }, signal,
+    });
+    if (result.status === 404) {
+      void result.body?.cancel().catch(() => {});
+      throw fail(404);
+    }
+    if (!result.ok) {
+      void result.body?.cancel().catch(() => {});
+      throw fail(503);
+    }
+    payload = JSON.parse((await readBounded(result, 1_048_576, signal)).toString('utf8'));
+  } catch (error) {
+    throw fail(error.statusCode === 404 ? 404 : 503);
+  }
+  const summary = row => {
+    if (!row || typeof row.id !== 'string' || !ID.test(row.id) || typeof row.parentTurnId !== 'string' ||
+        !['queued', 'running', 'waiting', 'done', 'failed'].includes(row.status) || row.target !== 'pod') return null;
+    const parentTurnId = store.webClientTurnId(owner.name, owner.agent, row.parentTurnId);
+    if (!parentTurnId) return null;
+    const blueprint = row.blueprint;
+    return { id: row.id, parentTurnId, status: row.status, target: row.target, title: clipText(row.title, 120) ?? 'Work session',
+      ...(typeof blueprint?.id === 'string' && BLUEPRINT_ID.test(blueprint.id) &&
+        typeof blueprint?.revision === 'string' && /^[0-9a-f]{64}$/.test(blueprint.revision) &&
+        { blueprint: { id: blueprint.id, revision: blueprint.revision } }),
+    };
+  };
+  if (!id) {
+    if (!Array.isArray(payload?.sessions)) throw fail(503);
+    return { sessions: payload.sessions.slice(0, 100).map(summary).filter(Boolean) };
+  }
+  const row = payload?.session;
+  const session = summary(row);
+  if (!session || session.id !== id || !Array.isArray(row.transcript)) throw fail(404);
+  session.transcript = row.transcript.slice(0, 100).flatMap(entry => {
+    if (!entry || !['user', 'assistant'].includes(entry.role) || typeof entry.text !== 'string') return [];
+    return [{ role: entry.role, text: entry.text.slice(0, 16000) }];
+  });
+  return { session };
+}
+
 async function worker(agent, id, input) {
   const { url, token } = config.agents.get(agent);
   let result;
@@ -268,7 +325,12 @@ async function web(req, res, path) {
     return runtimes.owner(req, res, path);
   }
   if (req.method === 'GET' && path === '/api/dashboard') return respond(res, 200, dashboard.state(owner.agent));
-  if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, { messages: store.messages(owner.agent) });
+  if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, {
+    messages: store.messages(owner.agent),
+    ...(owner.agent === workSessionAgent && { questions: store.inboxQuestions(owner.name, owner.agent) }),
+  });
+  const session = /^\/api\/sessions(?:\/([A-Za-z0-9_-]{1,128}))?$/.exec(path);
+  if (req.method === 'GET' && session) return respond(res, 200, await workerWorkSessions(owner, session[1]));
   if (req.method === 'GET' && path === '/api/turns') {
     const turns = store.webHistory(owner.name, owner.agent).map(turn => {
       const live = turn.status === 'pending' && liveTurns.get(webLiveId(owner, turn.id));
@@ -296,6 +358,15 @@ async function web(req, res, path) {
   }
   if (req.method === 'POST' || req.method === 'PUT') {
     if (req.headers['x-manolo-request'] !== '1') throw fail(403);
+    const question = /^\/api\/inbox\/questions\/([0-9a-f]{64})\/respond$/.exec(path);
+    if (req.method === 'POST' && question) {
+      if (owner.agent !== workSessionAgent) throw fail(404);
+      const body = await readJson(req);
+      const answer = ownFields(body, 'answer') && isText(body.answer) ? body.answer
+        : ownFields(body, 'decline') && body.decline === true ? null : undefined;
+      if (answer === undefined) throw fail(400);
+      return respond(res, 200, store.respondInboxQuestion(owner.name, owner.agent, question[1], answer));
+    }
     if (req.method === 'PUT' && path === '/api/dashboard/draft') return respond(res, 200, dashboard.draft(owner.agent, await readJson(req, 256 * 1024)));
     if (req.method === 'POST' && ['/api/dashboard/publish', '/api/dashboard/rollback'].includes(path)) {
       const body = await readJson(req);
@@ -321,6 +392,17 @@ async function internal(req, res, path) {
   if (req.method === 'PUT' && path === '/v1/dashboard/draft') {
     const { draft } = dashboard.draft(agent, await readJson(req, 256 * 1024));
     return respond(res, 200, { revision: draft.revision });
+  }
+  if (req.method === 'POST' && path === '/v1/inbox/question') {
+    if (!workSessionAgent) throw fail(404);
+    if (agent !== workSessionAgent) throw fail(403);
+    const idem = req.headersDistinct['idempotency-key'];
+    if (idem?.length !== 1 || !ID.test(idem[0])) throw fail(400);
+    const body = await readJson(req);
+    if (!ownFields(body, 'turnId', 'prompt') || typeof body.turnId !== 'string' || !ID.test(body.turnId) ||
+        !isInboxPrompt(body.prompt)) throw fail(400);
+    return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
+      name => config.owners.get(name)?.agent === agent));
   }
   if (req.method === 'POST' && path === '/v1/inbox') {
     const body = await readJson(req);
@@ -425,6 +507,7 @@ async function runWebTurn(job) {
   try {
     const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? {
       sessionId: job.session_id, text: job.input,
+      ...(job.agent === workSessionAgent && !job.owner.startsWith('device:') && { workSessions: true }),
       ...(runtimes && job.agent === runtimeAgent && runtimeOwner(job.owner) && { runtimes: runtimes.targets() }),
     } : undefined);
     if (turn.status === 'pending') {

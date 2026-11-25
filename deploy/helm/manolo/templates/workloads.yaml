@@ -9,6 +9,11 @@
 {{- if not (regexMatch "^[a-z][a-z0-9-]{0,31}$" $id) -}}{{ fail "Agent IDs must be Kubernetes name segments" }}{{- end -}}
 {{- $_ := set $entries $id (dict "url" (printf "http://manolo-%s:8081" $id) "tokenEnv" $agent.tokenEnv) -}}
 {{- end -}}
+{{- $workSessionAgent := .Values.workSessionAgent -}}
+{{- if not (kindIs "string" $workSessionAgent) -}}{{ fail "workSessionAgent must be a string" }}{{- end -}}
+{{- if and $workSessionAgent (not (hasKey $entries $workSessionAgent)) -}}
+{{- fail (printf "workSessionAgent %q is not configured in agents" $workSessionAgent) -}}
+{{- end -}}
 {{- $runtimeAgent := .Values.runtimeAgent -}}
 {{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
 {{- if $runtimeAgent -}}
@@ -136,6 +141,9 @@ spec:
             - {name: PORT, value: {{ $w.port | quote }}}
             {{- if eq $w.kind "relay" }}
             - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
+            {{- if $workSessionAgent }}
+            - {name: MANOLO_WORK_SESSION_AGENT, value: {{ $workSessionAgent | quote }}}
+            {{- end }}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
             {{- if $runtimeAgent }}
             - {name: MANOLO_RUNTIME_AGENT, value: {{ $runtimeAgent | quote }}}
@@ -156,6 +164,12 @@ spec:
             {{- end }}
             {{- with $w.instructions }}
             - {name: MANOLO_AGENT_INSTRUCTIONS, value: {{ . | quote }}}
+            {{- end }}
+            {{- if hasKey $w "workBlueprints" }}
+            {{- if not (kindIs "map" $w.workBlueprints) }}{{ fail "agents.<id>.workBlueprints must be a mapping" }}{{ end }}
+            {{- if $w.workBlueprints }}
+            - {name: MANOLO_WORK_BLUEPRINTS, value: {{ $w.workBlueprints | mustToJson | quote }}}
+            {{- end }}
             {{- end }}
             {{- with $w.bashEnv }}
             - {name: MANOLO_BASH_ENV, value: {{ join "," . | quote }}}

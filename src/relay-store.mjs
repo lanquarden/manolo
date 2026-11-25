@@ -3,6 +3,11 @@ import { validTranscript, validVoiceFileId } from './speech.mjs';
 import { key, routeKey, SNOWFLAKE } from './relay-config.mjs';
 
 const conflict = () => Object.assign(new Error('Turn ID was already used'), { statusCode: 409 });
+const inboxError = (statusCode) => Object.assign(new Error('Inbox question request rejected'), { statusCode });
+const MAX_OPEN_QUESTIONS = 50;
+const MAX_QUESTION_HISTORY = 100;
+const MAX_WORKER_INPUT = 4000;
+const continuationId = id => `inbox-answer-${id}`;
 const webTools = row => {
   if (row.state !== 'done' || typeof row.tools !== 'string') return {};
   try {
@@ -61,6 +66,16 @@ export function openRelayStore(path) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS relay_inbox_recipient ON relay_inbox(recipient, created_at);
+    CREATE TABLE IF NOT EXISTS relay_inbox_questions (
+      id TEXT PRIMARY KEY NOT NULL,
+      parent_turn_id TEXT NOT NULL UNIQUE REFERENCES web_turns(turn_id),
+      prompt_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','answered','declined')),
+      answer_json TEXT,
+      continuation_turn_id TEXT UNIQUE REFERENCES web_turns(turn_id),
+      CHECK((status = 'answered') = (answer_json IS NOT NULL)),
+      CHECK((status = 'answered') = (continuation_turn_id IS NOT NULL))
+    );
   `);
   const columns = new Set(db.prepare('PRAGMA table_info(telegram_jobs)').all().map(row => row.name));
   const webColumns = new Set(db.prepare('PRAGMA table_info(web_turns)').all().map(row => row.name));
@@ -86,6 +101,34 @@ export function openRelayStore(path) {
   const discordReady = selection('discord_jobs', 'AND j.bot=?', 'seq', active);
   const webReady = selection('web_turns', '', 'seq', "('submit','wait')");
   const webLookup = db.prepare('SELECT * FROM web_turns WHERE turn_id=?');
+  const addWebTurn = `INSERT INTO web_turns(id,owner,agent,turn_id,session_id,input,created_at,state)
+    VALUES(?,?,?,?,?,?,?,'submit')`;
+  const addContinuation = db.prepare(addWebTurn);
+  const addBrowserTurn = db.prepare(`${addWebTurn} ON CONFLICT(turn_id) DO NOTHING`);
+  const inboxById = db.prepare('SELECT id, parent_turn_id, prompt_json, status FROM relay_inbox_questions WHERE id=?');
+  const inboxByParent = db.prepare('SELECT id FROM relay_inbox_questions WHERE parent_turn_id=?');
+  const addQuestion = db.prepare('INSERT INTO relay_inbox_questions(id,parent_turn_id,prompt_json) VALUES(?,?,?)');
+  const inboxParent = 'FROM relay_inbox_questions q JOIN web_turns w ON w.turn_id=q.parent_turn_id';
+  const inboxScope = 'WHERE w.session_id=? AND w.owner=? AND w.agent=?';
+  const inboxContinuation = 'LEFT JOIN web_turns c ON c.turn_id=q.continuation_turn_id';
+  const countOpen = db.prepare(`SELECT count(*) AS count ${inboxParent} ${inboxScope} AND q.status='open'`);
+  const listQuestions = db.prepare(`SELECT q.id, q.prompt_json, q.status, w.id AS parent_id, c.id AS continuation_id
+    ${inboxParent} ${inboxContinuation} ${inboxScope} ORDER BY q.status='open' DESC, q.rowid DESC LIMIT ?`);
+  const ownedQuestion = db.prepare(`SELECT q.prompt_json, q.status, q.answer_json, w.id AS parent_id, w.session_id, c.id AS continuation_id
+    ${inboxParent} ${inboxContinuation} ${inboxScope} AND q.id=?`);
+  const closeQuestion = db.prepare(`UPDATE relay_inbox_questions SET status=?, answer_json=?, continuation_turn_id=?
+    WHERE id=? AND status='open'`);
+  function inboxTransaction(run) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = run();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   const clearToolImages = db.prepare('DELETE FROM web_tool_images WHERE turn_seq=?');
   const addToolImage = db.prepare('INSERT OR REPLACE INTO web_tool_images(turn_seq,idx,mime,data) VALUES(?,?,?,?)');
   const toolImage = db.prepare('SELECT mime, data FROM web_tool_images WHERE turn_seq=? AND idx=?');
@@ -165,10 +208,10 @@ export function openRelayStore(path) {
         .run(state, terminal ? null : output, next, attempts, id);
     },
     webSubmit(owner, agent, id, text, { includeActivity = false } = {}) {
+      // The relay owns these IDs; a client cannot preempt an Inbox continuation.
+      if (!owner.startsWith('device:') && /^inbox-answer-[0-9a-f]{64}$/.test(id)) throw conflict();
       const turnId = webId(owner, agent, id);
-      db.prepare(`INSERT INTO web_turns(id,owner,agent,turn_id,session_id,input,created_at,state)
-        VALUES(?,?,?,?,?,?,?,'submit') ON CONFLICT(turn_id) DO NOTHING`)
-        .run(id, owner, agent, turnId, webSession(owner, agent), text, new Date().toISOString());
+      addBrowserTurn.run(id, owner, agent, turnId, webSession(owner, agent), text, new Date().toISOString());
       const row = webLookup.get(turnId);
       if (row.input !== text) throw conflict();
       return webStatus(row, includeActivity);
@@ -184,6 +227,11 @@ export function openRelayStore(path) {
         ...(['submit', 'wait'].includes(row.state) && { activity: webActivity(row) }),
         ...(row.state === 'done' && { reply: row.output }), ...webTools(row),
       }));
+    },
+    webSession,
+    webClientTurnId(owner, agent, turnId) {
+      const row = webLookup.get(turnId);
+      return row?.owner === owner && row.agent === agent ? row.id : undefined;
     },
     webReady(now) { return webReady.all(now); },
     webAdvance(job, state, { output = null, tools = null, next = 0, attempts = 0 } = {}) {
@@ -226,6 +274,59 @@ export function openRelayStore(path) {
     messages(agent) {
       return db.prepare(`SELECT id, sender AS "from", body AS text, created_at AS createdAt
         FROM relay_inbox WHERE recipient=? ORDER BY created_at DESC, rowid DESC LIMIT 50`).all(agent);
+    },
+    openInboxQuestion(agent, parentTurnId, prompt, idempotencyKey, isBrowserOwner) {
+      return inboxTransaction(() => {
+        const parent = webLookup.get(parentTurnId);
+        if (!parent || parent.agent !== agent || parent.owner.startsWith('device:') || !isBrowserOwner(parent.owner)) {
+          throw inboxError(404);
+        }
+        // Agent-scoped keys cannot be reused for another prompt or parent. A new key cannot
+        // generate a second question for the same original turn, even after it is answered.
+        const id = key('inbox-question', agent, idempotencyKey);
+        const quoted = JSON.stringify(prompt);
+        const previous = inboxById.get(id);
+        if (previous) {
+          if (previous.parent_turn_id !== parentTurnId || previous.prompt_json !== quoted) throw inboxError(409);
+          return { id, status: previous.status };
+        }
+        if (inboxByParent.get(parentTurnId)) throw inboxError(409);
+        if (countOpen.get(parent.session_id, parent.owner, agent).count >= MAX_OPEN_QUESTIONS) throw inboxError(429);
+        addQuestion.run(id, parentTurnId, quoted);
+        return { id, status: 'open' };
+      });
+    },
+    inboxQuestions(owner, agent) {
+      return listQuestions.all(webSession(owner, agent), owner, agent, MAX_QUESTION_HISTORY).map(row => ({
+        id: row.id, parentTurnId: row.parent_id, prompt: JSON.parse(row.prompt_json), status: row.status,
+        ...(row.continuation_id && { continuationTurnId: row.continuation_id }),
+      }));
+    },
+    respondInboxQuestion(owner, agent, id, answer) {
+      return inboxTransaction(() => {
+        const question = ownedQuestion.get(webSession(owner, agent), owner, agent, id);
+        if (!question) throw inboxError(404);
+        const answerJson = answer === null ? null : JSON.stringify(answer);
+        const status = answer === null ? 'declined' : 'answered';
+        const receipt = continuationTurnId => ({ id, status, ...(continuationTurnId && { continuationTurnId }) });
+        if (question.status !== 'open') {
+          if (question.status !== status || question.answer_json !== answerJson) throw inboxError(409);
+          return receipt(question.continuation_id);
+        }
+        let continuation = null;
+        let turnId = null;
+        if (status === 'answered') {
+          // Only ordinary user-turn text reaches the worker. Quoting keeps the previous
+          // assistant prompt separate from the owner's actual input, even with embedded newlines.
+          const text = `Previous assistant context (original web turn ${question.parent_id}; inbox question ${id}):\n${question.prompt_json}\n\nOwner input (answer):\n${answerJson}`;
+          if (text.length > MAX_WORKER_INPUT) throw inboxError(400);
+          continuation = continuationId(id);
+          turnId = webId(owner, agent, continuation);
+          addContinuation.run(continuation, owner, agent, turnId, question.session_id, text, new Date().toISOString());
+        }
+        if (closeQuestion.run(status, answerJson, turnId, id).changes !== 1) throw inboxError(409);
+        return receipt(continuation);
+      });
     },
   };
 }

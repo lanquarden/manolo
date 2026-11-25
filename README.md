@@ -34,6 +34,29 @@ Use Node 24. Open the printed URL and sign in with `owner`/`owner` (primary) or 
 3. Create a bot with BotFather, start a DM to it, and obtain your numeric user/chat ID from a trusted Bot API `getUpdates` response. Use a bot with no webhook or other poller. Put exactly one entry in `relayConfig.routes`, e.g. `{transport: telegram, userId: '123456', chatId: '123456', agent: primary}` with your actual ID. Telegram retains undelivered updates for a limited time; the PoC has no automated cursor repair for a bot left idle for a week or more.
 4. Review the rendered manifests before registering a release in Flux. Use a port-forward for the first browser smoke test (`kubectl -n manolo port-forward svc/manolo-relay 8080:8080`), never plaintext Basic Auth on a shared network. A family rollout should put the UI behind HTTPS and integrate the internal OIDC gateway rather than distribute permanent Basic credentials. Then verify a real Telegram DM on the new bot, a denied sender, a directed inbox note, and a canary-pod restart before adding any family accounts. Scale, backups and data retention should be settled before migration; worker PVCs contain conversation data.
 
+### Try work sessions on the web canary
+
+Roll out the new relay and canary worker images, then set `workSessionAgent: canary` in Helm (`MANOLO_WORK_SESSION_AGENT=canary` on the relay). This is off by default; it enables delegation for authenticated browser turns for that agent, not Telegram, Discord, or device turns. Sign in to the canary and ask the agent to delegate a small task. Follow the work link from the chat turn, or open **Sessions** for active work and turn on ended sessions to inspect the transcript afterward. Access follows the browser owner's conversation scope; another owner of the same agent cannot read the transcript.
+
+A work session is part of the same agent, but runs in its own Pi Durable conversation. The child receives a bounded text task and no tools. The conversation session can use `delegate_work`, `get_work_result`, and `inspect_manolo` (read-only app metadata, not source or environment access). `delegate_work` waits up to 90 seconds; a pending result can be checked with `get_work_result`. The explorer lists recent work, not every internal Pi Durable session.
+
+To add a blueprint, put a named entry under the worker’s `agents.<id>.workBlueprints` in Helm (or set `MANOLO_WORK_BLUEPRINTS` to the equivalent JSON object):
+
+```yaml
+agents:
+  canary:
+    workBlueprints:
+      review:
+        description: Review short project notes
+        instructions: Lead with the conclusion and flag any missing evidence.
+```
+
+`inspect_manolo` lists blueprint names and descriptions. `delegate_work` can select one by ID. The work session records the selected revision and keeps its instructions across worker restarts. This changes instructions only; blueprints do not grant tools or credentials. Do not include secrets in blueprint text.
+
+For an enabled browser turn, the agent can ask a question with `request_human_input`. The question appears in **Inbox** and the current turn can finish. Answering queues a follow-up in the original conversation; retrying the same response does not create another turn. Declining closes the question without a follow-up. An answer supplies context, not a new execution grant. This does not suspend a running child session or approve actions.
+
+This slice runs work in the pod; it does not add group routing, cross-channel conversation linking, or remote work-session targets.
+
 ### Debugging inside a pod
 
 The image also ships `git`, `curl`, `wget`, `jq`, `yq` and [`mise`](https://mise.jdx.dev) for `kubectl exec` sessions and for a worker's own `bash` tool, which runs as the same user. `YQ_VERSION` and `MISE_VERSION` are pinned at the top of the `Dockerfile` so a rebuild does not silently change what is in the image; the build prints each version as it installs it.

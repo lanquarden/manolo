@@ -30,12 +30,14 @@ async function openBrowser(t) {
   let nextId = 0;
   let buffer = '';
   const awaiting = new Map();
+  const listeners = new Map();
   child.stdio[4].setEncoding('utf8').on('data', (chunk) => {
     buffer += chunk;
     let end;
     while ((end = buffer.indexOf('\0')) !== -1) {
-      const { id, result, error } = JSON.parse(buffer.slice(0, end));
+      const { id, result, error, method, params, sessionId } = JSON.parse(buffer.slice(0, end));
       buffer = buffer.slice(end + 1);
+      if (method) listeners.get(sessionId)?.(method, params);
       awaiting.get(id)?.(error ? new Error(error.message) : null, result);
       awaiting.delete(id);
     }
@@ -50,9 +52,23 @@ async function openBrowser(t) {
       child.stdio[3].write(JSON.stringify({ id, method, params, sessionId }) + '\0');
     });
   }
-  return async function openTab(url) {
+  return async function openTab(url, credentials) {
     const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
     const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+    if (credentials) {
+      const handledChallenges = new Set();
+      listeners.set(sessionId, (method, { requestId }) => {
+        if (method === 'Fetch.requestPaused') {
+          void send('Fetch.continueRequest', { requestId }, sessionId);
+        } else if (method === 'Fetch.authRequired') {
+          const authChallengeResponse = handledChallenges.has(requestId)
+            ? { response: 'CancelAuth' } : { response: 'ProvideCredentials', ...credentials };
+          handledChallenges.add(requestId);
+          void send('Fetch.continueWithAuth', { requestId, authChallengeResponse }, sessionId);
+        }
+      });
+      await send('Fetch.enable', { handleAuthRequests: true }, sessionId);
+    }
     const run = async (expression) => {
       const { result, exceptionDetails } = await send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
       assert.ok(!exceptionDetails, result.description);
@@ -106,6 +122,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   const checked = [];
   const posts = [];
   const authorizations = [];
+  let sessionRequests = 0;
   const finishLatest = Promise.withResolvers();
   const finishOlder = Promise.withResolvers();
   const acceptSubmit = Promise.withResolvers();
@@ -127,6 +144,10 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
     }
     if (url === '/api/dashboard') return json({ history: [] });
     if (url === '/api/inbox') return json({ messages: [] });
+    if (url === '/api/sessions') {
+      sessionRequests++;
+      return json({}, 404); // Older relay.
+    }
     if (url.startsWith('/api/turns')) authorizations.push(req.headers.authorization);
     if (url === '/api/turns' && method === 'GET') return json({ turns });
     if (url === '/api/turns' && method === 'POST') {
@@ -198,15 +219,20 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   const press = (id, key) => `document.getElementById('${id}-tab').dispatchEvent(new KeyboardEvent('keydown', { key: '${key}', bubbles: true }))`;
   assert.ok(await run(`${visible('chat')} && !(${visible('dashboard')}) && !(${visible('inbox')})`));
   await run(press('chat', 'ArrowDown'));
+  assert.ok(await run(`${visible('sessions')} && document.activeElement.id === 'sessions-tab'`));
+  await waitFor(run, `document.querySelector('#sessions-status').textContent.includes('not available on this relay')`);
+  await run(press('sessions', 'ArrowDown'));
   assert.ok(await run(`${visible('dashboard')} && document.activeElement.id === 'dashboard-tab'`));
   await run(click('inbox-tab'));
   assert.ok(await run(visible('inbox')));
+  await waitFor(run, `!document.querySelector('#inbox-messages-empty').hidden`);
+  assert.equal(await run(`document.querySelector('#inbox-questions-section').hidden`), true);
   await run(press('inbox', 'Home'));
   assert.ok(await run(visible('chat')));
   await firstTab.resize(390, 760);
   await waitFor(run, `document.getElementById('workspace-tabs').getAttribute('aria-orientation') === 'horizontal'`);
   await run(press('chat', 'ArrowRight'));
-  assert.ok(await run(`${visible('dashboard')} && document.documentElement.scrollWidth === innerWidth`));
+  assert.ok(await run(`${visible('sessions')} && document.documentElement.scrollWidth === innerWidth`));
   await run(click('chat-tab'));
   assert.ok(await run(`${visible('chat')} && document.querySelector('#send-chat').getBoundingClientRect().bottom <= innerHeight`));
   await run(`${fill('New draft')}; document.querySelector('#chat-form').requestSubmit()`);
@@ -228,6 +254,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   finishOlder.resolve();
   await waitFor(run, `!${sendDisabled}`);
   assert.deepEqual(checked, ['latest', 'latest', 'older', 'older', 'older']);
+  assert.ok(sessionRequests > 0 && sessionRequests <= 3, `Unexpected sessions probes: ${sessionRequests}`);
   assert.deepEqual(await run(pendingStates), []);
   assert.equal(await run(`document.querySelector('#chat-log > li:nth-last-child(2) .chat-turn-state').textContent`), 'Turn failed.');
   assert.ok(await run(`${logText}.includes('Check failed')`));
@@ -274,4 +301,290 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
     assert.equal(headers['x-manolo-request'], '1');
   }
   assert.ok(authorizations.every((header) => header === undefined));
+});
+
+test('browser Sessions links work to turns and reads transcripts with owner authentication', {
+  skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
+}, async (t) => {
+  const literal = '<a href="https://example.test" data-untrusted>text only</a>';
+  const target = 'Target: pod';
+  const active = { id: 'active task', parentTurnId: 'pending', title: 'Active work', status: 'queued', target: null };
+  const ended = { id: 'ended', parentTurnId: 'done', title: `Previous work ${literal}`, status: 'done', target: literal, blueprint: { id: 'review' } };
+  const failed = { id: 'failed', parentTurnId: null, title: 'Other work', status: 'failed', target: null };
+  const sessions = [active, ended, failed];
+  const turns = [
+    { id: 'done', status: 'done', text: 'Previous message', reply: 'Previous reply' },
+    { id: 'pending', status: 'pending', activity: 'running', text: 'Current message' },
+  ];
+  const finishTurn = Promise.withResolvers();
+  const requests = [];
+  let listStatus = 200;
+  let detailStatus = 200;
+  const assets = new Map(await Promise.all([
+    ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
+  ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
+  const auth = `Basic ${Buffer.from('owner:browser-test').toString('base64')}`;
+  const server = createServer(async (req, res) => {
+    const { url, method, headers } = req;
+    const json = (body, status = 200) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    if (headers.authorization !== auth) {
+      res.writeHead(401, { 'www-authenticate': 'Basic realm="Manolo browser test"' });
+      res.end();
+      return;
+    }
+    const asset = assets.get(url);
+    if (asset) {
+      res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-store' });
+      res.end(asset.body);
+      return;
+    }
+    if (url === '/api/dashboard') return json({ history: [] });
+    if (url === '/api/inbox') return json({ messages: [] });
+    if (url === '/api/turns') return json({ turns });
+    if (url === '/api/turns/pending') {
+      await finishTurn.promise;
+      return json({ status: 'done', text: 'Current reply' });
+    }
+    if (url.startsWith('/api/sessions')) requests.push({ url, method, authorization: headers.authorization });
+    if (url === '/api/sessions') return listStatus === 200 ? json({ sessions }) : json({}, listStatus);
+    if (url.startsWith('/api/sessions/')) {
+      const session = sessions.find(({ id }) => url === `/api/sessions/${encodeURIComponent(id)}`);
+      if (!session || detailStatus !== 200) return json({}, session ? detailStatus : 404);
+      const transcript = session === ended ? [{ role: 'user', text: 'Check this' }, { role: 'assistant', text: literal }] : [];
+      return json({ session: { ...session, transcript } });
+    }
+    return json({}, 404);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { finishTurn.resolve(); server.close(); server.closeAllConnections(); });
+  const openTab = await openBrowser(t);
+  const { run } = await openTab(`http://127.0.0.1:${server.address().port}/`, { username: 'owner', password: 'browser-test' });
+  const list = `document.querySelector('#session-list')`;
+  const status = `document.querySelector('#sessions-status').textContent`;
+  const title = `document.querySelector('#session-title').textContent`;
+  const detail = `document.querySelector('#session-detail')`;
+  const sessionTranscript = `document.querySelector('#session-transcript')`;
+  const chatLinks = (turn) => `document.querySelector('#chat-log > li:${turn}-child .chat-session-links')`;
+  const includes = (value) => `.textContent.includes(${JSON.stringify(value)})`;
+
+  await waitFor(run, `${chatLinks('first')}?${includes('Previous work')}`);
+  assert.equal(await run(`${chatLinks('last')}.textContent`), 'Active work');
+  await run(click('sessions-tab'));
+  assert.equal(await run(`document.querySelector('#include-ended').checked`), false);
+  assert.equal(await run(`${list}.childElementCount`), 1);
+  assert.ok(await run(`${list}${includes('Queued')}`));
+  await run(click('include-ended'));
+  assert.equal(await run(`${list}.childElementCount`), 3);
+  assert.ok(await run(`${list}${includes('Failed')}`));
+  await run(click('include-ended'));
+
+  // Sessions refresh even while an in-flight turn status request has not returned.
+  await run(`${click('chat-tab')}; ${click('check-turn')}`);
+  assert.equal(await run(refreshDisabled), true);
+  const beforePoll = requests.length;
+  active.status = 'running';
+  active.target = 'pod';
+  await waitFor(run, `${list}${includes(target)}`);
+  assert.ok(requests.length > beforePoll);
+  assert.equal(await run(refreshDisabled), true);
+
+  await run(`${chatLinks('last')}.querySelector('button').click()`);
+  await waitFor(run, `${title} === 'Active work' && ${detail}${includes('No transcript yet.')}`);
+  assert.equal(await run(`document.activeElement.id`), 'session-title');
+  assert.ok(await run(`${detail}${includes('Running')} && ${detail}${includes(target)}`));
+  active.status = 'waiting';
+  await run(click('refresh-sessions'));
+  await waitFor(run, `${detail}${includes('Waiting')}`);
+  await run(click('back-to-sessions'));
+  assert.ok(await run(`!document.querySelector('#sessions-list-view').hidden`));
+
+  await run(`${click('chat-tab')}; ${fill('Draft survives')}; ${chatLinks('first')}.querySelector('button').click()`);
+  await waitFor(run, `${title} === ${JSON.stringify(ended.title)} && ${sessionTranscript}${includes(literal)}`);
+  assert.deepEqual(await run(`[...${sessionTranscript}.querySelectorAll('strong')].map(node => node.textContent)`), ['user', 'assistant']);
+  assert.ok(await run(`${detail}${includes('Done')} && ${detail}${includes(`Target: ${literal}`)} && ${detail}${includes('Blueprint: review')}`));
+  assert.equal(await run(`document.querySelector('[data-untrusted]')`), null);
+
+  detailStatus = 404;
+  await run(click('refresh-sessions'));
+  await waitFor(run, `${detail}${includes('This session is no longer available.')}`);
+  assert.equal(await run(`${sessionTranscript}.childElementCount`), 0);
+  detailStatus = 403;
+  await run(click('refresh-sessions'));
+  await waitFor(run, `${detail}${includes('Sign in as an owner')}`);
+  await run(click('back-to-sessions'));
+
+  await run(click('chat-tab'));
+  await run(`${chatLinks('last')}.querySelector('button').focus()`);
+  active.status = 'done';
+  finishTurn.resolve();
+  await waitFor(run, `${status}.includes('No active sessions.') && ${logText}.includes('Current reply')`);
+  assert.equal(await run(`document.querySelector('#chat-text').value`), 'Draft survives');
+  assert.ok(await run(`${chatLinks('last')}${includes('Active work')}`));
+  assert.ok(await run(`document.activeElement === ${chatLinks('last')}.querySelector('button')`));
+  await run(click('sessions-tab'));
+  listStatus = 503;
+  await run(click('refresh-sessions'));
+  await waitFor(run, `${status}.includes('(503)')`);
+  listStatus = 200;
+  await run(click('refresh-sessions'));
+  await waitFor(run, `${status}.includes('No active sessions.')`);
+
+  assert.ok(requests.some(({ url }) => url === '/api/sessions/active%20task'));
+  assert.ok(requests.some(({ url }) => url === '/api/sessions/ended'));
+  assert.ok(requests.every(({ method, authorization }) => method === 'GET' && authorization === auth));
+  assert.deepEqual(await run(`[localStorage.length, sessionStorage.length]`), [0, 0]);
+});
+
+test('browser Inbox answers and declines questions without sending Chat drafts', {
+  skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
+}, async (t) => {
+  const literal = '<img data-untrusted src=x onerror=alert(1)>';
+  const messages = [{ from: 'Agent note', text: literal, createdAt: 0 }];
+  const questions = [
+    { id: 'question ?/#', parentTurnId: 'parent', prompt: `Which date? ${literal}${'"'.repeat(1200)}`, status: 'open' },
+    { id: 'decline', parentTurnId: 'parent', prompt: 'Send another update?', status: 'open' },
+    { id: 'decline-receipt', parentTurnId: 'parent', prompt: 'Send a reminder?', status: 'open' },
+  ];
+  const turns = [{ id: 'parent', status: 'done', text: 'Original request', reply: 'See Inbox' }];
+  const continuation = { id: 'follow-up', status: 'pending', activity: 'queued', text: 'Continue with Tuesday' };
+  const responses = [];
+  let inboxStatus = 200;
+  let historyStatus = 200;
+  let historyReads = 0;
+  let chatPosts = 0;
+  const assets = new Map(await Promise.all([
+    ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
+  ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
+  const server = createServer(async (req, res) => {
+    const { url, method, headers } = req;
+    const json = (body, status = 200) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    const asset = assets.get(url);
+    if (asset) {
+      res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-store' });
+      res.end(asset.body);
+      return;
+    }
+    if (url === '/api/dashboard') return json({ history: [] });
+    if (url === '/api/sessions') return json({ sessions: [] });
+    if (url === '/api/inbox' && method === 'GET') return json({ messages, questions }, inboxStatus);
+    if (url === '/api/turns' && method === 'GET') {
+      historyReads++;
+      return json({ turns }, historyStatus);
+    }
+    if (url === '/api/turns' && method === 'POST') chatPosts++;
+    if (url.startsWith('/api/inbox/questions/') && method === 'POST') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      responses.push({ url, body, csrf: headers['x-manolo-request'], type: headers['content-type'] });
+      const question = questions.find(({ id }) => url === `/api/inbox/questions/${encodeURIComponent(id)}/respond`);
+      if (!question) return json({}, 404);
+      if (headers['x-manolo-request'] !== '1') return json({}, 403);
+      if (responses.length === 1) return json({}, 503); // Nothing persisted; owner can retry after a read.
+      if (body.decline) {
+        question.status = 'declined';
+        if (question.id === 'decline') return json({}, 503); // A fresh read sees the persisted decline.
+        return json({ id: question.id, status: question.status });
+      }
+      question.status = 'answered';
+      question.continuationTurnId = continuation.id;
+      return json({ id: question.id, status: question.status, continuationTurnId: question.continuationTurnId });
+    }
+    return json({}, 404);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.close(); server.closeAllConnections(); });
+  const openTab = await openBrowser(t);
+  const { run, resize } = await openTab(`http://127.0.0.1:${server.address().port}/`);
+  await resize(390, 760);
+  const question = (index) => `document.querySelector('#inbox-questions > li:nth-child(${index})')`;
+  const first = question(1);
+  const second = question(2);
+  const answer = `${first}.querySelector('textarea')`;
+  const answerButton = `${first}.querySelector('button[type="submit"]')`;
+  const answerLimit = 1433; // 4000 minus the continuation framing, quoted prompt and two answer quotes.
+  const answerText = 'Use Tuesday.'.padEnd(answerLimit, '!');
+  const decline = `${second}.querySelector('button[type="button"]')`;
+  const view = `${first}.querySelector('button')`;
+  const status = `document.querySelector('#inbox-status').textContent`;
+  const inboxIdle = `!document.querySelector('#refresh-inbox').disabled`;
+  const inboxVisible = `!document.querySelector('#inbox-panel').hidden`;
+  await waitFor(run, `!${sendDisabled} && ${first}`);
+  await run(`${fill('Keep this Chat draft')}; ${click('inbox-tab')}`);
+  await waitFor(run, inboxIdle);
+  assert.ok(await run(`${first}.textContent.includes(${JSON.stringify(questions[0].prompt)})`));
+  assert.ok(await run(`document.querySelector('#inbox').textContent.includes(${JSON.stringify(literal)})`));
+  assert.equal(await run(`document.querySelector('[data-untrusted]')`), null);
+  assert.equal(await run(`document.documentElement.scrollWidth`), 390);
+  await run(`${answer}.value = '   '; ${answerButton}.click()`);
+  assert.ok(await run(`${status}.includes('Enter an answer')`));
+  assert.equal(await run(`${answer}.maxLength`), answerLimit);
+  await run(`${answer}.value = '"'.repeat(${answerLimit}); ${answerButton}.click()`);
+  assert.ok(await run(`${status}.includes('too long')`));
+  assert.equal(responses.length, 0);
+
+  await run(`${answer}.value = ${JSON.stringify(answerText)}; ${answerButton}.click(); ${answerButton}.click(); ${decline}.click()`);
+  await waitFor(run, `${inboxIdle} && ${status}.includes('(503)')`);
+  assert.equal(await run(`${answer}.value`), answerText);
+  assert.ok(await run(`${answerButton}.matches(':disabled') && ${status}.includes('Refresh inbox')`));
+  assert.equal(responses.length, 1);
+  inboxStatus = 503;
+  await run(click('refresh-inbox'));
+  await waitFor(run, `${inboxIdle} && ${status}.includes('(503)')`);
+  assert.ok(await run(`${answerButton}.matches(':disabled')`));
+  inboxStatus = 200;
+  await run(click('refresh-inbox'));
+  await waitFor(run, `${inboxIdle} && !${answerButton}.matches(':disabled')`);
+  assert.equal(await run(`${answer}.value`), answerText);
+
+  const beforeResponse = historyReads;
+  await run(`${answerButton}.click()`);
+  await waitFor(run, `${first}.textContent.includes('Answered')`);
+  assert.equal(await run(`${view}.textContent`), 'Refresh and view in Chat');
+  assert.equal(await run(inboxVisible), true);
+  assert.equal(historyReads, beforeResponse);
+  historyStatus = 503;
+  await run(`${view}.click()`);
+  await waitFor(run, `${first}.textContent.includes('Could not refresh Chat')`);
+  historyStatus = 200;
+  await run(`${view}.click()`);
+  await waitFor(run, `${first}.textContent.includes('not in recent Chat history')`);
+  assert.equal(await run(inboxVisible), true);
+  turns.push(continuation, { id: 'unrelated', status: 'done', text: 'Different turn' });
+  await run(`${view}.click()`);
+  await waitFor(run, `!(${inboxVisible}) && ${logText}.includes('Continue with Tuesday')`);
+  assert.equal(await run(`document.activeElement.querySelector('.chat-prompt').textContent`), continuation.text);
+  assert.equal(await run(`document.querySelector('#chat-text').value`), 'Keep this Chat draft');
+  assert.deepEqual(await run(pendingStates), ['Queued.']);
+  assert.equal(await run(sendDisabled), true);
+  assert.equal(chatPosts, 0);
+
+  await run(click('inbox-tab'));
+  await waitFor(run, inboxIdle);
+  assert.equal(await run(`${view}.textContent`), 'Refresh and view in Chat');
+  await run(`${decline}.click(); ${decline}.click()`);
+  await waitFor(run, `${inboxIdle} && ${status}.includes('Refresh inbox')`);
+  await run(click('refresh-inbox'));
+  await waitFor(run, `${second}.textContent.includes('Declined')`);
+  assert.equal(await run(`${second}.querySelector('form')`), null);
+  await run(`${question(3)}.querySelector('button[type="button"]').click()`);
+  await waitFor(run, `${question(3)}.textContent.includes('Declined')`);
+  assert.equal(await run(status), 'Question declined.');
+  assert.equal(await run(`${question(3)}.querySelector('button')`), null);
+  assert.deepEqual(responses.map(({ url, body }) => [url, body]), [
+    ['/api/inbox/questions/question%20%3F%2F%23/respond', { answer: answerText }],
+    ['/api/inbox/questions/question%20%3F%2F%23/respond', { answer: answerText }],
+    ['/api/inbox/questions/decline/respond', { decline: true }],
+    ['/api/inbox/questions/decline-receipt/respond', { decline: true }],
+  ]);
+  assert.ok(responses.every(({ csrf, type }) => csrf === '1' && type === 'application/json'));
+  assert.equal(chatPosts, 0);
 });

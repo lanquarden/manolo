@@ -391,3 +391,180 @@ test('slow accepted turns show activity without sending a holding message', { ti
   }, 'final web reply');
   assert.deepEqual(result, { status: 'done', text: 'Final answer' });
 });
+
+test('web work session stays linked to its original turn and readable only in its owner scope', { timeout: 30000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-work-session-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = { CANARY_TOKEN: secret(), OWNER_PASSWORD: secret(), OTHER_PASSWORD: secret() };
+  const conf = join(root, 'relay.json');
+  const child = start(t, 'worker', {
+    MANOLO_AGENT_ID: 'canary', MANOLO_AGENT_TOKEN: env.CANARY_TOKEN, MANOLO_DATA_DIR: join(root, 'worker'),
+    MANOLO_MODE: 'fixture', MANOLO_CODING_TOOLS: '0', MANOLO_FIXTURE_DELAY_MS: '800',
+    MANOLO_WORK_BLUEPRINTS: JSON.stringify({ review: { description: 'Review notes', instructions: 'Lead with the conclusion.' } }),
+    MANOLO_FIXTURE_TOOLS: '1', MANOLO_RELAY_URL: addr(1), PORT: '0',
+  });
+  const workerUrl = addr(await child.port(/worker listening on (\d+)/));
+  const configureOwner = (name, passwordEnv) => writeFile(conf, JSON.stringify({
+    agents: { canary: { url: workerUrl, tokenEnv: 'CANARY_TOKEN' } },
+    owners: { [name]: { agent: 'canary', passwordEnv } }, routes: [], inbox: [],
+  }));
+  const launchRelay = () => start(t, 'relay', {
+    ...env, MANOLO_RELAY_CONFIG: conf, MANOLO_DATA_DIR: join(root, 'relay'), MANOLO_WORK_SESSION_AGENT: 'canary',
+    PORT: '0', MANOLO_INTERNAL_PORT: '0',
+  });
+  await configureOwner('owner', 'OWNER_PASSWORD');
+  const relay = launchRelay();
+  const web = addr(await relay.port(/web listening on .*:(\d+)/));
+  const owner = basic('owner', env.OWNER_PASSWORD);
+  const task = 'Summarize this sample note: lunch is at noon';
+  const input = { id: 'parent-turn', text: `fixture-tool:${JSON.stringify({ name: 'delegate_work', args: { title: 'Lunch note', task, blueprint: 'review' } })}` };
+  const submit = () => request(web, '/api/turns', owner, 'POST', input, { 'x-manolo-request': '1' });
+  assert.deepEqual(await (await submit()).json(), { status: 'pending', activity: 'queued' });
+  assert.equal((await request(web, '/api/sessions', {})).status, 401);
+  assert.equal((await submit()).status, 200);
+  const sessions = async auth => {
+    const response = await request(web, '/api/sessions', auth);
+    assert.equal(response.status, 200, await response.clone().text());
+    return (await response.json()).sessions;
+  };
+  const active = await until(async () => (await sessions(owner)).find(s => ['queued', 'running'].includes(s.status)), 'a linked session before completion');
+  assert.equal(active.parentTurnId, input.id);
+  assert.equal(active.target, 'pod');
+  assert.equal(active.title, 'Lunch note');
+  assert.equal(active.blueprint.id, 'review');
+  assert.match(active.blueprint.revision, /^[0-9a-f]{64}$/);
+  const otherScope = '1'.repeat(64);
+  assert.equal((await request(workerUrl, `/v1/work-sessions/${otherScope}`, {})).status, 401);
+  assert.equal((await request(workerUrl, `/v1/work-sessions/${otherScope}/${active.id}`, bearer(env.CANARY_TOKEN))).status, 404);
+  const result = await until(async () => {
+    const turn = await (await request(web, `/api/turns/${input.id}`, owner)).json();
+    return turn.status !== 'pending' && turn;
+  }, 'original conversation answers after delegation');
+  assert.equal(result.status, 'done');
+  assert.match(result.text, /succeeded|lunch is at noon/i);
+  const delegation = result.tools?.find(tool => tool.name === 'delegate_work');
+  assert.equal(delegation?.status, 'ok');
+  const returned = JSON.parse(delegation.output);
+  assert.equal(returned.id, active.id);
+  assert.match(returned.result, /lunch is at noon/i);
+  assert.deepEqual((await sessions(owner)).map(({ id, status, parentTurnId }) => ({ id, status, parentTurnId })), [
+    { id: active.id, status: 'done', parentTurnId: input.id },
+  ]);
+  const { session } = await (await request(web, `/api/sessions/${active.id}`, owner)).json();
+  assert.equal(session.status, 'done');
+  assert.deepEqual(session.blueprint, active.blueprint);
+  assert.ok(session.transcript.some(entry => entry.role === 'user' && entry.text.includes(task)));
+  assert.ok(session.transcript.some(entry => entry.role === 'assistant' && entry.text.includes(task)));
+  assert.equal(JSON.stringify(session).includes(env.CANARY_TOKEN), false);
+  const inspection = { id: 'inspect-app', text: 'fixture-tool:{"name":"inspect_manolo","args":{}}' };
+  assert.equal((await request(web, '/api/turns', owner, 'POST', inspection, { 'x-manolo-request': '1' })).status, 200);
+  const app = await until(async () => {
+    const turn = await (await request(web, `/api/turns/${inspection.id}`, owner)).json();
+    return turn.status === 'done' && turn.tools?.find(tool => tool.name === 'inspect_manolo');
+  }, 'read-only app metadata');
+  assert.equal(app.status, 'ok');
+  const metadata = JSON.parse(app.output);
+  assert.equal(metadata.identity.id, 'canary');
+  assert.equal(metadata.capabilities.podCodingTools, false);
+  assert.deepEqual(metadata.capabilities.workSessions, { target: 'pod', childTools: [] });
+  assert.deepEqual(metadata.blueprints, [{ ...active.blueprint, description: 'Review notes' }]);
+  assert.ok(!app.output.includes('Lead with the conclusion.'));
+  assert.equal(app.output.includes(env.CANARY_TOKEN), false);
+  // Existing deployments have one browser owner per agent. Change the owner identity
+  // while keeping the same worker and volume; the new identity cannot read old work.
+  await relay.end();
+  await configureOwner('other', 'OTHER_PASSWORD');
+  const replacement = launchRelay();
+  const newWeb = addr(await replacement.port(/web listening on .*:(\d+)/));
+  const other = basic('other', env.OTHER_PASSWORD);
+  assert.deepEqual(await (await request(newWeb, '/api/sessions', other)).json(), { sessions: [] });
+  assert.equal((await request(newWeb, `/api/sessions/${active.id}`, other)).status, 404);
+});
+
+test('web inbox answer queues one continuation in the original conversation across a relay restart', { timeout: 30000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-human-input-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = { CANARY_TOKEN: secret(), OWNER_PASSWORD: secret() };
+  const relayData = join(root, 'relay');
+  const conf = join(root, 'relay.json');
+  // Give the worker a stable loopback address across relay restarts without reserving a free port by guessing.
+  let internal;
+  const proxy = createServer(async (req, res) => {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const response = await fetch(internal + req.url, {
+        method: req.method,
+        headers: Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
+          ['authorization', 'content-type', 'idempotency-key'].includes(key))),
+        body: Buffer.concat(chunks),
+      });
+      res.writeHead(response.status, { 'content-type': 'application/json' });
+      res.end(await response.text());
+    } catch { res.writeHead(503).end(); }
+  }).listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+  const child = start(t, 'worker', {
+    MANOLO_AGENT_ID: 'canary', MANOLO_AGENT_TOKEN: env.CANARY_TOKEN, MANOLO_DATA_DIR: join(root, 'worker'),
+    MANOLO_MODE: 'fixture', MANOLO_CODING_TOOLS: '0', MANOLO_FIXTURE_TOOLS: '1', PORT: '0',
+    MANOLO_RELAY_URL: addr(proxy.address().port),
+  });
+  const workerUrl = addr(await child.port(/worker listening on (\d+)/));
+  await writeFile(conf, JSON.stringify({
+    agents: { canary: { url: workerUrl, tokenEnv: 'CANARY_TOKEN' } },
+    owners: { owner: { agent: 'canary', passwordEnv: 'OWNER_PASSWORD' } }, routes: [], inbox: [],
+  }));
+  const launchRelay = async () => {
+    const relay = start(t, 'relay', { ...env, MANOLO_RELAY_CONFIG: conf, MANOLO_DATA_DIR: relayData,
+      MANOLO_WORK_SESSION_AGENT: 'canary', PORT: '0', MANOLO_INTERNAL_PORT: '0' });
+    internal = addr(await relay.port(/internal listening on .*:(\d+)/));
+    return { relay, web: addr(await relay.port(/web listening on .*:(\d+)/)) };
+  };
+  const auth = basic('owner', env.OWNER_PASSWORD);
+  const mutation = { 'x-manolo-request': '1' };
+  const first = await launchRelay();
+  const prompt = 'Which date should I use for the meeting?';
+  const answer = 'Use Tuesday.';
+  const source = { id: 'source-turn', text: `fixture-tool:${JSON.stringify({ name: 'request_human_input', args: { prompt } })}` };
+  const submitted = await request(first.web, '/api/turns', auth, 'POST', source, mutation);
+  assert.equal(submitted.status, 200);
+  const question = await until(async () => {
+    const response = await request(first.web, '/api/inbox', auth);
+    assert.equal(response.status, 200);
+    return (await response.json()).questions?.find(item => item.parentTurnId === source.id);
+  }, 'agent opens a question tied to the original chat turn');
+  assert.equal(question.status, 'open');
+  assert.equal(question.prompt, prompt);
+  const path = `/api/inbox/questions/${question.id}/respond`;
+  assert.equal((await request(first.web, path, {}, 'POST', { answer }, mutation)).status, 401);
+  assert.equal((await request(first.web, path, auth, 'POST', { answer })).status, 403);
+  const respond = (base, data) => request(base, path, auth, 'POST', data, mutation);
+  const reply = await respond(first.web, { answer });
+  assert.equal(reply.status, 200, await reply.clone().text());
+  const receipt = await reply.json();
+  assert.equal(receipt.status, 'answered');
+  assert.ok(receipt.continuationTurnId);
+  await first.relay.end('SIGKILL');
+  const second = await launchRelay();
+  assert.deepEqual(await (await respond(second.web, { answer })).json(), receipt);
+  assert.equal((await respond(second.web, { answer: 'Use Wednesday.' })).status, 409);
+  const continuation = await until(async () => {
+    const response = await request(second.web, `/api/turns/${receipt.continuationTurnId}`, auth);
+    assert.equal(response.status, 200);
+    const turn = await response.json();
+    return turn.status !== 'pending' && turn;
+  }, 'same conversation receives the continuation');
+  assert.equal(continuation.status, 'done');
+  assert.match(continuation.text, /Use Tuesday\./);
+  const turns = (await (await request(second.web, '/api/turns', auth)).json()).turns;
+  assert.deepEqual(turns.map(t => t.id), [source.id, receipt.continuationTurnId]);
+  await request(second.web, '/api/turns', auth, 'POST', { id: 'history-check', text: 'fixture:history' }, mutation);
+  const priorTurns = await until(async () => {
+    const result = await (await request(second.web, '/api/turns/history-check', auth)).json();
+    return result.status === 'done' && JSON.parse(result.text);
+  }, 'the continuation shares the original Pi Durable conversation');
+  assert.equal(priorTurns[0], source.text);
+  assert.equal(priorTurns.length, 2);
+  assert.match(priorTurns[1], /Use Tuesday\./);
+});

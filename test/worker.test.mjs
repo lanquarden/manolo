@@ -68,9 +68,9 @@ async function request(url, path, opts) {
   return { code: response.status, body: await response.json() };
 }
 
-function put(url, id, sessionId, text) {
+function put(url, id, sessionId, text, fields) {
   return request(url, `/v1/turns/${id}`, {
-    method: 'PUT', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, text }),
+    method: 'PUT', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, text, ...fields }),
   });
 }
 function get(url, id) {
@@ -142,6 +142,125 @@ function expectedSetup(operatorText, tools = codingTools) {
   const instructionsSha256 = createHash('sha256').update(`<instructions>\n${instructions}\n</instructions>`).digest('hex');
   return { status: 'done', text: JSON.stringify({ instructionsSha256, tools }) };
 }
+
+const workEnabled = { workSessions: true };
+const fixtureTool = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
+const workList = (url, scope) => request(url, `/v1/work-sessions/${scope}`, { headers: auth });
+const workDetail = (url, scope, id) => request(url, `/v1/work-sessions/${scope}/${id}`, { headers: auth });
+
+test('only flagged parent turns delegate, wait and expose redacted scoped work transcripts', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const url = await launch(t, dir, {
+    ...inspectSetup, MANOLO_FIXTURE_TOOLS: '1', MANOLO_RELAY_URL: 'http://127.0.0.1:1', MANOLO_FIXTURE_DELAY_MS: '150',
+  }).start();
+  const scope = 'web-owner';
+  assert.equal((await request(url, `/v1/work-sessions/${scope}`)).code, 401);
+  assert.deepEqual(await workList(url, scope), { code: 200, body: { sessions: [] } });
+  assert.equal((await put(url, 'bad-flag', scope, 'input', { workSessions: 'true' })).code, 400);
+  const title = `Delegate ${token}`;
+  const task = `Read this: ${token}.`;
+  const input = fixtureTool('delegate_work', { title, task });
+  expectPending(await put(url, 'unflagged', scope, input));
+  assert.equal((await toolTurn(url, 'unflagged', 'delegate_work')).tool.status, 'error');
+  assert.deepEqual(await workList(url, scope), { code: 200, body: { sessions: [] } });
+  expectPending(await put(url, 'parent', scope, input, workEnabled));
+  expectPending(await put(url, 'parent', scope, input));
+  assert.equal((await put(url, 'unflagged', scope, input, workEnabled)).body.text, 'Fixture tool failed');
+  assert.equal((await put(url, 'mixed', scope, 'no tools on this turn')).code, 409);
+  const running = await until(async () => (await workList(url, scope)).body.sessions[0], 'durable link before child answer');
+  assert.ok(['queued', 'running'].includes(running.status), JSON.stringify(running));
+  assert.deepEqual(await workDetail(url, 'another-owner', running.id), { code: 404, body: { error: 'work session not found' } });
+  const { tool } = await toolTurn(url, 'parent', 'delegate_work');
+  assert.equal(tool.status, 'ok', JSON.stringify(tool));
+  assert.deepEqual(JSON.parse(tool.output), { id: running.id, status: 'done', target: 'pod', result: 'Fixture: Read this: [redacted].' });
+  const summary = { id: running.id, parentTurnId: 'parent', title: 'Delegate [redacted]', status: 'done', target: 'pod' };
+  assert.deepEqual(await workList(url, scope), { code: 200, body: { sessions: [summary] } });
+  assert.deepEqual(await workDetail(url, scope, running.id), { code: 200, body: { session: {
+    ...summary, transcript: [{ role: 'user', text: 'Read this: [redacted].' }, { role: 'assistant', text: 'Fixture: Read this: [redacted].' }],
+  } } });
+  const read = fixtureTool('get_work_result', { id: running.id });
+  expectPending(await put(url, 'read', scope, read, workEnabled));
+  assert.deepEqual(JSON.parse((await toolTurn(url, 'read', 'get_work_result')).tool.output), JSON.parse(tool.output));
+  expectPending(await put(url, 'other-read', 'another-owner', read, workEnabled));
+  assert.equal((await toolTurn(url, 'other-read', 'get_work_result')).tool.status, 'error');
+  expectPending(await put(url, 'unflagged-after', scope, input, { workSessions: false }));
+  assert.equal((await toolTurn(url, 'unflagged-after', 'delegate_work')).tool.status, 'error');
+});
+
+test('work can run in the background, but a child cannot call tools; inspect returns only public metadata', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const worker = launch(t, dir, {
+    MANOLO_FIXTURE_TOOLS: '1', MANOLO_RELAY_URL: 'http://127.0.0.1:1', MANOLO_FIXTURE_DELAY_MS: '200',
+    MANOLO_AGENT_INSTRUCTIONS: 'private prompt marker', MANOLO_BASH_ENV: 'PRIVATE_TEST_VALUE', PRIVATE_TEST_VALUE: 'private value marker',
+  });
+  const url = await worker.start();
+  const scope = 'web';
+  expectPending(await put(url, 'inspect', scope, fixtureTool('inspect_manolo', {}), workEnabled));
+  const { tool } = await toolTurn(url, 'inspect', 'inspect_manolo');
+  assert.equal(tool.status, 'ok');
+  assert.deepEqual(JSON.parse(tool.output), {
+    version: JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version,
+    identity: { id: 'test-manolo', name: 'Manolo' },
+    capabilities: { podCodingTools: true, relayTools: true, workSessions: { target: 'pod', childTools: [] } },
+  });
+  const task = fixtureTool('bash', { command: 'printf forbidden > forbidden.txt' });
+  expectPending(await put(url, 'background', scope, fixtureTool('delegate_work', { title: 'No shell', task, wait: false }), workEnabled));
+  const start = JSON.parse((await toolTurn(url, 'background', 'delegate_work')).tool.output);
+  assert.ok(['queued', 'running'].includes(start.status), JSON.stringify(start));
+  expectPending(await put(url, 'await-background', scope, fixtureTool('get_work_result', { id: start.id, wait: true }), workEnabled));
+  const failed = (await toolTurn(url, 'await-background', 'get_work_result')).tool;
+  assert.equal(failed.status, 'error');
+  assert.deepEqual(JSON.parse(failed.output), { id: start.id, target: 'pod', status: 'failed' });
+  const result = await workDetail(url, scope, start.id);
+  assert.equal(result.body.session.status, 'failed');
+  assert.deepEqual(result.body.session.transcript, [{ role: 'user', text: task }]);
+  await assert.rejects(readFile(join(dir, 'workspace', 'forbidden.txt')), { code: 'ENOENT' });
+  assert.doesNotMatch(worker.logs(), /(?:private prompt marker|private value marker|fixture-private-bearer)/);
+});
+
+test('interrupted delegation reattaches to the exact same child submission and answers the original parent', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const instructions = 'Check the result against the request.';
+  const description = 'Review short notes';
+  const before = launch(t, dir, { MANOLO_FIXTURE_DELAY_MS: '500', MANOLO_WORK_BLUEPRINTS: JSON.stringify({
+    review: { description, instructions },
+  }) });
+  const url = await before.start();
+  const text = fixtureTool('delegate_work', { title: 'Replay me', task: 'fixture:setup', blueprint: 'review' });
+  expectPending(await put(url, 'replay-parent', 'replay-scope', text, workEnabled));
+  const childIntent = `SELECT s.conversation_id, s.id, json_extract(s.record, '$.requestId') AS request_id
+    FROM submissions s JOIN tasks t ON t.conversation_id = s.conversation_id
+    WHERE json_extract(t.record, '$.kind') = 'pi.generation' AND t.status = 'running'
+    AND json_extract(t.record, '$.state.checkpoint.phase') = 'request'
+    AND json_extract(s.record, '$.requestId') != 'replay-parent'`;
+  const admitted = await until(() => rows(dir, childIntent)[0], 'child request in progress');
+  const [linked] = (await workList(url, 'replay-scope')).body.sessions;
+  assert.equal(linked.status, 'running');
+  assert.equal(linked.id, admitted.request_id);
+  assert.equal(linked.blueprint.id, 'review');
+  assert.match(linked.blueprint.revision, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await before.stop('SIGKILL'), [null, 'SIGKILL']);
+  const after = launch(t, dir, inspectSetup);
+  const recovered = await after.start();
+  const { tool } = await toolTurn(recovered, 'replay-parent', 'delegate_work');
+  assert.equal(tool.status, 'ok', JSON.stringify(tool));
+  assert.equal(JSON.parse(tool.output).id, linked.id);
+  const fixtureSetup = JSON.parse(JSON.parse(tool.output).result);
+  assert.deepEqual(fixtureSetup.tools, []);
+  const childRules = 'You are Manolo, handling a delegated work session. Answer only the given task. You have no tools or access to files, services, other sessions, or paired devices. Do not claim to execute actions. Return concise findings to the parent session.';
+  assert.equal(fixtureSetup.instructionsSha256, createHash('sha256')
+    .update(`<instructions>\n${childRules}\n\nApply the following blueprint only within those limits:\n${instructions}\n</instructions>`).digest('hex'));
+  assert.deepEqual(JSON.parse(tool.output).blueprint, linked.blueprint);
+  const submissions = rows(dir, `SELECT conversation_id, id, json_extract(record, '$.requestId') AS request_id FROM submissions ORDER BY id`);
+  assert.equal(submissions.length, 2);
+  assert.deepEqual(submissions[1], admitted);
+  assert.notEqual(submissions[0].conversation_id, admitted.conversation_id);
+  assert.deepEqual((await workList(recovered, 'replay-scope')).body.sessions, [{ ...linked, status: 'done' }]);
+  // The old session remains inspectable but a new call cannot select the removed blueprint.
+  expectPending(await put(recovered, 'new-parent', 'replay-scope', text, workEnabled));
+  assert.equal((await toolTurn(recovered, 'new-parent', 'delegate_work')).tool.status, 'error');
+  assert.deepEqual((await workList(recovered, 'replay-scope')).body.sessions, [{ ...linked, status: 'done' }]);
+});
 
 test('staged workers keep only existing relay tools when pod coding and paired access are disabled', { timeout: 10_000 }, async t => {
   const dir = await dataDir(t);
