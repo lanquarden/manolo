@@ -14,8 +14,9 @@ webIngressFrom: []
 # Optional cluster-internal runtime companion listener. The agent must be web-only
 # (not targeted by relayConfig.routes or relayConfig.rooms), and relayDemoCredentials must be disabled.
 runtimeAgent: ''
-# Enable work-session delegation for this agent's authenticated web turns only.
-# Update the relay and this agent's worker image before opting in.
+# Enable work-session delegation for these agents' authenticated web turns only, as a
+# comma-separated list of agent IDs (for example "primary,canary"). Update the relay and
+# each listed worker's image before opting in.
 workSessionAgent: ''
 # Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
 runtimeIngressFrom: []

@@ -29,12 +29,17 @@ const loopbackOnly = [webHost, internalHost, deviceHost].every(isLoopback);
 if (demo && !loopbackOnly && !demoNetwork) throw new Error('MANOLO_DEMO requires loopback listeners or MANOLO_DEMO_ALLOW_NETWORK=1');
 if (demo && !loopbackOnly) console.warn('WARNING: weak demo passwords on a non-loopback listener; use only for an isolated smoke test');
 const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG, process.env, { demo });
-const workSessionAgent = process.env.MANOLO_WORK_SESSION_AGENT;
-if (workSessionAgent && demo && !loopbackOnly) throw new Error('Work sessions cannot use network-exposed demo credentials');
-if (workSessionAgent && (!config.agents.has(workSessionAgent) ||
-    ![...config.owners.values()].some(owner => owner.agent === workSessionAgent))) {
-  throw new Error('Work sessions require a configured agent with a browser owner');
+// One or more agents may host web work sessions, in a comma-separated list.
+const workSessionAgents = new Set((process.env.MANOLO_WORK_SESSION_AGENT ?? '')
+  .split(',').map(name => name.trim()).filter(Boolean));
+if (workSessionAgents.size && demo && !loopbackOnly) throw new Error('Work sessions cannot use network-exposed demo credentials');
+for (const name of workSessionAgents) {
+  if (!config.agents.has(name) || ![...config.owners.values()].some(owner => owner.agent === name)) {
+    throw new Error('Work sessions require a configured agent with a browser owner');
+  }
+  if (name === runtimeAgent) throw new Error('A runtime agent cannot host work sessions');
 }
+const workSessionsEnabled = agentName => workSessionAgents.has(agentName);
 const rooms = [...config.rooms.values()];
 const telegramMode = process.env.MANOLO_TELEGRAM_MODE;
 const useXmpp = telegramMode === 'xmpp';
@@ -313,7 +318,7 @@ function relayLive(value) {
 }
 
 async function workerWorkSessions(owner, id) {
-  if (owner.agent !== workSessionAgent) throw fail(404);
+  if (!workSessionsEnabled(owner.agent)) throw fail(404);
   const { url, token } = config.agents.get(owner.agent);
   // Never accept a worker scope or an internal turn ID from the browser.
   const scope = store.webSession(owner.name, owner.agent);
@@ -483,7 +488,7 @@ async function web(req, res, path) {
   if (req.method === 'GET' && path === '/api/dashboard') return respond(res, 200, dashboard.state(owner.agent));
   if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, {
     messages: store.messages(owner.agent),
-    ...(owner.agent === workSessionAgent && { questions: store.inboxQuestions(owner.name, owner.agent) }),
+    ...(workSessionsEnabled(owner.agent) && { questions: store.inboxQuestions(owner.name, owner.agent) }),
   });
   const session = /^\/api\/sessions(?:\/([A-Za-z0-9_-]{1,128}))?$/.exec(path);
   if (req.method === 'GET' && session) return respond(res, 200, await workerWorkSessions(owner, session[1]));
@@ -516,7 +521,7 @@ async function web(req, res, path) {
     if (req.headers['x-manolo-request'] !== '1') throw fail(403);
     const question = /^\/api\/inbox\/questions\/([0-9a-f]{64})\/respond$/.exec(path);
     if (req.method === 'POST' && question) {
-      if (owner.agent !== workSessionAgent) throw fail(404);
+      if (!workSessionsEnabled(owner.agent)) throw fail(404);
       const body = await readJson(req);
       const answer = ownFields(body, 'answer') && isText(body.answer) ? body.answer
         : ownFields(body, 'decline') && body.decline === true ? null : undefined;
@@ -550,8 +555,9 @@ async function internal(req, res, path) {
     return respond(res, 200, { revision: draft.revision });
   }
   if (req.method === 'POST' && path === '/v1/inbox/question') {
-    if (!workSessionAgent) throw fail(404);
-    if (agent !== workSessionAgent) throw fail(403);
+    if (!workSessionAgents.size) throw fail(404);
+    // Keep the old split: an unconfigured relay has no route, an unlisted agent is forbidden.
+    if (!workSessionsEnabled(agent)) throw fail(403);
     const idem = req.headersDistinct['idempotency-key'];
     if (idem?.length !== 1 || !ID.test(idem[0])) throw fail(400);
     const body = await readJson(req);
@@ -673,7 +679,7 @@ async function runWebTurn(job) {
   try {
     const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? {
       sessionId: job.session_id, text: job.input,
-      ...(job.agent === workSessionAgent && !job.owner.startsWith('device:') && { workSessions: true }),
+      ...(workSessionsEnabled(job.agent) && !job.owner.startsWith('device:') && { workSessions: true }),
       ...(runtimes && job.agent === runtimeAgent && runtimeOwner(job.owner) && { runtimes: runtimes.targets() }),
     } : undefined);
     if (turn.status === 'pending') {

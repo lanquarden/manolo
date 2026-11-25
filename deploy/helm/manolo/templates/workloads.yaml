@@ -14,8 +14,12 @@
 {{- if and $workSessionAgent .Values.relayDemoCredentials -}}
 {{- fail "workSessionAgent cannot be enabled with relayDemoCredentials" -}}
 {{- end -}}
-{{- if and $workSessionAgent (not (hasKey $entries $workSessionAgent)) -}}
-{{- fail (printf "workSessionAgent %q is not configured in agents" $workSessionAgent) -}}
+{{- if $workSessionAgent -}}
+{{- range $name := splitList "," $workSessionAgent -}}
+{{- $trimmed := trim $name -}}
+{{- if not $trimmed -}}{{ fail "workSessionAgent must be a comma-separated list of agent IDs" }}{{- end -}}
+{{- if not (hasKey $entries $trimmed) -}}{{ fail (printf "workSessionAgent %q is not configured in agents" $trimmed) }}{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- $runtimeAgent := .Values.runtimeAgent -}}
 {{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
