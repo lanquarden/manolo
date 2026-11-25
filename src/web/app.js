@@ -68,6 +68,7 @@ function showTab(selected) {
   if (selected.id === 'sessions-tab') void refreshSessions();
   if (selected.id === 'inbox-tab') void refreshInbox();
   if (selected.id === 'browser-tab') openDesktop();
+  if (selected.id === 'capabilities-tab') void refreshCapabilities();
 }
 for (const tab of tabs) tab.addEventListener('click', () => showTab(tab));
 tabList.addEventListener('keydown', (event) => {
@@ -687,7 +688,9 @@ async function refreshSessionDetail() {
     if (summary.id !== id) throw new Error('Unexpected session ID');
     const rows = session.transcript.map(({ role, text }) => {
       const row = document.createElement('li');
-      row.append(textNode('strong', role, 'plain-text'), textNode('p', text, 'plain-text'));
+      const body = document.createElement('div');
+      body.textContent = text;
+      row.append(textNode('strong', role, 'plain-text'), mountMarkdown(body, text));
       return row;
     });
     sessionTitle.textContent = summary.title;
@@ -785,6 +788,24 @@ function renderTools(tools, turnId) {
   return list;
 }
 
+// The renderer is a separate module and also needs markdown-it's bundle. Loading it lazily means a missing or broken
+// renderer degrades to the plain text that is already visible, instead of taking the whole workspace down.
+let markdownModule;
+const loadMarkdown = () => (markdownModule ??= import('./markdown.mjs').catch(() => null));
+
+/** Fill `holder` with markdown once it renders; until then the plain text is already visible. */
+function mountMarkdown(holder, text) {
+  if (typeof text !== 'string' || text === '') return holder;
+  void loadMarkdown().then(module => module?.renderMarkdown(text)).then(node => {
+    if (!node) return;
+    holder.className = node.className;
+    holder.replaceChildren(...node.childNodes);
+  }).catch(() => {
+    // Keep the plain text: a rendering failure must never hide the answer.
+  });
+  return holder;
+}
+
 function pendingActivityLabel(activity) {
   if (activity === 'queued') return 'Queued.';
   if (activity === 'running') return 'Running.';
@@ -798,7 +819,7 @@ function renderChatAnswer({ id, status, activity, reply, tools, live }) {
   answer.append(textNode('strong', 'Manolo'));
   if (status === 'done') {
     if (Array.isArray(tools) && tools.length > 0) answer.append(renderTools(tools, id));
-    answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
+    answer.append(mountMarkdown(textNode('div', reply ?? '(No reply text.)', 'plain-text'), reply));
   } else {
     const message = status === 'failed' ? 'Turn failed.' : pendingActivityLabel(activity);
     answer.append(textNode('div', message, 'chat-turn-state'));
@@ -1014,6 +1035,71 @@ async function signOut() {
 }
 
 signOutButton.addEventListener('click', () => void signOut());
+
+const themeSelect = byId('theme-select');
+if (themeSelect && globalThis.manoloTheme) {
+  themeSelect.value = globalThis.manoloTheme.current();
+  themeSelect.addEventListener('change', () => globalThis.manoloTheme.apply(themeSelect.value));
+}
+
+const capabilitiesStatus = byId('capabilities-status');
+const capabilitiesButton = byId('refresh-capabilities');
+let capabilitiesLoaded = false;
+
+function capabilityList(id, rows, empty, render) {
+  const list = byId(id);
+  list.replaceChildren(...rows.map(render));
+  if (rows.length === 0) {
+    const item = document.createElement('li');
+    item.className = 'capability-empty';
+    item.textContent = empty;
+    list.append(item);
+  }
+}
+
+function renderCapabilities(state) {
+  byId('capability-instructions').textContent = state.agent?.instructions || '(none)';
+  capabilityList('capability-tools', state.tools ?? [], 'No tools installed.', tool => {
+    const item = document.createElement('li');
+    item.append(textNode('span', tool.name, 'capability-name'), textNode('span', tool.source ?? '', 'badge'));
+    if (tool.description) item.append(textNode('p', tool.description, 'capability-detail'));
+    return item;
+  });
+  capabilityList('capability-blueprints', state.blueprints ?? [], 'No blueprints configured.', blueprint => {
+    const item = document.createElement('li');
+    item.append(textNode('span', blueprint.id, 'capability-name'));
+    if (blueprint.description) item.append(textNode('p', blueprint.description, 'capability-detail'));
+    return item;
+  });
+  capabilityList('capability-skills', state.skills ?? [], 'No skills in this repository.', skill => {
+    const item = document.createElement('li');
+    item.append(textNode('span', skill.name, 'capability-name'), textNode('span', 'SKILL.md', 'badge'));
+    if (skill.description) item.append(textNode('p', skill.description, 'capability-detail'));
+    if (skill.path) item.append(textNode('p', skill.path, 'capability-path'));
+    return item;
+  });
+  capabilityList('capability-agents-files', state.agentsFiles ?? [], 'No AGENTS.md found.', file => {
+    const item = document.createElement('li');
+    item.append(textNode('span', file.path, 'capability-path'), textNode('span', `${file.bytes} B`, 'badge'));
+    return item;
+  });
+  capabilitiesLoaded = true;
+}
+
+async function refreshCapabilities() {
+  capabilitiesButton.disabled = true;
+  capabilitiesStatus.textContent = 'Loading…';
+  try {
+    renderCapabilities(await api('/api/capabilities'));
+    capabilitiesStatus.textContent = '';
+  } catch (error) {
+    capabilitiesStatus.textContent = failure(error);
+  } finally {
+    capabilitiesButton.disabled = false;
+  }
+}
+
+capabilitiesButton.addEventListener('click', () => void refreshCapabilities());
 
 void loadSession();
 void refreshDashboard();

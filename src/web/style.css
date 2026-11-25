@@ -11,6 +11,16 @@
   --violet-wash: #2d263d;
   --focus: #b59af7;
   --warning: #eac787;
+  --selection: #57447c;
+  --on-accent: #211936;
+  --accent-hover: #d5c5ff;
+  --brand-line: #51436c;
+  --glow: #241f31;
+  --shadow: #00000055;
+  --error-line: #6b3b46;
+  --error-ink: #ffd9e0;
+  --error-bg: #2e1f24;
+  --code-bg: #101014;
   --measure: 46rem;
   font: 14px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -26,7 +36,7 @@ body {
   color: var(--ink);
   background: var(--canvas);
 }
-::selection { color: var(--ink); background: #57447c; }
+::selection { color: var(--ink); background: var(--selection); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 .icon-library { position: absolute; width: 0; height: 0; pointer-events: none; }
 .icon { width: 1.2rem; height: 1.2rem; flex: none; fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; }
@@ -52,8 +62,8 @@ button {
 button:not(:disabled) { cursor: pointer; }
 button:not(:disabled):hover { background: var(--raised); }
 button:disabled { opacity: .52; }
-.primary-button { border-color: transparent; color: #211936; background: var(--violet); }
-.primary-button:not(:disabled):hover { background: #d5c5ff; }
+.primary-button { border-color: transparent; color: var(--on-accent); background: var(--violet); }
+.primary-button:not(:disabled):hover { background: var(--accent-hover); }
 .quiet-button { border-color: transparent; color: var(--muted); background: transparent; }
 textarea {
   display: block;
@@ -72,7 +82,7 @@ textarea::placeholder { color: var(--muted); }
 .brand { display: flex; gap: .75rem; align-items: center; padding: .15rem .4rem 1.05rem; }
 .brand strong { display: block; font-size: 1.05rem; letter-spacing: -.02em; }
 .brand-caption { display: block; color: var(--muted); font-size: .78rem; }
-.brand-mark { display: inline-grid; place-items: center; flex: none; width: 2.25rem; height: 2.25rem; border: 1px solid #51436c; border-radius: .67rem; color: var(--violet); background: var(--violet-wash); }
+.brand-mark { display: inline-grid; place-items: center; flex: none; width: 2.25rem; height: 2.25rem; border: 1px solid var(--brand-line); border-radius: .67rem; color: var(--violet); background: var(--violet-wash); }
 .brand-mark .icon { width: 1.35rem; height: 1.35rem; }
 .sidebar-label { padding-inline: .55rem; color: var(--muted); font-size: .72rem; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
 .workspace-tabs { display: grid; gap: .25rem; }
@@ -82,7 +92,7 @@ textarea::placeholder { color: var(--muted); }
 .sidebar-footer { display: grid; gap: .45rem; margin-top: auto; padding: .8rem .4rem .1rem; color: var(--muted); border-top: 1px solid var(--line); font-size: .8rem; }
 .sidebar-footer .icon { inline-size: 1rem; block-size: 1rem; }
 .session-chip { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: .3rem .55rem; min-inline-size: 0; }
-.session-avatar { display: grid; place-items: center; inline-size: 1.9rem; block-size: 1.9rem; border: 1px solid #51436c; border-radius: 99rem; color: var(--violet); background: var(--violet-wash); }
+.session-avatar { display: grid; place-items: center; inline-size: 1.9rem; block-size: 1.9rem; border: 1px solid var(--brand-line); border-radius: 99rem; color: var(--violet); background: var(--violet-wash); }
 .session-avatar .icon { inline-size: 1.05rem; block-size: 1.05rem; }
 .session-identity { display: grid; min-inline-size: 0; }
 .session-caption { color: var(--muted); font-size: .68rem; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
@@ -235,7 +245,7 @@ body.login-page {
   place-items: center;
   padding: clamp(1.25rem, 6vw, 3rem);
   background:
-    radial-gradient(circle at 50% 0%, #241f31 0%, transparent 60%),
+    radial-gradient(circle at 50% 0%, var(--glow) 0%, transparent 60%),
     var(--canvas);
 }
 .login-card {
@@ -246,7 +256,7 @@ body.login-page {
   border: 1px solid var(--line);
   border-radius: 1rem;
   background: var(--surface);
-  box-shadow: 0 1.5rem 3.5rem #00000055;
+  box-shadow: 0 1.5rem 3.5rem var(--shadow);
 }
 .login-card .brand { gap: .65rem; padding: 0 0 .35rem; }
 .login-card .brand strong { font-size: 1.05rem; }
@@ -267,10 +277,10 @@ body.login-page {
 .login-card button.primary-button { justify-content: center; min-block-size: 2.7rem; margin-block-start: .5rem; }
 .login-error {
   padding: .6rem .75rem;
-  border: 1px solid #6b3b46;
+  border: 1px solid var(--error-line);
   border-radius: .6rem;
-  color: #ffd9e0;
-  background: #2e1f24;
+  color: var(--error-ink);
+  background: var(--error-bg);
   font-size: .85rem;
 }
 @media (max-width: 30rem) {
@@ -288,3 +298,114 @@ body.login-page {
 #mcp-form { display: grid; justify-items: start; gap: .6rem; margin-top: .85rem; }
 #mcp-help { color: var(--muted); }
 #mcp-config { font: .85rem/1.45 ui-monospace, monospace; }
+
+/* Theme: Solarized, from Ethan Schoonover's palette. Light uses base3 for the canvas and base00/base01 for text;
+   dark uses base03 with base0/base1. Only the variables change: every rule above is theme-neutral. */
+:root[data-theme="solarized-light"] {
+  color-scheme: light;
+  --canvas: #fdf6e3;
+  --rail: #eee8d5;
+  --surface: #f9f2df;
+  --raised: #eee8d5;
+  --line: #d9d2bd;
+  --ink: #586e75;
+  --muted: #7d8f8f;
+  --violet: #6c71c4;
+  --violet-wash: #e4e2f1;
+  --focus: #268bd2;
+  --warning: #b58900;
+  --selection: #d7d2e6;
+  --on-accent: #fdf6e3;
+  --accent-hover: #7d82d4;
+  --brand-line: #c9c2ab;
+  --glow: #eee8d5;
+  --shadow: #002b361f;
+  --error-line: #dc322f;
+  --error-ink: #a3302d;
+  --error-bg: #f7e7e4;
+  --code-bg: #f3ecd8;
+  --pele-bg: #fdf6e3;
+  --pele-fg: #586e75;
+  --pele-muted: #93a1a1;
+  --pele-line: #93a1a1;
+  --pele-surface: #eee8d5;
+  --pele-surface-alt: #e6dfcc;
+  --pele-border: #b8b09a;
+  --pele-accent: #268bd2;
+}
+:root[data-theme="solarized-dark"] {
+  color-scheme: dark;
+  --canvas: #002b36;
+  --rail: #00212b;
+  --surface: #073642;
+  --raised: #0b3f4d;
+  --line: #17505f;
+  --ink: #eee8d5;
+  --muted: #93a1a1;
+  --violet: #b58900;
+  --violet-wash: #123f4c;
+  --focus: #268bd2;
+  --warning: #cb4b16;
+  --selection: #1d5a6b;
+  --on-accent: #002b36;
+  --accent-hover: #d3a51a;
+  --brand-line: #17505f;
+  --glow: #073642;
+  --shadow: #00000088;
+  --error-line: #dc322f;
+  --error-ink: #ffd9d6;
+  --error-bg: #3a1f22;
+  --code-bg: #001f28;
+  --pele-bg: #002b36;
+  --pele-fg: #eee8d5;
+  --pele-muted: #93a1a1;
+  --pele-line: #93a1a1;
+  --pele-surface: #073642;
+  --pele-surface-alt: #0b3f4d;
+  --pele-border: #586e75;
+  --pele-accent: #268cb2;
+}
+:root[data-theme="solarized-light"] body.login-page { background: radial-gradient(circle at 50% 0%, var(--glow) 0%, transparent 60%), var(--canvas); }
+
+.theme-row { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .35rem .55rem 0; color: var(--muted); font-size: .78rem; }
+.theme-row select {
+  min-inline-size: 0; max-inline-size: 8.5rem; padding: .2rem .35rem;
+  border: 1px solid var(--line); border-radius: .45rem; color: var(--ink); background: var(--surface); font: inherit;
+}
+
+/* Rendered model markdown. Every size stays in em/rem so it follows the surrounding text. */
+.markdown { display: grid; gap: .55rem; overflow-wrap: anywhere; }
+.markdown > :first-child { margin-block-start: 0; }
+.markdown > :last-child { margin-block-end: 0; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { margin: .6rem 0 .1rem; line-height: 1.3; }
+.markdown h1 { font-size: 1.25rem; }
+.markdown h2 { font-size: 1.12rem; }
+.markdown h3 { font-size: 1.02rem; }
+.markdown p { margin: 0; }
+.markdown ul, .markdown ol { margin: 0; padding-inline-start: 1.35rem; display: grid; gap: .2rem; }
+.markdown blockquote { margin: 0; padding: .1rem 0 .1rem .8rem; border-inline-start: 3px solid var(--line); color: var(--muted); }
+.markdown a { color: var(--focus); text-decoration: underline; text-underline-offset: 2px; }
+.markdown code { padding: .1rem .3rem; border: 1px solid var(--line); border-radius: .3rem; background: var(--code-bg); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+.markdown pre { margin: 0; padding: .65rem .7rem; overflow: auto; border: 1px solid var(--line); border-radius: .5rem; background: var(--code-bg); }
+.markdown pre code { padding: 0; border: 0; background: transparent; font-size: .82rem; }
+.markdown table { border-collapse: collapse; display: block; overflow-x: auto; font-size: .92em; }
+.markdown th, .markdown td { padding: .3rem .55rem; border: 1px solid var(--line); text-align: start; }
+.markdown th { background: var(--raised); }
+.markdown hr { inline-size: 100%; border: 0; border-top: 1px solid var(--line); }
+.markdown input[type="checkbox"] { margin-inline-end: .35rem; }
+.md-image { color: var(--muted); font-style: italic; }
+.md-image-url { font-family: ui-monospace, monospace; font-size: .85em; overflow-wrap: anywhere; }
+.md-diagram { display: grid; gap: .35rem; }
+.md-diagram svg { max-inline-size: 100%; block-size: auto; background: var(--pele-bg); border: 1px solid var(--line); border-radius: .5rem; }
+.md-diagram-source summary { color: var(--muted); font-size: .78rem; }
+.md-diagram-failed { color: var(--warning); }
+
+.capabilities-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; }
+.capability-note { color: var(--muted); font-size: .82rem; margin-block: .2rem .5rem; }
+.capability-pre { max-height: 15rem; margin: 0; padding: .6rem .7rem; overflow: auto; border: 1px solid var(--line); border-radius: .5rem; background: var(--code-bg); font: .8rem/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.capability-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
+.capability-detail { color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+.capability-path { color: var(--muted); font-family: ui-monospace, monospace; font-size: .78rem; overflow-wrap: anywhere; }
+.capability-empty { color: var(--muted); font-size: .82rem; }
+#capability-tools li, #capability-blueprints li, #capability-skills li, #capability-agents-files li { display: grid; gap: .25rem; }
+@media (max-width: 48.999rem) { .capabilities-grid { grid-template-columns: minmax(0, 1fr); } }

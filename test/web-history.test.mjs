@@ -88,8 +88,9 @@ async function waitFor(run, expression) {
     try {
       if (await run(expression)) return;
     } catch (error) {
-      // A page navigation interrupts an in-flight evaluation; retry on the new document.
-      if (!/navigated or closed/.test(error.message)) throw error;
+      // A page navigation interrupts an in-flight evaluation, and a script still in flight can leave the DOM short of
+      // the element the expression dereferences. Both are transient: retry on the same or the new document.
+      if (process.env.DEBUG_WAIT) console.error('waitFor retry:', error.message.split('\n')[0]);
     }
     await sleep(50);
   }
@@ -641,7 +642,7 @@ test('workspace shows the signed-in user and signs out of the browser session', 
   let logoutStatus = 503;
   const assets = new Map(await Promise.all([
     ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
-    ['/login', 'login.html', 'text/html'],
+    ['/login', 'login.html', 'text/html'], ['/theme.js', 'theme.js', 'text/javascript'],
   ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
   const server = createServer((req, res) => {
     const { url, method, headers } = req;
@@ -721,7 +722,7 @@ test('workspace whose session probe returns 401 goes to the sign-in page', {
   let loginPages = 0;
   const assets = new Map(await Promise.all([
     ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
-    ['/login', 'login.html', 'text/html'],
+    ['/login', 'login.html', 'text/html'], ['/theme.js', 'theme.js', 'text/javascript'],
   ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
   const server = createServer((req, res) => {
     const { url } = req;

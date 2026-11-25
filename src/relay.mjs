@@ -123,7 +123,15 @@ const WEB = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
+  ['/theme.js', ['theme.js', 'text/javascript; charset=utf-8']],
+  ['/markdown.mjs', ['markdown.mjs', 'text/javascript; charset=utf-8']],
 ].map(([path, [file, type]]) => [path, { type, body: readFileSync(new URL(`./web/${file}`, import.meta.url)) }]));
+// Markdown and Mermaid rendering run in the browser with the same pinned packages the worker uses. Serving them from the
+// image keeps the page's CSP at `script-src 'self'`: no CDN, no inline script.
+const VENDOR = new Map([
+  ['/vendor/markdown-it.min.js', ['../node_modules/markdown-it/dist/markdown-it.min.js', 'text/javascript; charset=utf-8']],
+  ['/vendor/pele.js', ['../node_modules/pele/dist/pele.js', 'text/javascript; charset=utf-8']],
+].map(([path, [file, type]]) => [path, { type, body: readFileSync(new URL(file, import.meta.url)) }]));
 
 // Browser sign-in. The relay keeps sessions in memory; a restart signs everyone out.
 const loginPage = readFileSync(new URL('./web/login.html', import.meta.url), 'utf8');
@@ -500,6 +508,18 @@ async function web(req, res, path, search = '') {
   if (req.method === 'GET' && path === '/style.css') {
     const { type, body } = WEB.get(path);
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+    return res.end(body);
+  }
+  // The theme runs before the workspace loads, so the first paint already has the owner's choice. It is public for the
+  // same reason the stylesheet is: it holds no data, and the sign-in page uses it too.
+  if (req.method === 'GET' && path === '/theme.js') {
+    const { type, body } = WEB.get(path);
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+    return res.end(body);
+  }
+  if (req.method === 'GET' && VENDOR.has(path)) {
+    const { type, body } = VENDOR.get(path);
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=86400, immutable', 'x-content-type-options': 'nosniff' });
     return res.end(body);
   }
   const owner = ownerAuth(req);
