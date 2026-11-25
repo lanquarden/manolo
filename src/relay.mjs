@@ -29,6 +29,7 @@ if (demo && !loopbackOnly && !demoNetwork) throw new Error('MANOLO_DEMO requires
 if (demo && !loopbackOnly) console.warn('WARNING: weak demo passwords on a non-loopback listener; use only for an isolated smoke test');
 const config = loadRelayConfig(process.env.MANOLO_RELAY_CONFIG, process.env, { demo });
 const workSessionAgent = process.env.MANOLO_WORK_SESSION_AGENT;
+if (workSessionAgent && demo && !loopbackOnly) throw new Error('Work sessions cannot use network-exposed demo credentials');
 if (workSessionAgent && (!config.agents.has(workSessionAgent) ||
     ![...config.owners.values()].some(owner => owner.agent === workSessionAgent))) {
   throw new Error('Work sessions require a configured agent with a browser owner');

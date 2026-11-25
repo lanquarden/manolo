@@ -57,6 +57,22 @@ For an enabled browser turn, the agent can ask a question with `request_human_in
 
 This slice runs work in the pod; it does not add group routing, cross-channel conversation linking, or remote work-session targets.
 
+### Connect trusted MCP tools
+
+MCP is off by default. Set `agents.<id>.mcpServers` in Helm (or `MANOLO_MCP_SERVERS` to equivalent JSON on that worker) and enable `workSessionAgent` for that agent with demo credentials disabled:
+
+```yaml
+workSessionAgent: canary
+agents:
+  canary:
+    mcpServers:
+      notes:
+        url: https://notes.example.org/mcp
+        tools: [lookup]
+```
+
+The authenticated browser conversation can use `list_mcp_tools` and `call_mcp_tool`. A tool call can send its arguments to the configured server; use only servers you trust, and allowlist only tools whose behavior and data access you intend to grant. The allowlist does **not** make a tool read-only. Do not put credentials in these URLs. This version supports Streamable HTTP with JSON or SSE responses to a POST. It does not open standalone SSE listeners, support stdio or OAuth, or handle server callbacks. Telegram and Discord turns, Device API turns, and delegated work sessions do not inherit MCP access. The harness does not replay an interrupted MCP call automatically.
+
 ### Debugging inside a pod
 
 The image also ships `git`, `curl`, `wget`, `jq`, `yq` and [`mise`](https://mise.jdx.dev) for `kubectl exec` sessions and for a worker's own `bash` tool, which runs as the same user. `YQ_VERSION` and `MISE_VERSION` are pinned at the top of the `Dockerfile` so a rebuild does not silently change what is in the image; the build prints each version as it installs it.

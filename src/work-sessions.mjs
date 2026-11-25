@@ -3,6 +3,7 @@ import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/conte
 import { AssistantEntry, configure, defineDocFamily, defineExtension, defineTool, LiveDoc } from '@earendil-works/pi-durable';
 import app from '../package.json' with { type: 'json' };
 import { BLUEPRINT_ID } from './work-blueprints.mjs';
+import { makeMcpTools } from './mcp-tools.mjs';
 
 const workIndex = kind => defineDocFamily({ kind, scope: 'session', version: 1, family: true, initial: () => ({}), checkpointWhen: () => true });
 const Scope = workIndex('manolo.work-scope');
@@ -59,7 +60,7 @@ async function questionReceipt(response, redact) {
   return { id: receipt.id, status: receipt.status };
 }
 
-export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints = new Map() }) {
+export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints = new Map(), mcpServers }) {
   const publicBlueprints = [...blueprints.values()].map(({ id, description, revision }) => ({
     id, description: redact(description), revision,
   }));
@@ -264,7 +265,8 @@ export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns
       }
     },
   });
-  const extension = defineExtension({ name: 'manolo-work-sessions', tools: [delegate, read, inspect, ...(question ? [question] : [])] });
+  const mcp = makeMcpTools(mcpServers, (api, ctx) => api.commit(tx => parentTurn(tx, api), ctx), { redact });
+  const extension = defineExtension({ name: 'manolo-work-sessions', tools: [delegate, read, inspect, ...(question ? [question] : []), ...mcp] });
   registry.install(extension);
   return {
     extension,

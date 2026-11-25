@@ -41,7 +41,7 @@ export async function createWorkerModels(cfg, env) {
       if (text.startsWith('fixture-tool:')) {
         try {
           const { name, args } = JSON.parse(text.slice('fixture-tool:'.length));
-          if (cfg.relay || WORK_TOOL_NAMES.includes(name)) {
+          if (cfg.relay || WORK_TOOL_NAMES.includes(name) || name === 'list_mcp_tools' || name === 'call_mcp_tool') {
             if (messages.at(-1)?.role === 'toolResult') {
               return fauxAssistantMessage(messages.at(-1).isError ? 'Fixture tool failed' : 'Fixture tool succeeded');
             }

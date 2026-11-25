@@ -13,6 +13,7 @@ import { createWorkerModels, DEFAULT_BASH_TIMEOUT_SECONDS, installCodingTools, i
 import { RUNTIME_NAME } from './runtime-relay.mjs';
 import { installWorkSessions, WORK_PARENT_RULES } from './work-sessions.mjs';
 import { loadWorkBlueprints } from './work-blueprints.mjs';
+import { loadMcpServers } from './mcp-tools.mjs';
 import { normalizeRoomInstructions } from './telegram-room.mjs';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -435,9 +436,11 @@ function httpWorker(turns, workSessions, token) {
 
 async function main() {
   const cfg = loadConfig(process.env);
-  let blueprints;
-  try { blueprints = loadWorkBlueprints(process.env.MANOLO_WORK_BLUEPRINTS); }
-  catch (error) { throw new ConfigurationError(error.message); }
+  let blueprints, mcpServers;
+  try {
+    blueprints = loadWorkBlueprints(process.env.MANOLO_WORK_BLUEPRINTS);
+    mcpServers = loadMcpServers(process.env.MANOLO_MCP_SERVERS);
+  } catch (error) { throw new ConfigurationError(error.message); }
   const runtime = await createWorkerModels(cfg, process.env).catch(() => {
     throw new ConfigurationError('Invalid MANOLO_PROVIDER, MANOLO_MODEL, MANOLO_THINKING_LEVEL, or missing upstream API key.');
   });
@@ -454,7 +457,7 @@ async function main() {
   installRelayTools(registry, cfg);
   const runtimeExec = installRuntimeTools(registry, cfg);
   const redact = redactSecrets([cfg.token, apiKey].filter(Boolean));
-  const workSessions = installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints });
+  const workSessions = installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints, mcpServers });
   process.umask(0o077);
   await mkdir(cfg.dataDir, { recursive: true, mode: 0o700 });
   // The workspace is the tools' default cwd: it survives restarts and belongs to this agent alone.

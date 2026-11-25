@@ -749,3 +749,52 @@ test('OpenCode Go DeepSeek V4.1 Flash sends high reasoning by default', { timeou
     model: 'deepseek-v4.1-flash', effort: 'high', thinking: { type: 'enabled' }, authCorrect: true,
   });
 });
+
+test('MCP tools are exposed only to enabled web parent turns, never rooms or delegated sessions', { timeout: 20_000 }, async t => {
+  const hits = [];
+  const endpoint = createServer(async (req, res) => {
+    if (req.method !== 'POST') return res.writeHead(405).end();
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const message = JSON.parse(raw);
+    hits.push(message);
+    const response = result => res.writeHead(200, { 'content-type': 'application/json' })
+      .end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
+    if (message.method === 'initialize') return response({
+      protocolVersion: message.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' },
+    });
+    if (message.method === 'notifications/initialized') return res.writeHead(202).end();
+    if (message.method === 'tools/list') return response({ tools: [
+      { name: 'lookup', description: 'Look up a fixture note', inputSchema: { type: 'object' } },
+    ] });
+    if (message.method === 'tools/call') return response({ content: [{ type: 'text', text: 'Fixture note' }] });
+    return res.writeHead(400).end();
+  }).listen(0, '127.0.0.1');
+  await once(endpoint, 'listening');
+  t.after(() => endpoint.close());
+  const dir = await dataDir(t);
+  const url = await launch(t, dir, { ...inspectSetup, MANOLO_CODING_TOOLS: '0', MANOLO_MCP_SERVERS: JSON.stringify({
+    notes: { url: `http://127.0.0.1:${endpoint.address().port}/mcp`, tools: ['lookup'] },
+  }) }).start();
+  const text = fixtureTool('call_mcp_tool', { server: 'notes', tool: 'lookup', arguments: { query: 'today' } });
+  expectPending(await put(url, 'untrusted-mcp', 'private', text));
+  assert.equal((await toolTurn(url, 'untrusted-mcp', 'call_mcp_tool')).tool.status, 'error');
+  const room = { instructions: 'Help the room with text only.' };
+  assert.equal((await put(url, 'bad-room-mcp', 'room', text, { room, ...workEnabled })).code, 400);
+  expectPending(await put(url, 'room-mcp', 'room', text, { room }));
+  assert.equal((await toolTurn(url, 'room-mcp', 'call_mcp_tool')).tool.status, 'error');
+  expectPending(await put(url, 'child-mcp', 'web', fixtureTool('delegate_work', { title: 'Isolated work', task: 'fixture:setup' }), workEnabled));
+  const { tool: delegated } = await toolTurn(url, 'child-mcp', 'delegate_work');
+  assert.equal(delegated.status, 'ok');
+  assert.deepEqual(JSON.parse(JSON.parse(delegated.output).result).tools, []);
+  expectPending(await put(url, 'child-mcp-attempt', 'web', fixtureTool('delegate_work', { title: 'Denied tool', task: text }), workEnabled));
+  assert.equal((await toolTurn(url, 'child-mcp-attempt', 'delegate_work')).tool.status, 'error');
+  assert.equal(hits.length, 0);
+  expectPending(await put(url, 'web-mcp', 'web', text, workEnabled));
+  const { tool: result } = await toolTurn(url, 'web-mcp', 'call_mcp_tool');
+  assert.equal(result.status, 'ok', JSON.stringify(result));
+  assert.match(result.output, /Fixture note/);
+  assert.deepEqual(hits.filter(message => message.method === 'tools/call').map(({ params }) => params), [
+    { name: 'lookup', arguments: { query: 'today' } },
+  ]);
+});

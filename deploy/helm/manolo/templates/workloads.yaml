@@ -11,6 +11,9 @@
 {{- end -}}
 {{- $workSessionAgent := .Values.workSessionAgent -}}
 {{- if not (kindIs "string" $workSessionAgent) -}}{{ fail "workSessionAgent must be a string" }}{{- end -}}
+{{- if and $workSessionAgent .Values.relayDemoCredentials -}}
+{{- fail "workSessionAgent cannot be enabled with relayDemoCredentials" -}}
+{{- end -}}
 {{- if and $workSessionAgent (not (hasKey $entries $workSessionAgent)) -}}
 {{- fail (printf "workSessionAgent %q is not configured in agents" $workSessionAgent) -}}
 {{- end -}}
@@ -186,6 +189,12 @@ spec:
             {{- if not (kindIs "map" $w.workBlueprints) }}{{ fail "agents.<id>.workBlueprints must be a mapping" }}{{ end }}
             {{- if $w.workBlueprints }}
             - {name: MANOLO_WORK_BLUEPRINTS, value: {{ $w.workBlueprints | mustToJson | quote }}}
+            {{- end }}
+            {{- end }}
+            {{- if hasKey $w "mcpServers" }}
+            {{- if not (kindIs "map" $w.mcpServers) }}{{ fail "agents.<id>.mcpServers must be a mapping" }}{{ end }}
+            {{- if $w.mcpServers }}
+            - {name: MANOLO_MCP_SERVERS, value: {{ $w.mcpServers | mustToJson | quote }}}
             {{- end }}
             {{- end }}
             {{- with $w.bashEnv }}

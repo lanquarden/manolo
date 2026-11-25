@@ -38,6 +38,7 @@ agents:
     # and provider key are refused even when named here.
     bashEnv: []
     workBlueprints: {} # Optional named, non-secret instructions for delegated work.
+    mcpServers: {} # Operator-trusted Streamable HTTP endpoints and explicit tool allowlists.
     fixture: false
   canary:
     image: ""
@@ -50,4 +51,5 @@ agents:
     codingTools: true
     bashEnv: []
     workBlueprints: {}
+    mcpServers: {}
     fixture: false
