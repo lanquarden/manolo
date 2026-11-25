@@ -29,6 +29,22 @@ async function until(check, description) {
   throw new Error(`Timed out: ${description}`);
 }
 
+// A minimal valid 2x2 24-bit BMP: only the worker's image processor can turn this into a provider-ready PNG.
+function bmp2x2() {
+  const pixels = Buffer.from([0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0]);
+  const header = Buffer.alloc(54);
+  header.write('BM', 0, 'ascii');
+  header.writeUInt32LE(54 + pixels.length, 2);
+  header.writeUInt32LE(54, 10);
+  header.writeUInt32LE(40, 14);
+  header.writeInt32LE(2, 18);
+  header.writeInt32LE(2, 22);
+  header.writeUInt16LE(1, 26);
+  header.writeUInt16LE(24, 28);
+  header.writeUInt32LE(pixels.length, 34);
+  return Buffer.concat([header, pixels]);
+}
+
 function start(t, filename, env) {
   const child = spawn(process.execPath, [`src/${filename}.mjs`], { cwd, env: { PATH: process.env.PATH, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
@@ -237,14 +253,48 @@ test('real relay and Pi worker processes: message recovery, private routing, web
       const payload = await (await request(web, `/api/turns/${id}`, owner)).json();
       return ['done', 'failed'].includes(payload.status) && payload;
     }, 'worker executes a tool through Pi Durable');
-    assert.deepEqual(outcome, { status: 'done', text: 'Fixture tool succeeded' });
+    assert.equal(outcome.status, 'done');
+    assert.equal(outcome.text, 'Fixture tool succeeded');
+    assert.equal(outcome.tools?.[0]?.name, name);
+    assert.equal(outcome.tools[0].status, 'ok');
+    return outcome;
   }
   await runTool('inbox-tool', 'send_inbox', { ...event, text: 'Actual worker draft request for review' });
   assert.ok((await (await request(web, '/api/inbox', tester)).json()).messages.some(msg => msg.text === 'Actual worker draft request for review' && msg.from === 'primary'));
   await runTool('draft-tool', 'write_dashboard_draft', spec);
+  const withTools = (await history(web, owner)).find(({ id }) => id === 'draft-tool');
+  assert.deepEqual(withTools.tools.map(({ name }) => name), ['write_dashboard_draft']);
   const { draft } = await (await request(web, '/api/dashboard', owner)).json();
   assert.deepEqual(draft.spec, spec);
   assert.equal((await (await request(web, '/api/dashboard', tester)).json()).draft, null);
+  // A tool that returns an image stores it once, keeps it out of the transcript JSON, and serves it to its owner only.
+  await writeFile(join(root, 'primary', 'workspace', 'pixel.bmp'), bmp2x2());
+  await runTool('image-tool', 'read', { path: 'pixel.bmp' });
+  const imageTurn = await (await request(web, '/api/turns/image-tool', owner)).json();
+  assert.deepEqual(imageTurn.tools[0].images, [{ mimeType: 'image/png', index: 0 }]);
+  const served = await request(web, '/api/turn-image/image-tool/0', owner);
+  assert.equal(served.status, 200);
+  assert.equal(served.headers.get('content-type'), 'image/png');
+  assert.deepEqual([...Buffer.from(await served.arrayBuffer()).subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal((await request(web, '/api/turn-image/image-tool/0', tester)).status, 404);
+  assert.equal((await request(web, '/api/turn-image/image-tool/0', {})).status, 401);
+  assert.equal((await request(web, '/api/turn-image/image-tool/9', owner)).status, 404);
+  // Live progress reaches the browser while the tool still runs, and is gone once the turn ends.
+  const liveInput = `fixture-tool:${JSON.stringify({ name: 'bash', args: { command: 'printf relay-live-marker; sleep 2' } })}`;
+  await request(web, '/api/turns', owner, 'POST', { id: 'live-turn', text: liveInput }, mutation);
+  const streaming = await until(async () => {
+    const payload = await (await request(web, '/api/turns/live-turn', owner)).json();
+    return payload.live?.tools?.[0]?.output?.includes('relay-live-marker') ? payload : null;
+  }, 'relay streams live tool output');
+  assert.equal(streaming.status, 'pending');
+  assert.equal(streaming.live.tools[0].name, 'bash');
+  assert.equal(streaming.live.tools[0].status, 'running');
+  const completedLive = await until(async () => {
+    const payload = await (await request(web, '/api/turns/live-turn', owner)).json();
+    return payload.status === 'done' ? payload : null;
+  }, 'live turn completes');
+  assert.equal(completedLive.live, undefined);
+  assert.equal(completedLive.tools[0].status, 'ok');
   const publication = await (await request(web, '/api/dashboard/publish', owner, 'POST', { revision: draft.revision }, mutation)).json();
   assert.deepEqual(publication.current.spec, spec);
   assert.deepEqual(sent.map(m => m.chat_id).sort(), ['101', '202'], 'browser and inbox do not trigger Telegram delivery');
@@ -270,7 +320,9 @@ test('real relay and Pi worker processes: message recovery, private routing, web
     return h[0]?.status === 'done' && h;
   }, 'browser turn completes after relay restart');
   assert.match(canaryHistory[0].reply, /durable browser request/);
-  assert.equal((await history(recoveredWeb, owner)).length, 3);
+  const persisted = await history(recoveredWeb, owner);
+  assert.equal(persisted.length, 5);
+  assert.deepEqual(persisted.find(({ id }) => id === 'draft-tool')?.tools?.map(({ name }) => name), ['write_dashboard_draft']);
   assert.equal((await request(recoveredWeb, '/api/turns/parked', owner)).status, 404);
   assert.equal(discordSent.length, 2, 'replayed gateway events do not send a second reply');
 });

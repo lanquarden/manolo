@@ -3,8 +3,17 @@ import { validTranscript, validVoiceFileId } from './speech.mjs';
 import { key, routeKey, SNOWFLAKE } from './relay-config.mjs';
 
 const conflict = () => Object.assign(new Error('Turn ID was already used'), { statusCode: 409 });
+const webTools = row => {
+  if (row.state !== 'done' || typeof row.tools !== 'string') return {};
+  try {
+    const tools = JSON.parse(row.tools);
+    return Array.isArray(tools) && tools.length > 0 ? { tools } : {};
+  } catch {
+    return {};
+  }
+};
 const webStatus = row => {
-  if (row.state === 'done') return { status: 'done', text: row.output };
+  if (row.state === 'done') return { status: 'done', text: row.output, ...webTools(row) };
   if (row.state === 'failed') return { status: 'failed', text: 'This turn could not be completed.' };
   return { status: 'pending' };
 };
@@ -38,10 +47,14 @@ export function openRelayStore(path) {
       seq INTEGER PRIMARY KEY, id TEXT NOT NULL, owner TEXT NOT NULL, agent TEXT NOT NULL,
       turn_id TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL, input TEXT NOT NULL, created_at TEXT NOT NULL,
       state TEXT NOT NULL CHECK(state IN ('submit','wait','done','failed')),
-      output TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0
+      output TEXT, tools TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS web_due ON web_turns(state,next_at);
     CREATE INDEX IF NOT EXISTS web_session ON web_turns(session_id,seq);
+    CREATE TABLE IF NOT EXISTS web_tool_images (
+      turn_seq INTEGER NOT NULL, idx INTEGER NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL,
+      PRIMARY KEY (turn_seq, idx)
+    );
     CREATE TABLE IF NOT EXISTS relay_inbox (
       id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL,
       created_at TEXT NOT NULL
@@ -49,8 +62,10 @@ export function openRelayStore(path) {
     CREATE INDEX IF NOT EXISTS relay_inbox_recipient ON relay_inbox(recipient, created_at);
   `);
   const columns = new Set(db.prepare('PRAGMA table_info(telegram_jobs)').all().map(row => row.name));
+  const webColumns = new Set(db.prepare('PRAGMA table_info(web_turns)').all().map(row => row.name));
   db.exec('BEGIN IMMEDIATE');
   try {
+    if (!webColumns.has('tools')) db.exec('ALTER TABLE web_turns ADD COLUMN tools TEXT');
     if (!columns.has('voice_file_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_file_id TEXT');
     if (!columns.has('reply_message_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN reply_message_id INTEGER');
     if (!columns.has('voice_reply')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_reply INTEGER NOT NULL DEFAULT 0');
@@ -70,6 +85,9 @@ export function openRelayStore(path) {
   const discordReady = selection('discord_jobs', 'AND j.bot=?', 'seq', active);
   const webReady = selection('web_turns', '', 'seq', "('submit','wait')");
   const webLookup = db.prepare('SELECT * FROM web_turns WHERE turn_id=?');
+  const clearToolImages = db.prepare('DELETE FROM web_tool_images WHERE turn_seq=?');
+  const addToolImage = db.prepare('INSERT OR REPLACE INTO web_tool_images(turn_seq,idx,mime,data) VALUES(?,?,?,?)');
+  const toolImage = db.prepare('SELECT mime, data FROM web_tool_images WHERE turn_seq=? AND idx=?');
   const webSession = (owner, agent) => key('web-session', owner, agent);
   const webId = (owner, agent, id) => key('web', owner, agent, id);
   return {
@@ -161,12 +179,35 @@ export function openRelayStore(path) {
     webHistory(owner, agent) {
       return db.prepare('SELECT * FROM web_turns WHERE session_id=? ORDER BY seq DESC LIMIT 30').all(webSession(owner, agent)).reverse().map(row => ({
         id: row.id, text: row.input, createdAt: row.created_at,
-        status: webStatus(row).status, ...(row.state === 'done' && { reply: row.output }),
+        status: webStatus(row).status, ...(row.state === 'done' && { reply: row.output }), ...webTools(row),
       }));
     },
     webReady(now) { return webReady.all(now); },
-    webAdvance(job, state, output = null, next = 0, attempts = 0) {
-      db.prepare('UPDATE web_turns SET state=?, output=?, next_at=?, attempts=? WHERE seq=?').run(state, output, next, attempts, job.seq);
+    webAdvance(job, state, { output = null, tools = null, next = 0, attempts = 0 } = {}) {
+      let stored = tools;
+      if (Array.isArray(tools)) {
+        // Images are blobs served per turn, so the transcript JSON stays small enough for a history load.
+        clearToolImages.run(job.seq);
+        let index = 0;
+        stored = tools.map(tool => {
+          if (!Array.isArray(tool.images)) return tool;
+          const images = tool.images.flatMap(image => {
+            if (typeof image?.data !== 'string' || typeof image?.mimeType !== 'string') return [];
+            addToolImage.run(job.seq, index, image.mimeType, Buffer.from(image.data, 'base64'));
+            return [{ mimeType: image.mimeType, index: index++ }];
+          });
+          const { images: _ignored, ...rest } = tool;
+          return images.length > 0 ? { ...rest, images } : rest;
+        });
+      }
+      db.prepare('UPDATE web_turns SET state=?, output=?, tools=?, next_at=?, attempts=? WHERE seq=?')
+        .run(state, output, stored === null ? null : JSON.stringify(stored), next, attempts, job.seq);
+    },
+    webImage(owner, agent, id, index) {
+      const row = webLookup.get(webId(owner, agent, id));
+      if (!row) return undefined;
+      const image = toolImage.get(row.seq, index);
+      return image && { mimeType: image.mime, data: image.data };
     },
     inbox(from, to, text, idempotencyKey) {
       const id = key('inbox', from, idempotencyKey);

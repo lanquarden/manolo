@@ -3,10 +3,18 @@ relayImage: ""
 relaySecret: manolo-relay
 relayStorage: 1Gi
 storageClassName: longhorn
+# Public origin of the relay, e.g. https://manolo.example.com. Needed for MCP OAuth: the authorization server redirects
+# the owner's browser to <publicUrl>/mcp/oauth/callback, which forwards the code to the agent's worker.
+publicUrl: ''
 # The PoC uses Basic Auth; expose through HTTPS or kubectl port-forward only.
 relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passwords load. Isolated smoke tests only.
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
+# Optional cluster-internal runtime companion listener. The agent must be web-only
+# (not targeted by relayConfig.routes), and relayDemoCredentials must be disabled.
+runtimeAgent: ''
+# Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
+runtimeIngressFrom: []
 relayConfig:
   owners:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
@@ -24,6 +32,27 @@ agents:
     provider: ""
     model: ""
     instructions: "" # Non-secret behavior instructions; changing this restarts only this worker.
+    codingTools: true # Set false to keep the pod shell and file tools unavailable to this agent.
+    # Extra environment names the worker's bash tool receives. Only an allowlist reaches the shell; the agent token
+    # and provider key are refused even when named here.
+    bashEnv: []
+    # Opt-in headed Chromium sidecar. The agent drives it over loopback CDP and the
+    # relay proxies its web desktop into the Manolo UI. Needs an immutable image
+    # digest, a persistent profile claim and roughly 2Gi of pod memory.
+    browser:
+      enabled: false
+      image: ""
+      profileSize: 5Gi
+      width: 1280
+      height: 800
+    # Optional seed for the agent's own <data>/mcp.json. The file on the volume is the source of truth afterwards: the
+    # owner or the agent edits it and the worker applies changes without a restart.
+    mcpServers: {}
+    # Keep the `codemode` tool available for this agent even when no MCP server asks for code mode.
+    codemode: false
+    # Machines this agent's conversation can switch its file and shell tools to, through a pi-env daemon over SSH.
+    # The pod stays the default; the agent asks for a target with workspace_target(s).
+    remoteEnvs: {}
     fixture: false
   canary:
     image: ""
@@ -33,4 +62,15 @@ agents:
     provider: ""
     model: ""
     instructions: ""
+    codingTools: true
+    bashEnv: []
+    browser:
+      enabled: false
+      image: ""
+      profileSize: 5Gi
+      width: 1280
+      height: 800
+    mcpServers: {}
+    codemode: false
+    remoteEnvs: {}
     fixture: false

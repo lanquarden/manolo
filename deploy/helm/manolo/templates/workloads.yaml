@@ -9,6 +9,82 @@
 {{- if not (regexMatch "^[a-z][a-z0-9-]{0,31}$" $id) -}}{{ fail "Agent IDs must be Kubernetes name segments" }}{{- end -}}
 {{- $_ := set $entries $id (dict "url" (printf "http://manolo-%s:8081" $id) "tokenEnv" $agent.tokenEnv) -}}
 {{- end -}}
+
+{{- /* An opt-in headed Chromium sidecar per worker. The relay proxies its web desktop and the worker reaches its
+       loopback CDP endpoint; nothing else on the network may connect to either port. */ -}}
+{{- $browsers := dict -}}
+{{- $browserUrls := dict -}}
+{{- range $id, $agent := .Values.agents -}}
+{{- $browser := $agent.browser | default dict -}}
+{{- if not (kindIs "map" $browser) -}}{{ fail (printf "agents.%s.browser must be a mapping" $id) }}{{- end -}}
+{{- $enabled := $browser.enabled | default false -}}
+{{- if not (kindIs "bool" $enabled) -}}{{ fail (printf "agents.%s.browser.enabled must be a boolean" $id) }}{{- end -}}
+{{- if $enabled -}}
+{{- if $agent.fixture -}}{{ fail (printf "agents.%s.browser cannot be enabled on a fixture worker" $id) }}{{- end -}}
+{{- if not (kindIs "string" $browser.image) -}}{{ fail (printf "agents.%s.browser.image must be a string" $id) }}{{- end -}}
+{{- $_ := include "manolo.image" $browser.image -}}
+{{- $profileSize := $browser.profileSize | default "5Gi" -}}
+{{- if not (kindIs "string" $profileSize) -}}{{ fail (printf "agents.%s.browser.profileSize must be a string" $id) }}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,3}(Mi|Gi)$" $profileSize) -}}{{ fail (printf "agents.%s.browser.profileSize must be a positive Mi or Gi quantity" $id) }}{{- end -}}
+{{- if not (regexMatch "^[0-9]{3,4}$" (toString ($browser.width | default 1280))) -}}{{ fail (printf "agents.%s.browser.width must be an integer" $id) }}{{- end -}}
+{{- if not (regexMatch "^[0-9]{3,4}$" (toString ($browser.height | default 800))) -}}{{ fail (printf "agents.%s.browser.height must be an integer" $id) }}{{- end -}}
+{{- $width := int ($browser.width | default 1280) -}}
+{{- $height := int ($browser.height | default 800) -}}
+{{- if or (lt $width 640) (gt $width 3840) -}}{{ fail (printf "agents.%s.browser.width must be from 640 to 3840" $id) }}{{- end -}}
+{{- if or (lt $height 480) (gt $height 2160) -}}{{ fail (printf "agents.%s.browser.height must be from 480 to 2160" $id) }}{{- end -}}
+{{- if hasKey $entries "browser" -}}{{ fail "browser is a reserved agent ID when a worker browser is enabled" }}{{- end -}}
+{{- $url := printf "http://manolo-%s:5800" $id -}}
+{{- $_ := set $browsers $id (dict "url" $url "image" $browser.image "profileSize" $profileSize "width" $width "height" $height) -}}
+{{- $_ := set $browserUrls $id $url -}}
+{{- end -}}
+{{- end -}}
+
+{{- $publicUrl := .Values.publicUrl | default "" -}}
+{{- if not (kindIs "string" $publicUrl) -}}{{ fail "publicUrl must be a string" }}{{- end -}}
+{{- if $publicUrl -}}
+{{- if not (regexMatch "^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$" $publicUrl) -}}
+{{- fail "publicUrl must be an http(s) origin with no path" -}}
+{{- end -}}
+{{- end -}}
+
+{{- $runtimeAgent := .Values.runtimeAgent -}}
+{{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
+{{- if $runtimeAgent -}}
+{{- if not (hasKey $entries $runtimeAgent) -}}{{ fail (printf "runtimeAgent %q is not configured in agents" $runtimeAgent) }}{{- end -}}
+{{- if hasKey $entries "runtimes" -}}{{ fail "runtimes is a reserved agent ID when the runtime companion listener is enabled" }}{{- end -}}
+{{- if .Values.relayDemoCredentials -}}{{ fail "runtimeAgent cannot be enabled with relayDemoCredentials" }}{{- end -}}
+{{- with .Values.relayConfig.routes -}}
+{{- if not (kindIs "slice" .) -}}{{ fail "relayConfig.routes must be a list" }}{{- end -}}
+{{- range . -}}
+{{- if not (kindIs "map" .) -}}{{ fail "relayConfig.routes entries must be mappings" }}{{- end -}}
+{{- if and (kindIs "string" .agent) (eq .agent $runtimeAgent) -}}
+{{- fail (printf "runtimeAgent %q must be web-only: relayConfig.routes must not target it" $runtimeAgent) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "slice" .Values.runtimeIngressFrom) .Values.runtimeIngressFrom) -}}
+{{- fail "runtimeAgent requires a nonempty runtimeIngressFrom list" -}}
+{{- end -}}
+{{- range $i, $peer := .Values.runtimeIngressFrom -}}
+{{- $path := printf "runtimeIngressFrom[%d]" $i -}}
+{{- if not (kindIs "map" $peer) -}}{{ fail (printf "%s must be a NetworkPolicy peer mapping" $path) }}{{- end -}}
+{{- $restricted := false -}}
+{{- range $key, $value := $peer -}}
+{{- if not (kindIs "map" $value) -}}{{ fail (printf "%s.%s must be a mapping" $path $key) }}{{- end -}}
+{{- if eq $key "ipBlock" -}}
+{{- if or (ne (len $peer) 1) (not (kindIs "string" $value.cidr)) (not ($value.cidr | trim)) (regexMatch "/0+$" ($value.cidr | trim)) -}}
+{{- fail (printf "%s.ipBlock requires a restricted CIDR and cannot be combined with selectors" $path) -}}
+{{- end -}}
+{{- $restricted = true -}}
+{{- else if or (eq $key "podSelector") (eq $key "namespaceSelector") -}}
+{{- if or $value.matchLabels $value.matchExpressions -}}{{- $restricted = true -}}{{- end -}}
+{{- else -}}
+{{- fail (printf "%s.%s is not a NetworkPolicy peer field" $path $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $restricted -}}{{ fail (printf "%s must not be empty or allow unrestricted ingress" $path) }}{{- end -}}
+{{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -23,6 +99,8 @@ data:
 {{- end -}}
 {{- range $w := $workloads }}
 ---
+{{- $browser := dict -}}
+{{- if hasKey $browsers ($w.name | trimPrefix "manolo-") -}}{{- $browser = get $browsers ($w.name | trimPrefix "manolo-") -}}{{- end -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -34,6 +112,22 @@ spec:
   resources:
     requests:
       storage: {{ $w.storage | quote }}
+{{- with $browser }}
+---
+# Chromium's persistent profile: cookies, logins and restored tabs. Treat it as
+# credential-grade data; it is never shared between agents.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $w.name }}-browser
+  namespace: {{ $.Release.Namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $.Values.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ .profileSize | quote }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,6 +173,9 @@ spec:
             - {name: http, containerPort: {{ $w.port }}}
             {{- if eq $w.kind "relay" }}
             - {name: internal, containerPort: 8082}
+            {{- if $runtimeAgent }}
+            - {name: runtimes, containerPort: 8084}
+            {{- end }}
             {{- end }}
           readinessProbe:
             httpGet: {path: /healthz, port: http}
@@ -96,15 +193,52 @@ spec:
             {{- if eq $w.kind "relay" }}
             - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- if $runtimeAgent }}
+            - {name: MANOLO_RUNTIME_AGENT, value: {{ $runtimeAgent | quote }}}
+            - {name: MANOLO_RUNTIME_HOST, value: "0.0.0.0"}
+            {{- end }}
             {{- if $.Values.relayDemoCredentials }}
             - {name: MANOLO_DEMO, value: "1"}
             - {name: MANOLO_DEMO_ALLOW_NETWORK, value: "1"}
             {{- end }}
+            {{- with $browserUrls }}
+            - {name: MANOLO_BROWSER_URLS, value: {{ . | mustToJson | quote }}}
+            {{- end }}
             {{- else }}
             - {name: MANOLO_AGENT_ID, value: {{ $w.agentId | quote }}}
             - {name: MANOLO_RELAY_URL, value: "http://manolo-relay:8082"}
+            {{- if $browser }}
+            # Chromium's native debugger binds loopback in the shared pod netns, so only this container can drive it.
+            - {name: MANOLO_BROWSER_CDP, value: "http://127.0.0.1:9222"}
+            {{- end }}
+            {{- if $publicUrl }}
+            - {name: MANOLO_PUBLIC_URL, value: {{ $publicUrl | quote }}}
+            {{- end }}
+            {{- with $w.remoteEnvs }}
+            {{- if not (kindIs "map" .) }}{{ fail "agents.<id>.remoteEnvs must be a mapping" }}{{ end }}
+            - {name: MANOLO_REMOTE_ENVS, value: {{ . | mustToJson | quote }}}
+            {{- end }}
+            {{- if hasKey $w "codemode" }}
+            {{- if not (kindIs "bool" $w.codemode) }}{{ fail "agents.<id>.codemode must be a boolean" }}{{ end }}
+            {{- if $w.codemode }}
+            - {name: MANOLO_CODEMODE, value: "1"}
+            {{- end }}
+            {{- end }}
+            {{- with $w.mcpServers }}
+            {{- if not (kindIs "map" .) }}{{ fail "agents.<id>.mcpServers must be a mapping" }}{{ end }}
+            - {name: MANOLO_MCP_SERVERS, value: {{ dict "mcpServers" . | mustToJson | quote }}}
+            {{- end }}
+            {{- if hasKey $w "codingTools" }}
+            {{- if not (kindIs "bool" $w.codingTools) }}{{ fail "agents.<id>.codingTools must be a boolean" }}{{ end }}
+            {{- if not $w.codingTools }}
+            - {name: MANOLO_CODING_TOOLS, value: "0"}
+            {{- end }}
+            {{- end }}
             {{- with $w.instructions }}
             - {name: MANOLO_AGENT_INSTRUCTIONS, value: {{ . | quote }}}
+            {{- end }}
+            {{- with $w.bashEnv }}
+            - {name: MANOLO_BASH_ENV, value: {{ join "," . | quote }}}
             {{- end }}
             {{- if $w.fixture }}
             - {name: MANOLO_MODE, value: fixture}
@@ -118,7 +252,11 @@ spec:
             {{- end }}
           resources:
             requests: {cpu: 50m, memory: 128Mi}
+            {{- if eq $w.kind "worker" }}
+            limits: {memory: 1Gi}
+            {{- else }}
             limits: {memory: 512Mi}
+            {{- end }}
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
@@ -129,16 +267,80 @@ spec:
             {{- if eq $w.kind "relay" }}
             - {name: config, mountPath: /config, readOnly: true}
             {{- end }}
+        {{- with $browser }}
+        # Root is required by the image init; Chromium itself runs as UID/GID 1000.
+        # The web frontend on 5800 is reachable only from the relay, and raw VNC is
+        # bound to a Unix socket, not a port.
+        - name: browser
+          image: {{ .image | quote }}
+          securityContext:
+            # The pod forbids root; the image's supervisor needs it to prepare the
+            # profile, then drops to UID/GID 1000 for Chromium itself.
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile: {type: RuntimeDefault}
+            capabilities:
+              drop: [ALL]
+              # NET_BIND_SERVICE is needed by nginx's file capability even on port 5800.
+              add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, NET_BIND_SERVICE, SETGID, SETUID]
+          ports:
+            - {name: desktop, containerPort: 5800}
+          env:
+            - {name: USER_ID, value: "1000"}
+            - {name: GROUP_ID, value: "1000"}
+            - {name: UMASK, value: "0077"}
+            - {name: DISPLAY_WIDTH, value: {{ .width | quote }}}
+            - {name: DISPLAY_HEIGHT, value: {{ .height | quote }}}
+            # The relay owns authentication and the UI; no terminal, file manager or
+            # built-in web auth, and no all-interface CDP bridge.
+            - {name: WEB_AUTHENTICATION, value: "0"}
+            - {name: WEB_TERMINAL, value: "0"}
+            - {name: WEB_FILE_MANAGER, value: "0"}
+            - {name: VNC_LISTENING_PORT, value: "-1"}
+            - {name: CHROMIUM_REMOTE_DEBUGGING, value: "0"}
+            - {name: CHROMIUM_CUSTOM_ARGS, value: "--remote-debugging-port=9222 --restore-last-session --no-first-run --no-default-browser-check --disk-cache-size=268435456"}
+          startupProbe:
+            httpGet: {path: /, port: desktop}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: [/bin/sh, -ec, "wget -q -O /dev/null http://127.0.0.1:9222/json/version"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /, port: desktop}
+            periodSeconds: 30
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: browser, mountPath: /config}
+            - {name: browser-tmp, mountPath: /tmp}
+            - {name: browser-run, mountPath: /run}
+        {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: {{ $w.name }}-data}
         - name: tmp
-          emptyDir: {sizeLimit: 32Mi}
+          emptyDir: {sizeLimit: {{ if eq $w.kind "worker" }}256Mi{{ else }}32Mi{{ end }}}
         - name: home
           emptyDir: {sizeLimit: 1Gi}
         {{- if eq $w.kind "relay" }}
         - name: config
           configMap: {name: manolo-relay}
+        {{- end }}
+        {{- with $browser }}
+        - name: browser
+          persistentVolumeClaim: {claimName: {{ $w.name }}-browser}
+        - name: browser-tmp
+          emptyDir: {medium: Memory, sizeLimit: 512Mi}
+        - name: browser-run
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
         {{- end }}
 ---
 apiVersion: v1
@@ -153,6 +355,22 @@ spec:
     {{- if eq $w.kind "relay" }}
     - {name: internal, port: 8082, targetPort: internal}
     {{- end }}
+    {{- with $browser }}
+    - {name: desktop, port: 5800, targetPort: desktop}
+    {{- end }}
+{{- end }}
+{{- if $runtimeAgent }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: manolo-runtimes
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: manolo-relay}
+  ports:
+    - {name: runtimes, port: 8084, targetPort: runtimes}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -166,7 +384,9 @@ spec:
   ingress:
     - from:
         - podSelector: {matchLabels: {manolo.lan/component: relay}}
-      ports: [{port: 8081, protocol: TCP}]
+      # 5800 carries a worker browser's web desktop when one is enabled; the port
+      # is closed for every worker that does not listen on it.
+      ports: [{port: 8081, protocol: TCP}, {port: 5800, protocol: TCP}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -184,4 +404,9 @@ spec:
     - from:
         {{- toYaml . | nindent 8 }}
       ports: [{port: 8080, protocol: TCP}]
+    {{- end }}
+    {{- if $runtimeAgent }}
+    - from:
+        {{- toYaml .Values.runtimeIngressFrom | nindent 8 }}
+      ports: [{port: 8084, protocol: TCP}]
     {{- end }}

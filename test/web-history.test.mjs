@@ -87,13 +87,23 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
 }, async (t) => {
   const literal = '<b data-untrusted>plain text</b>';
+  const tools = [
+    { name: 'bash', status: 'ok', args: '{"command":"echo hi"}', output: 'hi\n', durationMs: 12,
+      diagnostics: [{ severity: 'info', code: 'full_output', message: 'Full output: /tmp/manolo/tool-output' }] },
+    { name: 'edit', status: 'error', args: '{"path":"notes.txt"}', diff: '- old\n+ new', output: 'Could not edit the file.' },
+    { name: 'read', status: 'ok', images: [{ mimeType: 'image/png', index: 0 }] },
+  ];
   const turns = [
-    { id: 'saved', text: literal, createdAt: 1, status: 'done', reply: literal },
+    { id: 'saved', text: literal, createdAt: 1, status: 'done', reply: literal, tools },
     { id: 'failed', text: 'Saved failure', createdAt: 2, status: 'failed' },
     { id: 'older', text: 'Older pending', createdAt: 3, status: 'pending' },
-    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending' },
+    { id: 'latest', text: 'Latest pending', createdAt: 4, status: 'pending', live: {
+      text: 'streamed partial', thinking: 'streamed reasoning',
+      tools: [{ name: 'bash', status: 'running', output: 'live output line' }],
+    } },
   ];
   const checked = [];
+  const mcpSaves = [];
   const posts = [];
   const authorizations = [];
   const assets = new Map(await Promise.all([
@@ -110,6 +120,17 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
       res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-store' });
       res.end(asset.body);
       return;
+    }
+    if (url === '/api/session') return json({ owner: 'owner', agent: 'primary', browser: true });
+    if (url === '/api/mcp' && method === 'GET') {
+      return json({ servers: [{ name: 'fixture', kind: 'stdio', enabled: true, state: 'connected', tools: 3 }], error: null, config: '{"mcpServers":{}}' });
+    }
+    if (url === '/api/mcp/config' && method === 'PUT') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const { text } = JSON.parse(body);
+      mcpSaves.push({ text, headers: req.headers });
+      return json({ servers: [], error: null, config: text });
     }
     if (url === '/api/dashboard') return json({ history: [] });
     if (url === '/api/inbox') return json({ messages: [] });
@@ -150,6 +171,20 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.deepEqual(await run(`[...document.querySelector('#chat-log').children].map(row => row.children[1].textContent)`),
     [literal, 'Saved failure', 'Older pending', 'Latest pending']);
   assert.equal(await run(`document.querySelectorAll('[data-untrusted]').length`), 0);
+  const saved = `document.querySelector('#chat-log > li:first-child')`;
+  assert.equal(await run(`${saved}.querySelectorAll('.chat-tool').length`), 3);
+  assert.deepEqual(await run(`[...${saved}.querySelectorAll('.chat-tool .tool-name')].map(node => node.textContent)`), ['bash', 'edit', 'read']);
+  assert.deepEqual(await run(`[...${saved}.querySelectorAll('.chat-tool .tool-status')].map(node => node.textContent)`), ['ok', 'failed', 'ok']);
+  assert.ok(await run(`${saved}.querySelector('.chat-tool').textContent.includes('echo hi')`));
+  assert.ok(await run(`${saved}.querySelector('.chat-tool').textContent.includes('Full output: /tmp/manolo/tool-output')`));
+  assert.ok(await run(`${saved}.querySelector('.chat-tool .tool-diff').textContent.includes('- old')`));
+  assert.equal(await run(`${saved}.querySelector('.chat-tool[data-status="error"] .tool-status').textContent`), 'failed');
+  assert.equal(await run(`${saved}.querySelector('.tool-image img').getAttribute('src')`), '/api/turn-image/saved/0');
+  assert.equal(await run(`${saved}.querySelector('.chat-tool:has(.tool-image)').open`), true);
+  assert.equal(await run(`document.querySelector('.chat-stream').textContent`), 'streamed partial');
+  assert.equal(await run(`document.querySelector('.chat-thinking-text').textContent`), 'streamed reasoning');
+  assert.equal(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-status').textContent`), 'running');
+  assert.ok(await run(`document.querySelector('.chat-tool[data-status="running"] .tool-output').textContent.includes('live output line')`));
   assert.ok(await run(`${logText}.includes(${JSON.stringify(literal)}) && ${logText}.includes('Turn failed.')`));
   assert.equal(await run(sendDisabled), true);
   assert.equal(await run(checkHidden), false);
@@ -159,6 +194,21 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.ok(await run(`${visible('chat')} && !(${visible('dashboard')}) && !(${visible('inbox')})`));
   await run(press('chat', 'ArrowDown'));
   assert.ok(await run(`${visible('dashboard')} && document.activeElement.id === 'dashboard-tab'`));
+  // The browser tab appears only for an agent with a desktop, and loads the proxied frame on first use.
+  await waitFor(run, `!document.getElementById('browser-tab').hidden`);
+  // The MCP card lists the agent's servers and saves the edited file back through the request header the relay wants.
+  await waitFor(run, `document.querySelectorAll('#mcp-list li').length === 1`);
+  assert.equal(await run(`document.querySelector('#mcp-list li').textContent.includes('fixture · 3 tools')`), true);
+  assert.equal(await run(`document.getElementById('mcp-config').value`), '{"mcpServers":{}}');
+  await run(`document.getElementById('mcp-config').value = '{"mcpServers":{"x":{"command":"y"}}}'; document.getElementById('mcp-form').requestSubmit()`);
+  await waitFor(run, `document.getElementById('mcp-status').textContent === 'Applied.'`);
+  assert.equal(mcpSaves.length, 1);
+  assert.equal(mcpSaves[0].headers['x-manolo-request'], '1');
+  assert.match(mcpSaves[0].text, /"x"/);
+  await run(click('browser-tab'));
+  assert.ok(await run(`${visible('browser')} && document.getElementById('browser-frame').getAttribute('src') === '/desktop/'`));
+  await run(click('chat-tab'));
+  assert.ok(await run(visible('chat')));
   await run(click('inbox-tab'));
   assert.ok(await run(visible('inbox')));
   await run(press('inbox', 'Home'));
@@ -167,6 +217,8 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   await waitFor(run, `document.getElementById('workspace-tabs').getAttribute('aria-orientation') === 'horizontal'`);
   await run(press('chat', 'ArrowRight'));
   assert.ok(await run(`${visible('dashboard')} && document.documentElement.scrollWidth === innerWidth`));
+  // Hidden tabs are skipped by keyboard navigation, so the compact row keeps working with three or four views.
+  assert.equal(await run(`document.getElementById('browser-tab').hidden`), false);
   await run(click('chat-tab'));
   assert.ok(await run(`${visible('chat')} && document.querySelector('#send-chat').getBoundingClientRect().bottom <= innerHeight`));
   await run(`${fill('New draft')}; document.querySelector('#chat-form').requestSubmit()`);

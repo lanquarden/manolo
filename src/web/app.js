@@ -1,7 +1,6 @@
 const byId = (id) => document.getElementById(id);
-const MAX_POLLS = 30;
-const POLL_INTERVAL_MS = 1_500;
-const POLL_WINDOW_MS = 60_000;
+const POLL_INTERVAL_MS = 800;
+const POLL_WINDOW_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 
 function textNode(tag, text, className) {
@@ -38,6 +37,7 @@ function failure(error) {
 
 const tabList = byId('workspace-tabs');
 const tabs = [...tabList.querySelectorAll('[role="tab"]')];
+const visibleTabs = () => tabs.filter(tab => !tab.hidden);
 const compactNav = matchMedia('(max-width: 48.999rem)');
 function orientTabs() {
   tabList.setAttribute('aria-orientation', compactNav.matches ? 'horizontal' : 'vertical');
@@ -50,26 +50,57 @@ function showTab(selected) {
     byId(tab.getAttribute('aria-controls')).hidden = !active;
   }
   if (selected.id === 'chat-tab') scrollChatToEnd();
+  if (selected.id === 'browser-tab') openDesktop();
 }
 for (const tab of tabs) tab.addEventListener('click', () => showTab(tab));
 tabList.addEventListener('keydown', (event) => {
-  const index = tabs.indexOf(event.target);
+  const list = visibleTabs();
+  const index = list.indexOf(event.target);
   if (index < 0) return;
   const previous = compactNav.matches ? 'ArrowLeft' : 'ArrowUp';
   const next = compactNav.matches ? 'ArrowRight' : 'ArrowDown';
   let destination;
-  if (event.key === previous) destination = (index + tabs.length - 1) % tabs.length;
-  else if (event.key === next) destination = (index + 1) % tabs.length;
+  if (event.key === previous) destination = (index + list.length - 1) % list.length;
+  else if (event.key === next) destination = (index + 1) % list.length;
   else if (event.key === 'Home') destination = 0;
-  else if (event.key === 'End') destination = tabs.length - 1;
+  else if (event.key === 'End') destination = list.length - 1;
   else return;
   event.preventDefault();
-  showTab(tabs[destination]);
-  tabs[destination].focus();
+  showTab(list[destination]);
+  list[destination].focus();
 });
 compactNav.addEventListener('change', orientTabs);
 orientTabs();
 
+// The desktop is another same-origin document that the relay proxies to this owner's worker browser. It is only
+// loaded once the session says this agent has one, and only when the tab is first opened.
+const browserTab = byId('browser-tab');
+const browserFrame = byId('browser-frame');
+const browserStatus = byId('browser-status');
+const reloadBrowserButton = byId('reload-browser');
+let browserAvailable = false;
+function openDesktop() {
+  browserFrame.hidden = false;
+  if (!browserFrame.getAttribute('src')) browserFrame.src = '/desktop/';
+}
+async function refreshBrowser() {
+  let available = false;
+  try {
+    available = Boolean((await api('/api/session')).browser);
+  } catch {
+    available = false;
+  }
+  browserAvailable = available;
+  browserTab.hidden = !available;
+  if (!available) return;
+  if (browserStatus.textContent === 'The desktop is loading.') {
+    browserStatus.textContent = 'The agent and you share this window; activity appears on both.';
+  }
+}
+reloadBrowserButton.addEventListener('click', () => {
+  if (!browserAvailable) return;
+  browserFrame.src = '/desktop/';
+});
 const dashboardControls = byId('dashboard-controls');
 const dashboardStatus = byId('dashboard-status');
 const publishButton = byId('publish-dashboard');
@@ -185,6 +216,104 @@ async function refreshInbox() {
 
 refreshInboxButton.addEventListener('click', refreshInbox);
 
+const runtimeSection = byId('paired-runtimes');
+const runtimeControls = byId('runtime-controls');
+const runtimeList = byId('runtime-list');
+const runtimeStatus = byId('runtime-status');
+const runtimePairing = byId('runtime-pairing');
+const runtimeCode = byId('runtime-code');
+const runtimeCodeExpiry = byId('runtime-code-expiry');
+const runtimesPath = '/api/runtimes';
+let runtimeCodeTimer;
+
+function clearRuntimeCode() {
+  clearTimeout(runtimeCodeTimer);
+  runtimePairing.hidden = true;
+  runtimeCode.textContent = '';
+  runtimeCodeExpiry.textContent = '';
+  runtimeCodeExpiry.removeAttribute('datetime');
+}
+
+async function runtimeAction(progress, action, hideOnNotFound = false) {
+  if (runtimeControls.disabled) return;
+  runtimeControls.disabled = true;
+  runtimeStatus.textContent = progress;
+  try {
+    await action();
+  } catch (error) {
+    if (error.status === 401 || (hideOnNotFound && error.status === 404)) {
+      runtimeSection.hidden = true;
+      runtimeList.replaceChildren();
+      clearRuntimeCode();
+    }
+    runtimeStatus.textContent = failure(error);
+  } finally {
+    runtimeControls.disabled = false;
+  }
+}
+
+async function loadRuntimes(message = '') {
+  const { runtimes } = await api(runtimesPath);
+  const rows = runtimes.map(({ id, name, online }) => {
+    const row = document.createElement('li');
+    const revoke = textNode('button', 'Revoke');
+    revoke.type = 'button';
+    revoke.setAttribute('aria-label', `Revoke ${name}`);
+    revoke.addEventListener('click', () => {
+      if (!window.confirm(`Revoke access for “${name}”?`)) return;
+      void runtimeAction('Revoking runtime…', async () => {
+        try {
+          const { ok } = await api(`${runtimesPath}/${encodeURIComponent(id)}/revoke`, 'POST', {});
+          if (ok !== true) throw new Error('Unexpected revoke response');
+          row.remove();
+        } catch (error) {
+          // A stale row may already have been revoked in another tab.
+          if (error.status !== 404) throw error;
+          await loadRuntimes('Runtime is no longer paired.');
+          return;
+        }
+        runtimeStatus.textContent = runtimeList.children.length ? 'Runtime revoked.' : 'Runtime revoked. No paired runtimes.';
+      }, true);
+    });
+    row.append(textNode('span', `${name} — ${online ? 'Online' : 'Offline'}`), revoke);
+    return row;
+  });
+  runtimeList.replaceChildren(...rows);
+  runtimeStatus.textContent = message || (rows.length ? '' : 'No paired runtimes.');
+  runtimeSection.hidden = false;
+}
+
+function refreshRuntimes() {
+  return runtimeAction('Refreshing runtimes…', loadRuntimes, true);
+}
+
+byId('refresh-runtimes').addEventListener('click', refreshRuntimes);
+byId('generate-pairing-code').addEventListener('click', () => {
+  void runtimeAction('Generating pairing code…', async () => {
+    clearRuntimeCode();
+    const { code, expires } = await api(`${runtimesPath}/enroll`, 'POST', {});
+    const expiry = new Date(expires);
+    const remaining = expires - Date.now();
+    if (typeof code !== 'string' || !code || !Number.isFinite(expires) || !Number.isFinite(expiry.getTime())) {
+      throw new Error('Unexpected pairing code response');
+    }
+    if (remaining <= 0) {
+      runtimeStatus.textContent = 'Pairing code expired. Generate a new code.';
+      return;
+    }
+    runtimeCode.textContent = code;
+    runtimeCodeExpiry.textContent = expiry.toLocaleTimeString();
+    runtimeCodeExpiry.dateTime = expiry.toISOString();
+    runtimePairing.hidden = false;
+    const generatedMessage = 'Pairing code generated. Keep it private.';
+    runtimeStatus.textContent = generatedMessage;
+    runtimeCodeTimer = setTimeout(() => {
+      clearRuntimeCode();
+      if (runtimeStatus.textContent === generatedMessage) runtimeStatus.textContent = 'Pairing code expired.';
+    }, remaining);
+  }, true);
+});
+
 const chatInput = byId('chat-text');
 const chatStatus = byId('chat-status');
 const chatLog = byId('chat-log');
@@ -223,8 +352,66 @@ function scrollChatToEnd() {
   if (!chatPanel.hidden) transcript.scrollTop = transcript.scrollHeight;
 }
 
+const TOOL_STATUS = { ok: 'ok', error: 'failed', pending: 'queued', running: 'running', done: 'ok' };
+
+function renderThinking(thinking) {
+  const details = document.createElement('details');
+  details.className = 'chat-thinking';
+  details.append(textNode('summary', 'Thinking'));
+  details.append(textNode('div', thinking, 'chat-thinking-text'));
+  return details;
+}
+
+function renderToolImage(turnId, image) {
+  const frame = document.createElement('figure');
+  frame.className = 'tool-image';
+  const img = document.createElement('img');
+  img.src = `/api/turn-image/${encodeURIComponent(turnId)}/${image.index}`;
+  img.alt = 'Image returned by a tool';
+  img.loading = 'lazy';
+  frame.append(img);
+  return frame;
+}
+
+function renderTools(tools, turnId) {
+  const list = document.createElement('ul');
+  list.className = 'chat-tools';
+  for (const tool of tools) {
+    const item = document.createElement('li');
+    const details = document.createElement('details');
+    details.className = 'chat-tool';
+    details.dataset.status = tool.status;
+    // An image the agent read is the point of the call, so show it without another click.
+    if (tool.images?.length) details.open = true;
+    const summary = document.createElement('summary');
+    summary.append(
+      textNode('span', tool.name, 'tool-name'),
+      textNode('span', TOOL_STATUS[tool.status] ?? tool.status, 'tool-status'),
+    );
+    const preview = (tool.args ?? '').replace(/\s+/g, ' ').trim();
+    if (preview) summary.append(textNode('span', preview.slice(0, 90), 'tool-preview'));
+    details.append(summary);
+    for (const image of tool.images ?? []) details.append(renderToolImage(turnId, image));
+    if (tool.args) details.append(textNode('pre', tool.args, 'tool-args'));
+    if (tool.diff) details.append(textNode('pre', tool.diff, 'tool-diff'));
+    if (tool.output) details.append(textNode('pre', tool.output, 'tool-output'));
+    if (tool.droppedLines) details.append(textNode('p', `${tool.droppedLines} earlier lines dropped.`, 'tool-dropped'));
+    if (tool.diagnostics?.length) {
+      const notes = document.createElement('ul');
+      notes.className = 'tool-diagnostics';
+      for (const note of tool.diagnostics) {
+        notes.append(textNode('li', note.message, `tool-diagnostic ${note.severity}`));
+      }
+      details.append(notes);
+    }
+    item.append(details);
+    list.append(item);
+  }
+  return list;
+}
+
 function renderHistory() {
-  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ text, status, reply }) => {
+  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ id, text, status, reply, tools, live }) => {
     const row = document.createElement('li');
     row.className = 'chat-turn';
     row.append(textNode('strong', 'You', 'chat-user'), textNode('div', text, 'chat-prompt plain-text'));
@@ -233,11 +420,18 @@ function renderHistory() {
     answer.dataset.state = status;
     answer.append(textNode('strong', 'Manolo'));
     if (status === 'done') {
+      if (Array.isArray(tools) && tools.length > 0) answer.append(renderTools(tools, id));
       answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
     } else {
       const message = status === 'failed' ? 'Turn failed.' : 'Reply pending.';
       answer.append(textNode('div', message, 'chat-turn-state'));
       if (status === 'failed' && reply) answer.append(textNode('div', reply, 'plain-text'));
+      if (status === 'pending' && live) {
+        if (live.thinking) answer.append(renderThinking(live.thinking));
+        if (live.tools?.length) answer.append(renderTools(live.tools, id));
+        if (live.text) answer.append(textNode('div', live.text, 'chat-stream plain-text'));
+        if (live.retry) answer.append(textNode('div', 'Retrying the model request…', 'chat-turn-state'));
+      }
     }
     row.append(answer);
     return row;
@@ -273,8 +467,18 @@ async function refreshHistory() {
 function recordTurnStatus(turn, result) {
   if (!['done', 'failed', 'pending'].includes(result?.status)) throw new Error('Unexpected turn status');
   if (unconfirmedTurn?.id === turn.id) unconfirmedTurn = undefined;
-  if (result.status === 'pending') return;
-  turns.set(turn.id, { ...turn, status: result.status, reply: typeof result.text === 'string' ? result.text : undefined });
+  if (result.status === 'pending') {
+    if (result.live) {
+      turns.set(turn.id, { ...turn, status: 'pending', live: result.live });
+      renderHistory();
+    }
+    return;
+  }
+  turns.set(turn.id, {
+    ...turn, status: result.status, live: undefined,
+    reply: typeof result.text === 'string' ? result.text : undefined,
+    tools: Array.isArray(result.tools) ? result.tools : undefined,
+  });
   while (turns.size > HISTORY_LIMIT) turns.delete(turns.keys().next().value);
   renderHistory();
 }
@@ -287,13 +491,15 @@ async function runTurn(turn, submit) {
   try {
     let result = submit ? await api('/api/turns', 'POST', { id, text }) : await api(path);
     recordTurnStatus(turn, result);
+    // Stream while the turn runs: poll the relay faster than history refreshes, but never more than the window.
     const deadline = performance.now() + POLL_WINDOW_MS;
-    for (let count = 0; result.status === 'pending' && count < MAX_POLLS; count++) {
-      if (deadline - performance.now() <= POLL_INTERVAL_MS) break;
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    while (result.status === 'pending') {
       const remaining = Math.floor(deadline - performance.now());
       if (remaining <= 0) break;
-      result = await api(path, 'GET', undefined, Math.min(REQUEST_TIMEOUT_MS, remaining));
+      await new Promise((resolve) => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining)));
+      const left = Math.floor(deadline - performance.now());
+      if (left <= 0) break;
+      result = await api(path, 'GET', undefined, Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, left)));
       recordTurnStatus(turn, result);
     }
     chatStatus.textContent = idleChatStatus();
@@ -339,6 +545,68 @@ checkButton.addEventListener('click', () => {
 });
 refreshHistoryButton.addEventListener('click', refreshHistory);
 
+const mcpList = byId('mcp-list');
+const mcpStatus = byId('mcp-status');
+const mcpConfig = byId('mcp-config');
+const mcpForm = byId('mcp-form');
+const refreshMcpButton = byId('refresh-mcp');
+
+function renderMcp(state) {
+  const rows = (state.servers ?? []).map(server => {
+    const item = document.createElement('li');
+    const title = textNode('span', `${server.name} · ${server.tools} tool${server.tools === 1 ? '' : 's'}`);
+    const state_ = textNode('span', server.state, 'badge');
+    const actions = document.createElement('span');
+    actions.className = 'mcp-actions';
+    if (server.authUrl) {
+      const signIn = textNode('button', 'Sign in');
+      signIn.type = 'button';
+      signIn.addEventListener('click', () => {
+        window.open(server.authUrl, '_blank', 'noopener');
+        mcpStatus.textContent = `Authorize ${server.name} in the new tab; this list refreshes afterwards.`;
+      });
+      actions.append(signIn);
+    }
+    item.append(title, state_, actions);
+    if (server.error) item.append(textNode('p', server.error, 'plain-text'));
+    return item;
+  });
+  mcpList.replaceChildren(...rows);
+  if (!rows.length) mcpList.append(textNode('li', 'No MCP servers configured.'));
+  if (state.error) mcpStatus.textContent = state.error;
+  // Do not fight the owner's edits: only replace the editor when it is not focused.
+  if (document.activeElement !== mcpConfig && typeof state.config === 'string') mcpConfig.value = state.config;
+}
+
+async function refreshMcp() {
+  refreshMcpButton.disabled = true;
+  try {
+    const state = await api('/api/mcp');
+    renderMcp(state);
+    if (!state.error) mcpStatus.textContent = '';
+  } catch (error) {
+    mcpStatus.textContent = failure(error);
+  } finally {
+    refreshMcpButton.disabled = false;
+  }
+}
+
+refreshMcpButton.addEventListener('click', () => void refreshMcp());
+mcpForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  mcpStatus.textContent = 'Saving…';
+  try {
+    const state = await api('/api/mcp/config', 'PUT', { text: mcpConfig.value });
+    renderMcp(state);
+    mcpStatus.textContent = state.error ?? 'Applied.';
+  } catch (error) {
+    mcpStatus.textContent = failure(error);
+  }
+});
+
 void refreshDashboard();
 void refreshInbox();
 void refreshHistory();
+void refreshRuntimes();
+void refreshBrowser();
+void refreshMcp();

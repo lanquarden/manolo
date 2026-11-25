@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
-import { defineExtension, defineTool, ProviderDoc } from '@earendil-works/pi-durable';
+import { defineDoc, defineExtension, defineTool, ProviderDoc, wrapTool } from '@earendil-works/pi-durable';
+import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
 
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
 const PROVIDERS = new Map(Object.entries({
@@ -78,7 +79,7 @@ export async function createWorkerModels(cfg, env) {
   if (thinkingLevel && !getSupportedThinkingLevels(catalogModel).includes(thinkingLevel)) {
     throw new Error('Unsupported thinking level');
   }
-  return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey };
+  return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey, credentialEnv: keyName };
 }
 
 function schema(properties) {
@@ -116,11 +117,88 @@ async function readRelayJson(response) {
       if (bytes > 64 * 1024) throw new Error('relay response too large');
       json += decoder.decode(value, { stream: true });
     }
-    JSON.parse(json + decoder.decode());
+    return JSON.parse(json + decoder.decode());
   } finally {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
+}
+
+// File and shell tools for the worker's own workspace. The shell gets an allowlist of the worker's environment, so a
+// new credential name cannot leak by default; `env` adds names the operator wants available. This is not a sandbox.
+// The process can still read /proc/self/environ and run as the container's user.
+export const DEFAULT_BASH_TIMEOUT_SECONDS = 1800;
+export const BASH_ENV_NAMES = ['PATH', 'HOME', 'USER', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM'];
+export function installCodingTools(registry, { images, env = [], timeoutSeconds = DEFAULT_BASH_TIMEOUT_SECONDS }) {
+  const names = new Set([...BASH_ENV_NAMES, ...env]);
+  const visibleEnv = () => Object.fromEntries([...names].flatMap(name => {
+    const value = process.env[name];
+    return typeof value === 'string' ? [[name, value]] : [];
+  }));
+  const bash = createBashTool({ prepare(execution) { execution.env = visibleEnv(); execution.inheritEnv = false; } });
+  // These are also callable from a `codemode` script, so a script can inspect or change the workspace between calls
+  // to other tools. `callers` never widens the model's own set: 'model' is still there.
+  const scriptable = tool => ({ ...tool, callers: [...new Set([...(tool.callers ?? ['model']), 'model', 'tools'])] });
+  registry.install(defineExtension({
+    name: 'coding-tools',
+    tools: [scriptable(createReadTool({ images })), scriptable(createWriteTool()), scriptable(createEditTool()), scriptable(bash)],
+    // A turn waits on a command with no timeout, so every call gets one even when the model omits it.
+    wraps: [wrapTool(createBashTool(), tool => ({
+      ...tool,
+      execute: (args, api, context) => tool.execute({ ...args, timeout: args.timeout ?? timeoutSeconds }, api, context),
+    }))],
+  }));
+}
+
+export const RuntimeAccess = defineDoc({
+  kind: 'manolo.runtime-access', scope: 'conversation', version: 1, initial: () => ({ targets: [] }), checkpointWhen: () => true,
+});
+
+export function installRuntimeTools(registry, { relay, token }) {
+  if (!relay) return;
+  const exec = defineTool({
+    name: 'runtime_exec', callers: ['model'], replay: 'unsafe',
+    description: 'Run a shell command on a paired runtime listed in this turn’s instructions. Use ordinary bash for the pod. Relative cwd is resolved on the runtime under its home directory. Never retry an unknown outcome automatically.',
+    parameters: {
+      type: 'object', additionalProperties: false, required: ['target', 'command'], properties: {
+        target: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,31}$' },
+        command: textSchema(8000), cwd: textSchema(4096),
+        timeoutSeconds: { type: 'integer', minimum: 1, maximum: 120 },
+      },
+    },
+    async execute({ target, command, cwd, timeoutSeconds = 30 }, api, context) {
+      const access = await api.snapshot(RuntimeAccess, api.conversationId, context);
+      if (!access?.turn || !access.targets.includes(target)) throw new Error('This runtime is not available for this turn.');
+      const timeoutMs = timeoutSeconds * 1000;
+      const deadline = AbortSignal.timeout(timeoutMs + 5000);
+      const signal = context.abortSignal ? AbortSignal.any([deadline, context.abortSignal]) : deadline;
+      let result;
+      try {
+        const response = await fetch(`${relay}/v1/runtime/execute`, {
+          method: 'POST', redirect: 'error', signal,
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+          body: JSON.stringify({ turn: access.turn, target, command, cwd, timeoutMs }),
+        });
+        if (response.status >= 400 && response.status < 500) {
+          await response.body?.cancel();
+          result = { status: 'denied' };
+        } else result = await readRelayJson(response);
+      } catch { result = { status: 'unknown' }; }
+      if (result?.status === 'denied') throw new Error('Runtime request was denied before dispatch.');
+      if (result?.status === 'unavailable') throw new Error(`${target} is offline or busy; command was not dispatched.`);
+      if (result?.status !== 'completed' || typeof result.output !== 'string' || result.output.length > 8000 ||
+          typeof result.timedOut !== 'boolean' || (result.exitCode !== null && !Number.isSafeInteger(result.exitCode))) {
+        throw new Error(`${target}: command outcome unknown. Do not retry automatically.`);
+      }
+      const status = result.timedOut ? 'timed out after it may have run; do not retry automatically' : `exit status ${result.exitCode ?? 'unknown'}`;
+      return {
+        output: [{ type: 'text', text: `[${target}] ${status}\n${result.output}` }],
+        isError: result.timedOut || result.exitCode !== 0,
+      };
+    },
+  });
+  registry.install(defineExtension({ name: 'manolo-runtimes', tools: [exec] }));
+  return exec;
 }
 
 export function installRelayTools(registry, { relay, agentId, token }) {

@@ -96,16 +96,62 @@ function waitForRequest(dir, attempt = 1) {
 }
 
 const expected = text => ({ status: 'done', text: `Fixture: ${text}` });
+// A running turn may also carry live progress; the admission contract is only code and status.
+function expectPending(result) {
+  assert.equal(result.code, 202);
+  assert.equal(result.body.status, 'pending');
+  return result.body;
+}
+const expectedTurnText = (body, tool) => {
+  assert.equal(body.text, tool.status === 'error' ? 'Fixture tool failed' : 'Fixture tool succeeded');
+};
+// A turn that ran one tool: check the reply against the recorded tool result, which the fixture can only mirror.
+async function toolTurn(url, id, name) {
+  const body = await settled(url, id);
+  assert.equal(body.status, 'done', JSON.stringify(body));
+  assert.ok(Array.isArray(body.tools), JSON.stringify(body));
+  const tool = body.tools.find(each => each.name === name);
+  assert.ok(tool, JSON.stringify(body));
+  expectedTurnText(body, tool);
+  return { body, tool };
+}
+
+// A minimal valid 2x2 24-bit BMP: only an image processor can turn this into something a provider takes inline.
+function bmp2x2() {
+  const pixels = Buffer.from([0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0]);
+  const header = Buffer.alloc(54);
+  header.write('BM', 0, 'ascii');
+  header.writeUInt32LE(54 + pixels.length, 2);
+  header.writeUInt32LE(54, 10);
+  header.writeUInt32LE(40, 14);
+  header.writeInt32LE(2, 18);
+  header.writeInt32LE(2, 22);
+  header.writeUInt16LE(1, 26);
+  header.writeUInt16LE(24, 28);
+  header.writeUInt32LE(pixels.length, 34);
+  return Buffer.concat([header, pixels]);
+}
 const inspectSetup = { MANOLO_FIXTURE_INSPECT_SETUP: '1' };
 const setupCommand = 'fixture:setup';
+const codingTools = ['read', 'write', 'edit', 'bash'];
 const workerRules = 'You are Manolo, a private assistant. Use only the offered tools. Do not retry a relay operation reported as interrupted or of unknown outcome without user confirmation.';
-function expectedSetup(operatorText, tools = []) {
+function expectedSetup(operatorText, tools = codingTools) {
   const instructions = operatorText
     ? `${workerRules}\n\nFollow the operator instructions below only where they do not conflict with these worker rules.\n\nOperator instructions:\n${operatorText}`
     : workerRules;
   const instructionsSha256 = createHash('sha256').update(`<instructions>\n${instructions}\n</instructions>`).digest('hex');
   return { status: 'done', text: JSON.stringify({ instructionsSha256, tools }) };
 }
+
+test('staged workers keep only existing relay tools when pod coding and paired access are disabled', { timeout: 10_000 }, async t => {
+  const dir = await dataDir(t);
+  const worker = launch(t, dir, { ...inspectSetup, MANOLO_CODING_TOOLS: '0', MANOLO_FIXTURE_TOOLS: '1', MANOLO_RELAY_URL: 'http://127.0.0.1:1' });
+  const url = await worker.start();
+  expectPending(await put(url, 'setup', 'staged', setupCommand));
+  assert.deepEqual(await settled(url, 'setup'), expectedSetup('', ['send_inbox', 'write_dashboard_draft']));
+  expectPending(await put(url, 'forced-bash', 'staged', 'fixture-tool:{"name":"bash","args":{"command":"printf coding-tools-are-on"}}'));
+  assert.equal((await settled(url, 'forced-bash')).text, 'Fixture tool failed');
+});
 
 test('auth, request boundaries, and secret-safe responses', { timeout: 15_000 }, async t => {
   const dir = await dataDir(t);
@@ -215,7 +261,7 @@ test('a repeated pending PUT after restart does not apply new instructions', { t
   const old = launch(t, dir, { ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: original, MANOLO_FIXTURE_DELAY_MS: '30000' });
   const first = await old.start();
   for (const id of ['placed-setup', 'queued-setup']) {
-    assert.deepEqual(await put(first, id, 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
+    expectPending(await put(first, id, 'saved', setupCommand));
   }
   assert.equal(await waitForRequest(dir), 1);
   assert.deepEqual(await old.stop('SIGKILL'), [null, 'SIGKILL']);
@@ -223,8 +269,8 @@ test('a repeated pending PUT after restart does not apply new instructions', { t
   const second = await launch(t, dir, {
     ...inspectSetup, MANOLO_AGENT_INSTRUCTIONS: updated, MANOLO_FIXTURE_DELAY_MS: '1000',
   }).start();
-  assert.deepEqual(await put(second, 'placed-setup', 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
-  assert.deepEqual(await put(second, 'queued-setup', 'saved', setupCommand), { code: 202, body: { status: 'pending' } });
+  expectPending(await put(second, 'placed-setup', 'saved', setupCommand));
+  expectPending(await put(second, 'queued-setup', 'saved', setupCommand));
   assert.equal((await put(second, 'queued-setup', 'saved', 'conflicting input')).code, 409);
   assert.deepEqual(await settled(second, 'placed-setup'), expectedSetup(original));
   assert.deepEqual(await settled(second, 'queued-setup'), expectedSetup(original));
@@ -259,8 +305,8 @@ test('kill mid-generation and resume placed and queued submissions without a ret
   const dir = await dataDir(t);
   const oldWorker = launch(t, dir, { MANOLO_FIXTURE_DELAY_MS: '30000' });
   const url = await oldWorker.start();
-  assert.deepEqual(await put(url, 'interrupted', 'resume-session', 'recover me'), { code: 202, body: { status: 'pending' } });
-  assert.deepEqual(await put(url, 'queued', 'resume-session', 'after recovery'), { code: 202, body: { status: 'pending' } });
+  expectPending(await put(url, 'interrupted', 'resume-session', 'recover me'));
+  expectPending(await put(url, 'queued', 'resume-session', 'after recovery'));
   assert.equal(await waitForRequest(dir), 1);
   const competing = launch(t, dir);
   assert.deepEqual(await competing.closed, [1, null]);
@@ -304,19 +350,17 @@ test('relay tools use fixed authenticated requests and do not replay an interrup
   const toolInput = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
   const tool = (id, name, args) => put(url, id, 'tools', toolInput(name, args));
   assert.ok((await put(url, 'setup', 'tools', setupCommand)).code < 300);
-  assert.deepEqual(await settled(url, 'setup'), expectedSetup(opts.MANOLO_AGENT_INSTRUCTIONS, ['send_inbox', 'write_dashboard_draft']));
+  assert.deepEqual(await settled(url, 'setup'), expectedSetup(opts.MANOLO_AGENT_INSTRUCTIONS, [...codingTools, 'send_inbox', 'write_dashboard_draft']));
   const inbox = { to: 'allowed', text: 'hello' };
   const draft = { title: 'Title', widgets: [{ kind: 'heading', text: 'Section' }, { kind: 'note', text: 'Note' }] };
-  const success = { status: 'done', text: 'Fixture tool succeeded' };
-  const fail = { status: 'done', text: 'Fixture tool failed' };
   await tool('inbox', 'send_inbox', inbox);
-  assert.deepEqual(await settled(url, 'inbox'), success);
+  await toolTurn(url, 'inbox', 'send_inbox');
   await tool('draft', 'write_dashboard_draft', draft);
-  assert.deepEqual(await settled(url, 'draft'), success);
-  await tool('no-bash', 'bash', { command: 'not allowed' });
-  assert.deepEqual(await settled(url, 'no-bash'), fail);
+  await toolTurn(url, 'draft', 'write_dashboard_draft');
+  await tool('unknown-tool', 'powershell', { command: 'not offered' });
+  await toolTurn(url, 'unknown-tool', 'powershell');
   await tool('no-sender', 'send_inbox', { ...inbox, sender: 'forged' });
-  assert.deepEqual(await settled(url, 'no-sender'), fail);
+  await toolTurn(url, 'no-sender', 'send_inbox');
   assert.deepEqual(calls.map(({ method, path, body }) => ({ method, path, body })), [
     { method: 'POST', path: '/v1/inbox', body: inbox },
     { method: 'PUT', path: '/v1/dashboard/draft', body: draft },
@@ -327,14 +371,164 @@ test('relay tools use fixed authenticated requests and do not replay an interrup
   await until(() => calls.length === 3, 'side effect recorded by loopback relay');
   assert.deepEqual(await worker.stop('SIGKILL'), [null, 'SIGKILL']);
   const next = await launch(t, dir, opts).start();
-  assert.deepEqual(await settled(next, 'interrupted-tool'), fail);
-  assert.deepEqual(await put(next, 'interrupted-tool', 'tools', toolInput('send_inbox', interrupted)), { code: 200, body: fail });
+  await toolTurn(next, 'interrupted-tool', 'send_inbox');
+  const retried = await put(next, 'interrupted-tool', 'tools', toolInput('send_inbox', interrupted));
+  assert.equal(retried.code, 200);
+  assert.equal(retried.body.status, 'done');
   assert.equal(calls.length, 3);
   assert.equal(new Set(calls.map(call => call.key)).size, 3);
   for (const call of calls) {
     assert.equal(call.auth, auth.authorization);
     assert.match(call.key, /^[a-f0-9]{64}$/);
   }
+});
+
+test('coding tools work in the data-volume workspace and keep the shell environment small', { timeout: 30_000 }, async t => {
+  const dir = await dataDir(t);
+  const relay = createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('[]'); });
+  relay.listen(0, '127.0.0.1');
+  await once(relay, 'listening');
+  t.after(() => { relay.closeAllConnections(); return new Promise(resolve => relay.close(resolve)); });
+  const worker = launch(t, dir, {
+    MANOLO_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, MANOLO_FIXTURE_TOOLS: '1',
+    HOME: dir, MANOLO_TEST_EXTRA: 'allowed-test-marker', MANOLO_TEST_UNLISTED: 'unlisted-test-marker',
+    MANOLO_BASH_ENV: 'MANOLO_AGENT_ID,MANOLO_TEST_EXTRA', MANOLO_BASH_TIMEOUT_SECONDS: '1',
+  });
+  const url = await worker.start();
+  const workspace = join(dir, 'workspace');
+  const toolInput = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
+  const tool = (id, name, args) => put(url, id, 'tools', toolInput(name, args));
+
+  // Relative paths resolve against the workspace, which lives on the data volume.
+  await tool('write', 'write', { path: 'notes/today.txt', content: 'hello workspace\n' });
+  await toolTurn(url, 'write', 'write');
+  assert.equal(await readFile(join(workspace, 'notes/today.txt'), 'utf8'), 'hello workspace\n');
+  await tool('read', 'read', { path: 'notes/today.txt' });
+  await toolTurn(url, 'read', 'read');
+  await tool('edit', 'edit', { path: 'notes/today.txt', edits: [{ oldText: 'workspace', newText: 'world' }] });
+  const edited = await toolTurn(url, 'edit', 'edit');
+  assert.match(edited.tool.diff ?? '', /world/);
+  assert.equal(await readFile(join(workspace, 'notes/today.txt'), 'utf8'), 'hello world\n');
+
+  // bash starts in the workspace, and its own writes land there.
+  await tool('bash', 'bash', { command: 'printf shell > notes/from-bash.txt' });
+  const bash = await toolTurn(url, 'bash', 'bash');
+  assert.equal(bash.tool.status, 'ok');
+  assert.equal(await readFile(join(workspace, 'notes/from-bash.txt'), 'utf8'), 'shell');
+
+  // An image is prepared by the processor: a BMP becomes something a provider accepts.
+  await writeFile(join(workspace, 'pixel.bmp'), bmp2x2());
+  await tool('image', 'read', { path: 'pixel.bmp' });
+  const image = await toolTurn(url, 'image', 'read');
+  assert.equal(image.tool.images?.[0]?.mimeType, 'image/png');
+  assert.ok(image.tool.images[0].data.length > 0);
+
+  // The shell allowlist: the token, an unlisted name and an unlisted worker variable stay out; listed names remain.
+  for (const [id, name] of [['no-token', 'MANOLO_AGENT_TOKEN'], ['no-unlisted', 'MANOLO_TEST_UNLISTED'], ['no-worker', 'MANOLO_MODE'], ['no-data', 'MANOLO_DATA_DIR']]) {
+    await tool(id, 'bash', { command: `printenv ${name}` });
+    const excluded = await toolTurn(url, id, 'bash');
+    assert.equal(excluded.tool.status, 'error', name);
+  }
+  for (const [id, name] of [['listed-agent', 'MANOLO_AGENT_ID'], ['listed-extra', 'MANOLO_TEST_EXTRA'], ['listed-home', 'HOME']]) {
+    await tool(id, 'bash', { command: `printenv ${name}` });
+    const listed = await toolTurn(url, id, 'bash');
+    assert.equal(listed.tool.status, 'ok', name);
+  }
+  await tool('timed-out', 'bash', { command: 'sleep 5', timeout: 1 });
+  const timedOut = await toolTurn(url, 'timed-out', 'bash');
+  assert.equal(timedOut.tool.status, 'error');
+  // Without an explicit timeout the configured default applies.
+  await tool('default-timed-out', 'bash', { command: 'sleep 5' });
+  const defaultTimedOut = await toolTurn(url, 'default-timed-out', 'bash');
+  assert.equal(defaultTimedOut.tool.status, 'error');
+
+  // Tool arguments and output are redacted like the answer text.
+  await tool('secret', 'write', { path: 'notes/secret.txt', content: token });
+  const secret = await toolTurn(url, 'secret', 'write');
+  assert.doesNotMatch(JSON.stringify(secret.body), new RegExp(token));
+  await tool('secret-read', 'read', { path: 'notes/secret.txt' });
+  const secretRead = await toolTurn(url, 'secret-read', 'read');
+  assert.doesNotMatch(JSON.stringify(secretRead.body), new RegExp(token));
+  assert.doesNotMatch(worker.logs(), new RegExp(token));
+  assert.doesNotMatch(worker.logs(), /allowed-test-marker/);
+});
+
+test('a running turn exposes live tool output before the result lands', { timeout: 20_000 }, async t => {
+  const dir = await dataDir(t);
+  const relay = createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('[]'); });
+  relay.listen(0, '127.0.0.1');
+  await once(relay, 'listening');
+  t.after(() => { relay.closeAllConnections(); return new Promise(resolve => relay.close(resolve)); });
+  const url = await launch(t, dir, {
+    MANOLO_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, MANOLO_FIXTURE_TOOLS: '1',
+  }).start();
+  const toolInput = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
+  await put(url, 'live-tool', 'tools', toolInput('bash', { command: 'printf live-tool-marker; sleep 2' }));
+  const slot = await until(async () => {
+    const { body } = await get(url, 'live-tool');
+    if (body.status !== 'pending') return false;
+    const running = body.live?.tools?.[0];
+    return running?.output?.includes('live-tool-marker') ? running : false;
+  }, 'live tool output on a running turn');
+  assert.equal(slot.name, 'bash');
+  assert.equal(slot.status, 'running');
+  const done = await settled(url, 'live-tool');
+  assert.equal(done.text, 'Fixture tool succeeded');
+  assert.equal(done.tools[0].status, 'ok');
+});
+
+test('a running live turn streams its reasoning and text', { timeout: 20_000 }, async t => {
+  const dir = await dataDir(t);
+  const preload = join(dir, 'stream.mjs');
+  await writeFile(preload, `const encoder = new TextEncoder();
+    globalThis.fetch = async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url !== 'https://opencode.ai/inference/go/openai/v1/chat/completions') throw new Error('Unexpected outbound destination');
+      const body = await req.json();
+      const chunk = (delta, finish) => 'data: ' + JSON.stringify({
+        id: 'stream', object: 'chat.completion.chunk', created: 1, model: body.model,
+        choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+      }) + '\\n\\n';
+      const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const stream = new ReadableStream({ async start(controller) {
+        controller.enqueue(encoder.encode(chunk({ role: 'assistant' })));
+        controller.enqueue(encoder.encode(chunk({ reasoning_content: 'live-reasoning-marker ' })));
+        await wait(400);
+        controller.enqueue(encoder.encode(chunk({ content: 'live-text-marker' })));
+        await wait(400);
+        controller.enqueue(encoder.encode(chunk({}, 'stop')));
+        controller.enqueue(encoder.encode('data: [DONE]\\n\\n'));
+        controller.close();
+      } });
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    };`);
+  const url = await launch(t, dir, {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'opencode-go', MANOLO_MODEL: 'deepseek-v4.1-flash',
+    OPENCODE_API_KEY: 'fake-opencode-key', NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+  }).start();
+  assert.ok((await put(url, 'stream', 'chat', 'stream please')).code < 300);
+  const seen = { text: '', thinking: '' };
+  await until(async () => {
+    const { body } = await get(url, 'stream');
+    if (body.status !== 'pending') return false;
+    if (body.live?.text) seen.text = body.live.text;
+    if (body.live?.thinking) seen.thinking = body.live.thinking;
+    return seen.text.includes('live-text-marker') && seen.thinking.includes('live-reasoning-marker');
+  }, 'live reasoning and answer text');
+  assert.deepEqual(await settled(url, 'stream'), { status: 'done', text: 'live-text-marker' });
+});
+
+test('an invalid or credential bash environment name fails startup', { timeout: 15_000 }, async t => {
+  for (const value of ['not-a-name', 'MANOLO_AGENT_TOKEN']) {
+    const dir = await dataDir(t);
+    const worker = launch(t, dir, { MANOLO_BASH_ENV: value });
+    assert.deepEqual(await worker.closed, [1, null]);
+    assert.match(worker.logs(), /MANOLO_BASH_ENV/);
+  }
+  const dir = await dataDir(t);
+  const worker = launch(t, dir, { MANOLO_BASH_TIMEOUT_SECONDS: '0' });
+  assert.deepEqual(await worker.closed, [1, null]);
+  assert.match(worker.logs(), /MANOLO_BASH_TIMEOUT_SECONDS/);
 });
 
 test('live-mode startup validates the pinned provider catalog and explicit keys without making a request', { timeout: 15_000 }, async t => {
