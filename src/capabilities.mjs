@@ -1,5 +1,6 @@
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { constants } from 'node:fs';
+import { open, readdir, realpath, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 // Everything this module returns is owner-visible and rendered verbatim, so it holds only names, descriptions, relative
 // paths and byte counts: never file contents, environment values, credentials, or absolute paths.
@@ -17,7 +18,7 @@ const MAX_BUILTIN_INSTRUCTIONS = 4000;
 const MAX_WALK_UP = 16;
 // A skill section is appended to a real prompt; keep it small enough that it never crowds out the turn.
 export const MAX_SKILL_SECTION_CHARS = 2500;
-const SKILL_INTRO = 'Repository skills. When a task matches one, read its SKILL.md and follow it.';
+const SKILL_INTRO = 'Repository skills found in the pod workspace. When a task matches one, read its SKILL.md and follow it.';
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 // Same filter as blueprint text: control and bidi characters are never prompt or display material.
 const unsafeText = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/u;
@@ -25,6 +26,52 @@ const unsafeText = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/u
 const statOrNull = async path => {
   try { return await stat(path); } catch { return null; }
 };
+
+const realpathOrNull = async path => {
+  try { return await realpath(path); } catch { return null; }
+};
+
+// A path is inside a root when it is the root itself or begins with `root/`.
+const inside = (path, root) => path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+
+/**
+ * Opens a regular file without following a final symlink, checks the opened descriptor (not the path) is a regular file
+ * within the byte cap, and reads it. A repository can be written by the agent, so a `SKILL.md` symlink must not be able
+ * to pull an out-of-tree file's text into a prompt or the owner's review panel.
+ */
+async function readRegularFileNoFollow(path, maxBytes) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > maxBytes) return undefined;
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+// Trim text to a UTF-8 byte budget on a code-point boundary: a character budget over bytes can yield nothing at all for
+// text that is not ASCII.
+function clipBytes(text, maxBytes) {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  let used = 0;
+  let out = '';
+  for (const character of text) {
+    const size = Buffer.byteLength(character);
+    if (used + size > maxBytes) break;
+    used += size;
+    out += character;
+  }
+  return out;
+}
 
 // A repository root is a directory that has a `.git` entry, which may be a directory or (in a worktree) a file.
 async function scanRoots(workspace) {
@@ -117,12 +164,15 @@ async function scanSkills(workspace) {
   const stamp = [];
   let visited = 0;
 
-  async function readDirectory(dir, role, depth) {
+  async function readDirectory(dir, role, depth, rootReal) {
     if (visited >= MAX_SKILL_DIRECTORIES || skills.length >= MAX_SKILLS) return;
     visited += 1;
     const info = await statOrNull(dir);
     stamp.push([dir, info?.mtimeMs ?? null]);
     if (!info?.isDirectory()) return;
+    // A symlinked `.agents/skills` (or a symlinked ancestor of it) would point the whole scan out of the repository.
+    const dirReal = await realpathOrNull(dir);
+    if (dirReal === null || !inside(dirReal, rootReal)) return;
     const skillFile = join(dir, 'SKILL.md');
     const fileInfo = await statOrNull(skillFile);
     if (fileInfo?.isFile()) {
@@ -130,7 +180,7 @@ async function scanSkills(workspace) {
       // A SKILL.md this large is not a routing header; skip it and do not treat its subdirectories as skills.
       if (fileInfo.size > MAX_SKILL_FILE_BYTES || skills.length >= MAX_SKILLS) return;
       let parsed;
-      try { parsed = parseSkill(await readFile(skillFile, 'utf8')); } catch { parsed = undefined; }
+      try { parsed = parseSkill(await readRegularFileNoFollow(skillFile, MAX_SKILL_FILE_BYTES)); } catch { parsed = undefined; }
       if (parsed && !seen.has(parsed.name)) {
         seen.add(parsed.name);
         const path = relative(workspace, skillFile);
@@ -141,15 +191,20 @@ async function scanSkills(workspace) {
     if (depth >= MAX_SKILL_DEPTH) return;
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries.toSorted((a, b) => a.name.localeCompare(b.name))) {
+      // `withFileTypes` reports a symlink as such, so a link to another directory is never traversed.
       if (!entry.isDirectory()) continue;
-      await readDirectory(join(dir, entry.name), role, depth + 1);
+      await readDirectory(join(dir, entry.name), role, depth + 1, rootReal);
     }
   }
 
   const repository = roots.at(-1);
+  const workspaceReal = await realpathOrNull(workspace);
   for (const root of roots) {
+    const rootReal = await realpathOrNull(root);
+    // An ancestor reached through a symlink is not a real ancestor of the workspace; refuse it rather than guess.
+    if (workspaceReal === null || rootReal === null || !inside(workspaceReal, rootReal)) continue;
     const role = root === workspace ? 'workspace' : root === repository ? 'repository' : 'ancestor';
-    await readDirectory(join(root, '.agents', 'skills'), role, 0);
+    await readDirectory(join(root, '.agents', 'skills'), role, 0, rootReal);
   }
   return { skills, stamp };
 }
@@ -229,28 +284,38 @@ function fitBudget(result) {
   }
   if (byteLength(current) > MAX_JSON_BYTES) {
     // A pathological prompt (many escaped characters) can exceed the cap on its own; trim it rather than the promise.
-    const excess = byteLength(current) - MAX_JSON_BYTES;
     const instructions = current.agent.instructions;
-    current = { ...current, agent: { ...current.agent, instructions: instructions.slice(0, Math.max(0, instructions.length - excess)) } };
+    const budget = Math.max(0, Buffer.byteLength(instructions) - (byteLength(current) - MAX_JSON_BYTES));
+    current = { ...current, agent: { ...current.agent, instructions: clipBytes(instructions, budget) } };
   }
   return current;
 }
 
-export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, workSessionRules }) {
+export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, workSessionRules, redact = text => text }) {
   const workspace = resolve(workspaceDir);
   const skills = await discoverSkills(workspace);
+  const safe = text => redact(String(text ?? ''));
   const result = {
-    agent: agentInfo(cfg, workSessionRules),
-    tools: toolList(registry),
+    agent: (() => {
+      const info = agentInfo(cfg, workSessionRules);
+      // Instructions are operator text, but a blueprint or an environment reference can still carry a token.
+      return {
+        ...info,
+        instructions: clip(safe(info.instructions), MAX_INSTRUCTIONS),
+        ...(info.workSessionRules !== undefined && { workSessionRules: clip(safe(info.workSessionRules), MAX_BUILTIN_INSTRUCTIONS) }),
+      };
+    })(),
+    tools: toolList(registry).map(tool => ({ ...tool, description: clip(safe(tool.description), MAX_SUMMARY) })),
     blueprints: [...(blueprints?.values?.() ?? [])].slice(0, 12).flatMap(blueprint => {
       const id = clip(blueprint?.id, 64);
       if (!id) return [];
-      return [{ id, description: clip(blueprint?.description, MAX_SUMMARY) }];
+      return [{ id, description: clip(safe(blueprint?.description), MAX_SUMMARY) }];
     }),
     agentsFiles: await findAgentsFiles(workspace),
-    // The panel shows a routing summary; the full description stays in the prompt section, where it belongs.
+    // The panel shows a routing summary; the full description stays in the prompt section, where it belongs. Skill text
+    // comes from a repository file, so it is redacted like any other untrusted prose before the owner sees it.
     skills: skills.map(skill => ({
-      name: skill.name, description: clip(skill.description, MAX_SUMMARY), path: skill.path, source: skill.source,
+      name: skill.name, description: clip(safe(skill.description), MAX_SUMMARY), path: skill.path, source: skill.source,
     })),
   };
   return fitBudget(result);

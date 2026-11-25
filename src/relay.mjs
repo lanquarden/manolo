@@ -474,7 +474,7 @@ async function login(req, res) {
 }
 
 // Owner-facing MCP management talks to the owner's own worker. The relay holds the agent token; the browser never does.
-async function workerApi(agent, path, { method = 'GET', body } = {}) {
+async function workerApi(agent, path, { method = 'GET', body, maxBytes = 128 * 1024 } = {}) {
   const { url, token } = config.agents.get(agent);
   let response;
   try {
@@ -485,8 +485,11 @@ async function workerApi(agent, path, { method = 'GET', body } = {}) {
       signal: AbortSignal.timeout(30_000),
     });
   } catch { throw fail(503); }
+  // A worker is trusted, but a version skew or a bug must not be able to stream an unbounded body into the relay.
   let result;
-  try { result = await response.json(); } catch { throw fail(503); }
+  try {
+    result = JSON.parse((await readBounded(response, maxBytes, AbortSignal.timeout(30_000))).toString('utf8'));
+  } catch { throw fail(503); }
   if (!response.ok) throw fail(response.status >= 400 && response.status < 500 ? response.status : 503);
   return result;
 }

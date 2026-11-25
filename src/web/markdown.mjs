@@ -6,6 +6,50 @@
 const MERMAID_MAX_SOURCE = 12_000;
 const MERMAID_MAX_SVG = 500_000;
 const MAX_MARKDOWN = 200_000;
+const MAX_DIAGRAMS = 8;
+const SVG_NS = 'http://www.w3.org/2000/svg';
+// Pele escapes the text it draws, but the SVG string crosses into our DOM, so the boundary is enforced here: only these
+// elements and attributes survive, no attribute may start with `on`, and a reference must be local to the document.
+const SVG_ELEMENTS = new Set([
+  'svg', 'g', 'defs', 'title', 'desc', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'tspan',
+  'marker', 'clipPath', 'mask', 'pattern', 'linearGradient', 'radialGradient', 'stop', 'symbol', 'use',
+]);
+const SVG_ATTRIBUTES = new Set([
+  'class', 'id', 'role', 'aria-label', 'viewBox', 'width', 'height', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r',
+  'rx', 'ry', 'd', 'points', 'transform', 'fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-width', 'stroke-dasharray',
+  'stroke-linecap', 'stroke-linejoin', 'stroke-opacity', 'opacity', 'font-family', 'font-size', 'font-weight', 'text-anchor',
+  'dominant-baseline', 'marker-end', 'marker-start', 'marker-mid', 'clip-path', 'mask', 'offset', 'stop-color',
+  'stop-opacity', 'gradientUnits', 'patternUnits', 'preserveAspectRatio', 'xmlns',
+]);
+let diagramSequence = 0;
+
+function sanitizeSvg(root, prefix) {
+  // Rename every id and every reference to it, so two diagrams (or a diagram and the page) cannot collide.
+  const ids = new Map();
+  for (const node of root.querySelectorAll('[id]')) {
+    const next = `${prefix}-${ids.size}`;
+    ids.set(node.getAttribute('id'), next);
+    node.setAttribute('id', next);
+  }
+  for (const node of [...root.querySelectorAll('*')]) {
+    if (node.namespaceURI !== SVG_NS || !SVG_ELEMENTS.has(node.localName)) {
+      node.remove();
+      continue;
+    }
+    for (const attribute of [...node.attributes]) {
+      const name = attribute.name;
+      const value = attribute.value;
+      if (name.startsWith('on') || !SVG_ATTRIBUTES.has(name)) { node.removeAttribute(name); continue; }
+      if (name === 'href' || name === 'xlink:href') {
+        if (!value.startsWith('#')) node.removeAttribute(name);
+        else node.setAttribute('href', `#${ids.get(value.slice(1)) ?? ''}`);
+        continue;
+      }
+      if (name === 'style' || /javascript:|data:|https?:/i.test(value)) node.removeAttribute(name);
+    }
+  }
+  return root;
+}
 
 let markdown;
 let diagramRender;
@@ -69,9 +113,10 @@ function diagramNode(svg, source) {
   const trimmed = svg.replace(/\sstyle="[^"]*"/, '');
   const parsed = new DOMParser().parseFromString(trimmed, 'image/svg+xml');
   const root = parsed.documentElement;
-  if (root.nodeName === 'parsererror' || root.nodeName !== 'svg') throw new Error('Unreadable diagram');
-  root.setAttribute('role', 'img');
-  wrapper.append(document.importNode(root, true));
+  if (root.nodeName === 'parsererror' || root.nodeName !== 'svg' || root.namespaceURI !== SVG_NS) throw new Error('Unreadable diagram');
+  const clean = sanitizeSvg(document.importNode(root, true), `d${++diagramSequence}`);
+  clean.setAttribute('role', 'img');
+  wrapper.append(clean);
   const toggle = document.createElement('details');
   toggle.className = 'md-diagram-source';
   toggle.append(Object.assign(document.createElement('summary'), { textContent: 'Mermaid source' }),
@@ -82,7 +127,9 @@ function diagramNode(svg, source) {
 
 async function mermaidNodes(fragment) {
   const render = await renderer();
+  let drawn = 0;
   for (const block of [...fragment.querySelectorAll('pre > code.language-mermaid')]) {
+    if (++drawn > MAX_DIAGRAMS) break;
     const source = block.textContent ?? '';
     const holder = document.createElement('div');
     holder.className = 'md-diagram';
@@ -91,7 +138,9 @@ async function mermaidNodes(fragment) {
       holder.querySelector('pre').className = 'md-diagram-failed';
     } else {
       try {
-        const result = source.length > MERMAID_MAX_SOURCE ? null : render(source, { links: false, images: false, maxEdges: 400 });
+        const result = source.length > MERMAID_MAX_SOURCE
+          ? null
+          : render(source, { links: false, images: false, maxEdges: 400, idPrefix: `d${diagramSequence + 1}` });
         if (!result || typeof result.svg !== 'string' || result.svg.length > MERMAID_MAX_SVG) throw new Error('Diagram too large');
         block.parentElement.replaceWith(diagramNode(result.svg, source));
         continue;

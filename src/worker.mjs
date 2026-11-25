@@ -625,7 +625,7 @@ async function main() {
   const server = httpWorker(
     turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension, readSkillSection),
     workSessions, cfg.token, mcp,
-    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES }),
+    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES, redact }),
   );
   mcp.watch();
   const shutdown = () => {

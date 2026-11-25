@@ -99,7 +99,7 @@ test('the relay proxies only the signed-in owner’s desktop and never leaks cre
     inbox: [],
   }));
   const relay = launch(t, {
-    MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0',
+    MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0', MANOLO_INTERNAL_PORT: '0',
     ...env,
     MANOLO_BROWSER_URLS: JSON.stringify({ primary: `http://127.0.0.1:${desktop.address().port}` }),
   });
@@ -182,7 +182,7 @@ test('a browser URL for an unknown agent stops the relay at startup', async t =>
   const child = spawn(process.execPath, ['src/relay.mjs'], {
     cwd,
     env: {
-      PATH: process.env.PATH, MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0',
+      PATH: process.env.PATH, MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0', MANOLO_INTERNAL_PORT: '0',
       PRIMARY_TOKEN: secret(), OWNER_PASSWORD: secret(), MANOLO_BROWSER_URLS: '{"ghost":"http://127.0.0.1:5800"}',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

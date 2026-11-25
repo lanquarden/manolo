@@ -57,7 +57,15 @@ const compactNav = matchMedia('(max-width: 48.999rem)');
 function orientTabs() {
   tabList.setAttribute('aria-orientation', compactNav.matches ? 'horizontal' : 'vertical');
 }
+let desktopOpen = false;
+
 function showTab(selected) {
+  if (desktopOpen && selected.id !== 'browser-tab') {
+    // Release the desktop and its tunnel; opening the tab again reconnects.
+    desktopOpen = false;
+    browserFrame.src = 'about:blank';
+    browserFrame.hidden = true;
+  }
   for (const tab of tabs) {
     const active = selected === tab;
     tab.setAttribute('aria-selected', String(active));
@@ -1110,8 +1118,10 @@ const reloadBrowserButton = byId('reload-browser');
 let browserAvailable = false;
 
 function openDesktop() {
+  if (!browserAvailable) return;
   browserFrame.hidden = false;
-  if (!browserFrame.getAttribute('src')) browserFrame.src = '/desktop/';
+  desktopOpen = true;
+  if (!browserFrame.getAttribute('src') || browserFrame.getAttribute('src') === 'about:blank') browserFrame.src = '/desktop/';
 }
 
 function applyBrowserAvailability(available) {
@@ -1125,6 +1135,8 @@ function applyBrowserAvailability(available) {
 
 reloadBrowserButton.addEventListener('click', () => {
   if (!browserAvailable) return;
+  desktopOpen = true;
+  browserFrame.hidden = false;
   browserFrame.src = '/desktop/';
 });
 

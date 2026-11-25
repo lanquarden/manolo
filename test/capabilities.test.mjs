@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -236,4 +236,54 @@ test('the relay forwards capabilities for the owner and reports a stopped worker
   await worker.stop();
   const down = await fetch(`${url}/api/capabilities`, { headers: basic, signal: AbortSignal.timeout(10_000) });
   assert.equal(down.status, 503);
+});
+
+test('a symlinked skill file or directory cannot pull text from outside the repository', async t => {
+  const outside = await temp(t, 'manolo-capabilities-outside-');
+  await writeSkill(join(outside, 'leak'), 'leaked', 'Instructions from outside the repository');
+  const repo = await temp(t);
+  await mkdir(join(repo, '.git'), { recursive: true });
+  const skills = join(repo, '.agents', 'skills');
+  await mkdir(skills, { recursive: true });
+  await writeSkill(join(skills, 'real'), 'real', 'A real skill');
+  // A SKILL.md that is a symlink out of the tree, and a directory symlink that would make the walk leave it.
+  await mkdir(join(skills, 'linked'), { recursive: true });
+  await symlink(join(outside, 'leak', 'SKILL.md'), join(skills, 'linked', 'SKILL.md'));
+  await symlink(join(outside, 'leak'), join(skills, 'linked-dir'));
+
+  const found = await discoverSkills(repo);
+  assert.deepEqual(found.map(skill => skill.name), ['real']);
+});
+
+test('non-ASCII instructions keep their budget instead of being emptied', async () => {
+  const result = await readCapabilities({
+    workspaceDir: await mkdtemp(join(tmpdir(), 'manolo-capabilities-cjk-')),
+    registry: undefined,
+    cfg: { agentId: 'primary', instructions: '家'.repeat(4000) },
+    blueprints: new Map(),
+    redact: text => text,
+  });
+  assert.ok(result.agent.instructions.length > 0, 'CJK instructions must not clip to nothing');
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024);
+});
+
+test('capabilities redact known secrets from instructions, tools and skills', async t => {
+  const repo = await temp(t);
+  const secret = 'super-secret-value-0123456789';
+  await mkdir(join(repo, '.git'), { recursive: true });
+  await writeSkill(join(repo, '.agents', 'skills', 'notes'), 'notes', `Uses ${secret} on purpose`);
+  const registry = {
+    snapshot: () => ({
+      tools: () => [{ extension: { name: 'coding-tools' }, tool: { name: 'bash', description: `Runs with ${secret}` } }],
+    }),
+  };
+  const result = await readCapabilities({
+    workspaceDir: repo, registry,
+    cfg: { agentId: 'primary', instructions: `Operator text with ${secret}` },
+    blueprints: new Map([['review', { id: 'review', description: `Blueprint that mentions ${secret}` }]]),
+    redact: text => text.split(secret).join('[redacted]'),
+  });
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes(secret), false);
+  assert.match(serialized, /\[redacted\]/);
 });

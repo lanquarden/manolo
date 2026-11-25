@@ -93,6 +93,17 @@ const MARKDOWN = [
   '  Idle --> Busy: start',
   '  Busy --> Idle: done',
   '```',
+  '',
+  '<script>window.__pwned = true;</script>',
+  '',
+  '[click me](javascript:alert(1))',
+  '',
+  '![remote pixel](https://evil.example/pixel.png)',
+  '',
+  '```mermaid',
+  'stateDiagram-v2',
+  '  [*] --> X: </text><script>window.__pwned2 = true;</script>',
+  '```',
 ].join('\n');
 
 test('model markdown, Mermaid, the theme picker and the capabilities review render in the workspace', { skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 60_000 }, async t => {
@@ -143,7 +154,7 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
   t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
 
   const openTab = await openBrowser(t);
-  const { run } = await openTab(`http://127.0.0.1:${server.address().port}/`);
+  const { run, reload } = await openTab(`http://127.0.0.1:${server.address().port}/`);
   await waitFor(run, `document.querySelectorAll('#chat-log > li').length === 1`);
 
   // Markdown: headings, emphasis, lists, tables and fenced code become real elements, not literal text.
@@ -153,8 +164,14 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
   assert.equal(await run(`document.querySelector('#chat-log .markdown strong').textContent`), 'healthy');
   assert.equal(await run(`document.querySelectorAll('#chat-log table th').length`), 2);
   assert.equal(await run(`document.querySelector('#chat-log pre code').textContent.trim()`), 'const ok = true;');
-  // Raw HTML in model text must never become markup.
+  // Raw HTML in model text must never become markup, a javascript: link never becomes a link, and no remote image is
+  // fetched: the reply is text plus safe elements.
   assert.equal(await run(`document.querySelectorAll('#chat-log script').length`), 0);
+  assert.equal(await run(`window.__pwned === undefined && window.__pwned2 === undefined`), true);
+  assert.equal(await run(`document.querySelectorAll('#chat-log img').length`), 0);
+  assert.equal(await run(`[...document.querySelectorAll('#chat-log a')].every(a => /^https?:|^mailto:/.test(a.getAttribute('href')))`), true);
+  assert.equal(await run(`document.querySelector('#chat-log').textContent.includes('window.__pwned')`), true);
+  assert.equal(await run(`[...document.querySelectorAll('#chat-log a')].every(a => a.rel === 'noopener noreferrer' && a.target === '_blank')`), true);
 
   // Mermaid: the fence is drawn as SVG by Pele, with the source available underneath.
   await waitFor(run, `!!document.querySelector('.md-diagram svg.pele')`);
@@ -168,7 +185,7 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
   assert.equal(await run(`document.documentElement.dataset.theme`), 'solarized-light');
   assert.equal(await run(`getComputedStyle(document.body).backgroundColor`), 'rgb(253, 246, 227)');
   assert.equal(await run(`localStorage.getItem('manolo.theme')`), 'solarized-light');
-  await run.reload;
+  await reload();
   await waitFor(run, `document.documentElement.dataset.theme === 'solarized-light'`);
   assert.equal(await run(`document.getElementById('theme-select').value`), 'solarized-light');
 
