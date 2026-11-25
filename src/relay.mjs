@@ -494,6 +494,47 @@ async function workerApi(agent, path, { method = 'GET', body, maxBytes = 256 * 1
   return result;
 }
 
+// The panel renders what it gets, so the relay projects a worker's inventory onto the fields it reads: a version skew or
+// a malformed row becomes 503 instead of a null a template would dereference.
+function capabilityInventory(value) {
+  const text = (item, key, limit = 4096) => (typeof item?.[key] === 'string' ? item[key].slice(0, limit) : undefined);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail(503);
+  const agent = value.agent;
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent) || typeof agent.instructions !== 'string' ||
+      typeof agent.id !== 'string') throw fail(503);
+  const rows = (key, project, limit) => {
+    const list = value[key];
+    if (!Array.isArray(list)) throw fail(503);
+    return list.slice(0, limit).map(project).filter(Boolean);
+  };
+  return {
+    agent: {
+      id: agent.id.slice(0, 128),
+      instructions: agent.instructions.slice(0, 4000),
+      ...(typeof agent.workSessionRules === 'string' && { workSessionRules: agent.workSessionRules.slice(0, 4000) }),
+    },
+    tools: rows('tools', item => typeof item?.name === 'string' && {
+      name: item.name.slice(0, 64),
+      ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+      ...(text(item, 'source', 64) !== undefined && { source: text(item, 'source', 64) }),
+    }, 128),
+    blueprints: rows('blueprints', item => typeof item?.id === 'string' && {
+      id: item.id.slice(0, 64),
+      ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+    }, 16),
+    agentsFiles: rows('agentsFiles', item => typeof item?.path === 'string' && {
+      path: item.path.slice(0, 1024),
+      bytes: Number.isSafeInteger(item.bytes) && item.bytes >= 0 ? item.bytes : 0,
+    }, 16),
+    skills: rows('skills', item => typeof item?.name === 'string' && {
+      name: item.name.slice(0, 64),
+      ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+      ...(text(item, 'path', 1024) !== undefined && { path: text(item, 'path', 1024) }),
+      ...(text(item, 'source', 32) !== undefined && { source: text(item, 'source', 32) }),
+    }, 16),
+  };
+}
+
 async function web(req, res, path, search = '') {
   if (path === '/login') {
     if (req.method === 'GET') return sendLogin(res, 200);
@@ -550,11 +591,7 @@ async function web(req, res, path, search = '') {
   if (path === '/api/capabilities') {
     if (req.method !== 'GET') throw fail(404);
     const inventory = await workerApi(owner.agent, '/v1/capabilities', { maxBytes: 64 * 1024 });
-    // The panel renders what it gets, so the relay refuses a version-skewed or malformed inventory instead of passing it.
-    if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory) ||
-        !inventory.agent || typeof inventory.agent !== 'object' || typeof inventory.agent.instructions !== 'string' ||
-        !['tools', 'blueprints', 'agentsFiles', 'skills'].every(key => Array.isArray(inventory[key]))) throw fail(503);
-    return respond(res, 200, inventory);
+    return respond(res, 200, capabilityInventory(inventory));
   }
   if (path === '/api/mcp' || path.startsWith('/api/mcp/')) {
     if (req.method === 'GET' && path === '/api/mcp') {

@@ -332,7 +332,8 @@ test('a large MCP configuration survives the relay round trip', { timeout: 60_00
   // The worker's own 128 KiB limit still applies to the text itself.
   const tooLarge = await fetch(`${url}/api/mcp/config`, {
     method: 'PUT', headers: { ...basic, 'content-type': 'application/json', 'x-manolo-request': '1' },
-    body: JSON.stringify({ text: `${text}${'x'.repeat(40_000)}` }), signal: AbortSignal.timeout(15_000),
+    // Trailing JSON whitespace keeps the document valid while pushing the text past the worker's 128 KiB limit.
+    body: JSON.stringify({ text: `${text}${' '.repeat(40_000)}` }), signal: AbortSignal.timeout(15_000),
   });
   assert.equal(tooLarge.status, 400);
   await tooLarge.body?.cancel();

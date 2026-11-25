@@ -24,18 +24,31 @@ const SVG_ATTRIBUTES = new Set([
 let diagramSequence = 0;
 
 function sanitizeSvg(root, prefix) {
-  // Rename every id and every reference to it, so two diagrams (or a diagram and the page) cannot collide.
+  // Structure first: remove anything that is not an SVG element we draw with, then rename the ids that survived.
+  const nodes = [root, ...root.querySelectorAll('*')];
+  for (const node of nodes.slice(1)) {
+    if (node.namespaceURI !== SVG_NS || !SVG_ELEMENTS.has(node.localName)) node.remove();
+  }
+  const kept = [root, ...root.querySelectorAll('*')];
   const ids = new Map();
-  for (const node of root.querySelectorAll('[id]')) {
+  for (const node of kept) {
+    if (!node.getAttribute('id')) continue;
     const next = `${prefix}-${ids.size}`;
     ids.set(node.getAttribute('id'), next);
     node.setAttribute('id', next);
   }
-  // `url(#id)` inside a paint attribute must follow the rename; any other URL is an external fetch and is dropped.
-  const rewrite = value => value.replace(/url\(\s*['"]?#([^)'"]+)['"]?\s*\)/g, (whole, id) => {
-    const next = ids.get(id);
-    return next === undefined ? 'none' : `url(#${next})`;
-  });
+  // A paint attribute may only reference an id that still exists in this diagram. Every other url(...) — a relative
+  // file, a protocol-relative URL, a data: URL — is an external fetch and removes the whole attribute.
+  const localOnly = value => {
+    let ok = true;
+    const rewritten = value.replace(/url\(\s*(['"]?)([^)'"]*)\1\s*\)/g, (whole, quote, target) => {
+      if (!target.startsWith('#')) { ok = false; return whole; }
+      const next = ids.get(target.slice(1));
+      if (next === undefined) { ok = false; return whole; }
+      return `url(#${next})`;
+    });
+    return ok ? rewritten : undefined;
+  };
   const clean = node => {
     for (const attribute of [...node.attributes]) {
       const name = attribute.name;
@@ -47,18 +60,15 @@ function sanitizeSvg(root, prefix) {
         continue;
       }
       if (name === 'style' || /javascript:|data:|https?:/i.test(value)) { node.removeAttribute(name); continue; }
-      if (value.includes('url(')) node.setAttribute(name, rewrite(value));
+      if (value.includes('url(')) {
+        const rewritten = localOnly(value);
+        if (rewritten === undefined) node.removeAttribute(name);
+        else node.setAttribute(name, rewritten);
+      }
     }
   };
-  // The root is not part of `querySelectorAll('*')`, so it is checked first and then every descendant.
-  clean(root);
-  for (const node of [...root.querySelectorAll('*')]) {
-    if (node.namespaceURI !== SVG_NS || !SVG_ELEMENTS.has(node.localName)) {
-      node.remove();
-      continue;
-    }
-    clean(node);
-  }
+  // The root is not part of `querySelectorAll('*')`, so it is cleaned explicitly and then every surviving descendant.
+  for (const node of kept) clean(node);
   return root;
 }
 

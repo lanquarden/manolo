@@ -225,7 +225,9 @@ export async function createMcp({
 
   async function parse(text) {
     const parsed = parseMcpConfig(text, env);
-    secrets = parsed.secrets;
+    // A reload replaces the secret set before the old tools are reconciled away; keep both until the next reload so a
+    // result from a server that is about to be removed is still redacted.
+    secrets = new Set([...secrets, ...parsed.secrets]);
     referencedEnv = parsed.referencedEnv;
     return parsed.servers;
   }

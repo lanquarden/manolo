@@ -48,7 +48,11 @@ async function readRegularFileNoFollow(path, maxBytes, rootReal) {
     // check and this open. Ask the kernel where the descriptor actually points and re-check containment.
     if (rootReal !== undefined) {
       const opened = await realpathOrNull(`/proc/self/fd/${handle.fd}`);
-      if (opened !== null && !inside(opened, rootReal)) return undefined;
+      if (opened === null) {
+        // No /proc means no way to ask the kernel where the descriptor points. On a system that has it, an unreadable
+        // entry is a failure, not a reason to trust the path we were handed.
+        if (await realpathOrNull('/proc/self/fd') !== null) return undefined;
+      } else if (!inside(opened, rootReal)) return undefined;
     }
     const buffer = Buffer.alloc(info.size);
     let offset = 0;
@@ -266,13 +270,14 @@ function toolList(registry, safe = text => text) {
 
 // The owner asked to review the prompt itself, not just its length. It is non-secret operator text plus the runtime's
 // own rules, and it stays within the same 4,000-character budget the operator instructions already use.
-function agentInfo(cfg, workSessionRules) {
+function agentInfo(cfg, workSessionRules, safe) {
+  // Redacted first and clipped second: a cap applied before redaction can leave a secret's prefix in the panel.
   const agent = {
     id: clip(cfg?.agentId, 128),
-    instructions: clipLines(cfg?.instructions, MAX_INSTRUCTIONS),
+    instructions: clipLines(safe(cfg?.instructions), MAX_INSTRUCTIONS),
   };
   if (typeof workSessionRules === 'string' && workSessionRules !== '') {
-    agent.workSessionRules = clipLines(workSessionRules, MAX_BUILTIN_INSTRUCTIONS);
+    agent.workSessionRules = clipLines(safe(workSessionRules), MAX_BUILTIN_INSTRUCTIONS);
   }
   return agent;
 }
@@ -321,15 +326,8 @@ export async function readCapabilities({ workspaceDir, registry, cfg, blueprints
   const skills = await discoverSkills(workspace);
   const safe = text => redact(String(text ?? ''));
   const result = {
-    agent: (() => {
-      const info = agentInfo(cfg, workSessionRules);
-      // Instructions are operator text, but a blueprint or an environment reference can still carry a token.
-      return {
-        ...info,
-        instructions: clipLines(safe(info.instructions), MAX_INSTRUCTIONS),
-        ...(info.workSessionRules !== undefined && { workSessionRules: clipLines(safe(info.workSessionRules), MAX_BUILTIN_INSTRUCTIONS) }),
-      };
-    })(),
+    // Instructions are operator text, but a blueprint or an environment reference can still carry a token.
+    agent: agentInfo(cfg, workSessionRules, safe),
     tools: toolList(registry, safe),
     blueprints: [...(blueprints?.values?.() ?? [])].slice(0, 12).flatMap(blueprint => {
       const id = clip(blueprint?.id, 64);
