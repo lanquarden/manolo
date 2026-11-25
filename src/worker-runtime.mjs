@@ -34,6 +34,11 @@ export async function createWorkerModels(cfg, env) {
         const tools = system?.toolsAdded?.map(tool => tool.name) ?? [];
         return fauxAssistantMessage(JSON.stringify({ instructionsSha256, tools }));
       }
+      if (inspectSetup && text === 'fixture:instructions') {
+        const system = getCurrentSystemMessage(messages);
+        // The admitted prompt text itself, for tests that assert repository skills reach a private turn and not a room.
+        return fauxAssistantMessage((system?.sections?.instructions ?? '').slice(0, 4000));
+      }
       if (text === 'fixture:history') return fauxAssistantMessage(JSON.stringify(inputs.slice(0, -1)));
       if (text === 'fixture:fail') {
         return fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'Fixture failure' });
