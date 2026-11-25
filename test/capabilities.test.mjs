@@ -161,14 +161,14 @@ test('the skills prompt section is bounded and lists every skill', () => {
   assert.equal(skillSection([]), '');
   assert.equal(skillSection(undefined), '');
   assert.equal(skillSection([{ name: 'alpha', description: 'Short.', path: '.agents/skills/alpha/SKILL.md', source: 'workspace' }]),
-    'Repository skills. When a task matches one, read its SKILL.md and follow it.\n- alpha: Short. (.agents/skills/alpha/SKILL.md)');
+    'Repository skills found in the pod workspace. When a task matches one, read its SKILL.md and follow it.\n- alpha: Short. (.agents/skills/alpha/SKILL.md)');
 
   const skills = Array.from({ length: 12 }, (_, index) => ({
     name: `skill-${index}`, description: 'd'.repeat(1024), path: `.agents/skills/skill-${index}/SKILL.md`, source: 'workspace',
   }));
   const section = skillSection(skills);
   assert.ok(section.length <= MAX_SKILL_SECTION_CHARS, `${section.length} characters`);
-  assert.match(section, /^Repository skills\. When a task matches one, read its SKILL\.md and follow it\./);
+  assert.match(section, /^Repository skills found in the pod workspace\. When a task matches one, read its SKILL\.md and follow it\./);
   for (const skill of skills) assert.ok(section.includes(`- ${skill.name}: `), skill.name);
 });
 
@@ -286,4 +286,73 @@ test('capabilities redact known secrets from instructions, tools and skills', as
   const serialized = JSON.stringify(result);
   assert.equal(serialized.includes(secret), false);
   assert.match(serialized, /\[redacted\]/);
+});
+
+test('a large MCP configuration survives the relay round trip', { timeout: 60_000 }, async t => {
+  const root = await temp(t, 'manolo-mcp-relay-');
+  const token = randomBytes(24).toString('hex');
+  const password = randomBytes(24).toString('hex');
+  const worker = startProcess(t, process.execPath, [workerPath], {
+    MANOLO_DATA_DIR: join(root, 'data'), MANOLO_MODE: 'fixture', MANOLO_AGENT_ID: 'primary', MANOLO_AGENT_TOKEN: token, PORT: '0',
+  });
+  const workerPort = await worker.listen(/Manolo worker listening on (\d+)/);
+  const configPath = join(root, 'relay.json');
+  await writeFile(configPath, JSON.stringify({
+    agents: { primary: { url: `http://127.0.0.1:${workerPort}`, tokenEnv: 'PRIMARY_TOKEN' } },
+    owners: { owner: { agent: 'primary', passwordEnv: 'OWNER_PASSWORD' } },
+    routes: [], inbox: [],
+  }));
+  const relay = startProcess(t, process.execPath, ['src/relay.mjs'], {
+    MANOLO_DATA_DIR: join(root, 'relay-data'), MANOLO_RELAY_CONFIG: configPath,
+    PORT: '0', MANOLO_INTERNAL_PORT: '0', PRIMARY_TOKEN: token, OWNER_PASSWORD: password,
+  });
+  const url = `http://127.0.0.1:${await relay.listen(/web listening on [^\s:]+:(\d+)/)}`;
+  const basic = { authorization: `Basic ${Buffer.from(`owner:${password}`).toString('base64')}` };
+  // The worker bounds the config text at 128 KiB. A valid file of quoted strings JSON-escapes to well over that on the
+  // wire, which is why the relay's budget for this route is separate from the text limit.
+  const servers = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`s${index}`, {
+    command: '/bin/true',
+    // A credential embedded as JSON escapes quotes and newlines, so a valid file is much larger on the wire.
+    env: Object.fromEntries(Array.from({ length: 3 }, (_, slot) => [`V${slot}`, '{"key":"value"}\n'.repeat(240)])),
+  }]));
+  const text = JSON.stringify({ mcpServers: servers });
+  const bytes = Buffer.byteLength(text);
+  assert.ok(bytes > 60_000 && bytes < 128 * 1024, `${bytes} bytes`);
+  // ~1.43x here: the wire JSON escapes every quote and newline of the embedded credential.
+  assert.ok(Buffer.byteLength(JSON.stringify({ text })) > 1.3 * bytes);
+  const written = await fetch(`${url}/api/mcp/config`, {
+    method: 'PUT', headers: { ...basic, 'content-type': 'application/json', 'x-manolo-request': '1' },
+    body: JSON.stringify({ text }), signal: AbortSignal.timeout(15_000),
+  });
+  assert.equal(written.status, 200, await written.text());
+  const read = await fetch(`${url}/api/mcp`, { headers: basic, signal: AbortSignal.timeout(15_000) });
+  assert.equal(read.status, 200);
+  const state = await read.json();
+  assert.equal(state.config, text);
+  // The worker's own 128 KiB limit still applies to the text itself.
+  const tooLarge = await fetch(`${url}/api/mcp/config`, {
+    method: 'PUT', headers: { ...basic, 'content-type': 'application/json', 'x-manolo-request': '1' },
+    body: JSON.stringify({ text: `${text}${'x'.repeat(40_000)}` }), signal: AbortSignal.timeout(15_000),
+  });
+  assert.equal(tooLarge.status, 400);
+  await tooLarge.body?.cancel();
+});
+
+test('instructions keep their line breaks and the whole response stays bounded', async () => {
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'manolo-capabilities-lines-'));
+  const multiline = 'First line\nSecond line\n\n- a bullet';
+  const plain = await readCapabilities({
+    workspaceDir, registry: undefined, cfg: { agentId: 'primary', instructions: multiline }, blueprints: new Map(),
+  });
+  assert.equal(plain.agent.instructions, multiline);
+
+  // CJK work-session rules alone can exceed the byte cap; the response must still fit, dropping them before the
+  // operator's instructions.
+  const huge = await readCapabilities({
+    workspaceDir, registry: undefined, cfg: { agentId: 'primary', instructions: 'instr' }, blueprints: new Map(),
+    workSessionRules: '規'.repeat(4000),
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(huge)) <= 8 * 1024);
+  assert.equal(huge.agent.instructions, 'instr');
+  assert.equal(huge.agent.workSessionRules, undefined);
 });

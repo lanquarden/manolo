@@ -784,7 +784,7 @@ test('repository skills reach a private prompt but never a room', { timeout: 20_
   assert.deepEqual(JSON.parse(setup.text).tools, codingTools);
   expectPending(await put(url, 'instructions', 'skills', 'fixture:instructions'));
   const instructions = (await settled(url, 'instructions')).text;
-  const section = 'Repository skills. When a task matches one, read its SKILL.md and follow it.\n' +
+  const section = 'Repository skills found in the pod workspace. When a task matches one, read its SKILL.md and follow it.\n' +
     '- release-notes: Summarise release notes for the household. (.agents/skills/release-notes/SKILL.md)';
   // The fixture renders the assembled prompt, including the wrapper the provider-facing system message carries.
   assert.equal(instructions, `<instructions>\n${workerRules}\n\n${section}\n</instructions>`);

@@ -472,7 +472,8 @@ function httpWorker(turns, workSessions, token, mcp, capabilities) {
           return reply(res, 200, { servers: mcp.status(), error: mcp.configError ?? null, config: await mcp.configText() });
         }
         if (req.method === 'PUT' && action === 'config') {
-          const body = await readJsonBody(req, 128 * 1024);
+          // The config text is limited to 128 KiB by setConfig; the JSON envelope escapes its quotes and newlines.
+          const body = await readJsonBody(req, 512 * 1024);
           if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.text !== 'string') throw new RequestError(400, 'invalid config');
           let result;
           try {
@@ -622,10 +623,12 @@ async function main() {
   }
   workSessions.attach(harness);
   const readSkillSection = async () => skillSection(await discoverSkills(cfg.workspaceDir));
+  // Rebuilt for each inventory so MCP servers reloaded since startup have their secrets redacted too.
+  const capabilityRedact = text => redactSecrets([cfg.token, apiKey, ...mcp.secrets].filter(Boolean))(text);
   const server = httpWorker(
     turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension, readSkillSection),
     workSessions, cfg.token, mcp,
-    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES, redact }),
+    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES, redact: capabilityRedact }),
   );
   mcp.watch();
   const shutdown = () => {

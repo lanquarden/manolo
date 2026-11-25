@@ -39,11 +39,17 @@ const inside = (path, root) => path === root || path.startsWith(root.endsWith(se
  * within the byte cap, and reads it. A repository can be written by the agent, so a `SKILL.md` symlink must not be able
  * to pull an out-of-tree file's text into a prompt or the owner's review panel.
  */
-async function readRegularFileNoFollow(path, maxBytes) {
+async function readRegularFileNoFollow(path, maxBytes, rootReal) {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0));
   try {
     const info = await handle.stat();
     if (!info.isFile() || info.size > maxBytes) return undefined;
+    // The final component cannot be a symlink (O_NOFOLLOW), but an ancestor could have been swapped between the realpath
+    // check and this open. Ask the kernel where the descriptor actually points and re-check containment.
+    if (rootReal !== undefined) {
+      const opened = await realpathOrNull(`/proc/self/fd/${handle.fd}`);
+      if (opened !== null && !inside(opened, rootReal)) return undefined;
+    }
     const buffer = Buffer.alloc(info.size);
     let offset = 0;
     while (offset < buffer.length) {
@@ -130,6 +136,14 @@ function clip(text, limit) {
   return value.length > limit ? `${value.slice(0, limit - 1).trimEnd()}…` : value;
 }
 
+// Instructions are reviewed as the prompt they are, so their line breaks survive; only control characters are removed.
+const MULTILINE_UNSAFE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]|\p{Bidi_Control}/gu;
+function clipLines(text, limit) {
+  // A field cap, not a UI ellipsis: the panel shows exactly the prompt text up to the same 4,000-unit budget the
+  // instructions already have.
+  return String(text ?? '').replace(MULTILINE_UNSAFE, '').slice(0, limit);
+}
+
 // Tool descriptions are paragraphs; the inventory only needs the routing line.
 function firstLine(text, limit) {
   const line = oneLine(String(text ?? '').split('\n').find(part => part.trim() !== '') ?? '');
@@ -180,7 +194,7 @@ async function scanSkills(workspace) {
       // A SKILL.md this large is not a routing header; skip it and do not treat its subdirectories as skills.
       if (fileInfo.size > MAX_SKILL_FILE_BYTES || skills.length >= MAX_SKILLS) return;
       let parsed;
-      try { parsed = parseSkill(await readRegularFileNoFollow(skillFile, MAX_SKILL_FILE_BYTES)); } catch { parsed = undefined; }
+      try { parsed = parseSkill(await readRegularFileNoFollow(skillFile, MAX_SKILL_FILE_BYTES, rootReal)); } catch { parsed = undefined; }
       if (parsed && !seen.has(parsed.name)) {
         seen.add(parsed.name);
         const path = relative(workspace, skillFile);
@@ -237,14 +251,16 @@ async function findAgentsFiles(workspace) {
   return files;
 }
 
-function toolList(registry) {
+// A tool description can come from a remote MCP server, so it is redacted before it is clipped: clipping first would let
+// a secret's prefix survive at the boundary.
+function toolList(registry, safe = text => text) {
   let snapshot;
   try { snapshot = registry?.snapshot?.(); } catch { snapshot = undefined; }
   const entries = typeof snapshot?.tools === 'function' ? snapshot.tools() : [];
   return (Array.isArray(entries) ? entries : []).slice(0, MAX_TOOLS).flatMap(({ extension, tool }) => {
     const name = typeof tool?.name === 'string' ? clip(tool.name, 64) : '';
     if (!name) return [];
-    return [{ name, description: firstLine(tool.description, MAX_SUMMARY), source: clip(extension?.name, 64) || 'worker' }];
+    return [{ name, description: firstLine(safe(String(tool.description ?? '')), MAX_SUMMARY), source: clip(extension?.name, 64) || 'worker' }];
   });
 }
 
@@ -253,10 +269,10 @@ function toolList(registry) {
 function agentInfo(cfg, workSessionRules) {
   const agent = {
     id: clip(cfg?.agentId, 128),
-    instructions: String(cfg?.instructions ?? '').slice(0, MAX_INSTRUCTIONS),
+    instructions: clipLines(cfg?.instructions, MAX_INSTRUCTIONS),
   };
   if (typeof workSessionRules === 'string' && workSessionRules !== '') {
-    agent.workSessionRules = workSessionRules.slice(0, MAX_BUILTIN_INSTRUCTIONS);
+    agent.workSessionRules = clipLines(workSessionRules, MAX_BUILTIN_INSTRUCTIONS);
   }
   return agent;
 }
@@ -268,6 +284,7 @@ const byteLength = value => Buffer.byteLength(JSON.stringify(value));
 function fitBudget(result) {
   const sections = ['tools', 'skills', 'agentsFiles', 'blueprints'];
   let current = result;
+  // Shrink the lists first: they are the bulk, and the two agent fields are what the owner came to read.
   while (byteLength(current) > MAX_JSON_BYTES) {
     let largest;
     let largestSize = -1;
@@ -282,11 +299,19 @@ function fitBudget(result) {
     if (largest === undefined) break;
     current = { ...current, [largest]: current[largest].slice(0, -1) };
   }
-  if (byteLength(current) > MAX_JSON_BYTES) {
-    // A pathological prompt (many escaped characters) can exceed the cap on its own; trim it rather than the promise.
+  // The work-session rules are a runtime constant; drop them before touching the operator's instructions.
+  if (byteLength(current) > MAX_JSON_BYTES && current.agent.workSessionRules !== undefined) {
+    const { workSessionRules, ...agent } = current.agent;
+    current = { ...current, agent };
+  }
+  // A pathological prompt can still exceed the cap (multi-byte or escaped characters). Clip on byte boundaries and
+  // re-check until it fits, so the promise that the response is bounded actually holds.
+  for (let attempt = 0; attempt < 4 && byteLength(current) > MAX_JSON_BYTES; attempt += 1) {
     const instructions = current.agent.instructions;
     const budget = Math.max(0, Buffer.byteLength(instructions) - (byteLength(current) - MAX_JSON_BYTES));
-    current = { ...current, agent: { ...current.agent, instructions: clipBytes(instructions, budget) } };
+    const clipped = clipBytes(instructions, budget);
+    current = { ...current, agent: { ...current.agent, instructions: clipped } };
+    if (clipped === '') break;
   }
   return current;
 }
@@ -301,11 +326,11 @@ export async function readCapabilities({ workspaceDir, registry, cfg, blueprints
       // Instructions are operator text, but a blueprint or an environment reference can still carry a token.
       return {
         ...info,
-        instructions: clip(safe(info.instructions), MAX_INSTRUCTIONS),
-        ...(info.workSessionRules !== undefined && { workSessionRules: clip(safe(info.workSessionRules), MAX_BUILTIN_INSTRUCTIONS) }),
+        instructions: clipLines(safe(info.instructions), MAX_INSTRUCTIONS),
+        ...(info.workSessionRules !== undefined && { workSessionRules: clipLines(safe(info.workSessionRules), MAX_BUILTIN_INSTRUCTIONS) }),
       };
     })(),
-    tools: toolList(registry).map(tool => ({ ...tool, description: clip(safe(tool.description), MAX_SUMMARY) })),
+    tools: toolList(registry, safe),
     blueprints: [...(blueprints?.values?.() ?? [])].slice(0, 12).flatMap(blueprint => {
       const id = clip(blueprint?.id, 64);
       if (!id) return [];

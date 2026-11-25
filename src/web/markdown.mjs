@@ -31,11 +31,12 @@ function sanitizeSvg(root, prefix) {
     ids.set(node.getAttribute('id'), next);
     node.setAttribute('id', next);
   }
-  for (const node of [...root.querySelectorAll('*')]) {
-    if (node.namespaceURI !== SVG_NS || !SVG_ELEMENTS.has(node.localName)) {
-      node.remove();
-      continue;
-    }
+  // `url(#id)` inside a paint attribute must follow the rename; any other URL is an external fetch and is dropped.
+  const rewrite = value => value.replace(/url\(\s*['"]?#([^)'"]+)['"]?\s*\)/g, (whole, id) => {
+    const next = ids.get(id);
+    return next === undefined ? 'none' : `url(#${next})`;
+  });
+  const clean = node => {
     for (const attribute of [...node.attributes]) {
       const name = attribute.name;
       const value = attribute.value;
@@ -45,8 +46,18 @@ function sanitizeSvg(root, prefix) {
         else node.setAttribute('href', `#${ids.get(value.slice(1)) ?? ''}`);
         continue;
       }
-      if (name === 'style' || /javascript:|data:|https?:/i.test(value)) node.removeAttribute(name);
+      if (name === 'style' || /javascript:|data:|https?:/i.test(value)) { node.removeAttribute(name); continue; }
+      if (value.includes('url(')) node.setAttribute(name, rewrite(value));
     }
+  };
+  // The root is not part of `querySelectorAll('*')`, so it is checked first and then every descendant.
+  clean(root);
+  for (const node of [...root.querySelectorAll('*')]) {
+    if (node.namespaceURI !== SVG_NS || !SVG_ELEMENTS.has(node.localName)) {
+      node.remove();
+      continue;
+    }
+    clean(node);
   }
   return root;
 }

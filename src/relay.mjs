@@ -474,7 +474,7 @@ async function login(req, res) {
 }
 
 // Owner-facing MCP management talks to the owner's own worker. The relay holds the agent token; the browser never does.
-async function workerApi(agent, path, { method = 'GET', body, maxBytes = 128 * 1024 } = {}) {
+async function workerApi(agent, path, { method = 'GET', body, maxBytes = 256 * 1024 } = {}) {
   const { url, token } = config.agents.get(agent);
   let response;
   try {
@@ -549,11 +549,17 @@ async function web(req, res, path, search = '') {
   // Read-only capability inventory for the owner's own agent. The relay holds the agent token; the browser never does.
   if (path === '/api/capabilities') {
     if (req.method !== 'GET') throw fail(404);
-    return respond(res, 200, await workerApi(owner.agent, '/v1/capabilities'));
+    const inventory = await workerApi(owner.agent, '/v1/capabilities', { maxBytes: 64 * 1024 });
+    // The panel renders what it gets, so the relay refuses a version-skewed or malformed inventory instead of passing it.
+    if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory) ||
+        !inventory.agent || typeof inventory.agent !== 'object' || typeof inventory.agent.instructions !== 'string' ||
+        !['tools', 'blueprints', 'agentsFiles', 'skills'].every(key => Array.isArray(inventory[key]))) throw fail(503);
+    return respond(res, 200, inventory);
   }
   if (path === '/api/mcp' || path.startsWith('/api/mcp/')) {
     if (req.method === 'GET' && path === '/api/mcp') {
-      const state = await workerApi(owner.agent, '/v1/mcp');
+      // The MCP config rides in this response JSON-escaped, so its wire budget is larger than the 128 KiB text limit.
+      const state = await workerApi(owner.agent, '/v1/mcp', { maxBytes: 512 * 1024 });
       // A sign-in started while connecting (before the owner asked) is already pending in the worker; adopt its state
       // so the callback route recognizes it.
       for (const server of state.servers ?? []) if (server.authState) rememberSignIn(server.authState, owner.agent);
@@ -561,7 +567,8 @@ async function web(req, res, path, search = '') {
     }
     if (req.headers['x-manolo-request'] !== '1') throw fail(403);
     if (req.method === 'PUT' && path === '/api/mcp/config') {
-      const body = await readJson(req, 128 * 1024);
+      // The worker enforces 128 KiB on the config text itself; the envelope is larger because JSON escapes it.
+      const body = await readJson(req, 512 * 1024);
       if (!ownFields(body, 'text') || typeof body.text !== 'string') throw fail(400);
       return respond(res, 200, await workerApi(owner.agent, '/v1/mcp/config', { method: 'PUT', body: { text: body.text } }));
     }

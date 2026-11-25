@@ -104,6 +104,14 @@ const MARKDOWN = [
   'stateDiagram-v2',
   '  [*] --> X: </text><script>window.__pwned2 = true;</script>',
   '```',
+  '',
+  '```mermaid',
+  'sankey-beta',
+  '',
+  'Solar,House,8',
+  'Grid,House,5',
+  'Grid,Car,3',
+  '```',
 ].join('\n');
 
 test('model markdown, Mermaid, the theme picker and the capabilities review render in the workspace', { skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 60_000 }, async t => {
@@ -172,6 +180,15 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
   assert.equal(await run(`[...document.querySelectorAll('#chat-log a')].every(a => /^https?:|^mailto:/.test(a.getAttribute('href')))`), true);
   assert.equal(await run(`document.querySelector('#chat-log').textContent.includes('window.__pwned')`), true);
   assert.equal(await run(`[...document.querySelectorAll('#chat-log a')].every(a => a.rel === 'noopener noreferrer' && a.target === '_blank')`), true);
+  // Renamed ids must still resolve: a diagram whose paint attributes point at url(#…) keeps every reference local.
+  await waitFor(run, `document.querySelectorAll('.md-diagram svg').length >= 3`);
+  assert.equal(await run(`[...document.querySelectorAll('.md-diagram svg')].every(svg => {
+    const ids = new Set([...svg.querySelectorAll('[id]')].map(node => node.getAttribute('id')));
+    const refs = [...svg.querySelectorAll('*')].flatMap(node => [...node.attributes]
+      .filter(attribute => attribute.value.includes('url('))
+      .flatMap(attribute => [...attribute.value.matchAll(/url\\(\\s*['"]?#([^)'"]+)/g)].map(match => match[1])));
+    return refs.every(id => ids.has(id));
+  })`), true);
 
   // Mermaid: the fence is drawn as SVG by Pele, with the source available underneath.
   await waitFor(run, `!!document.querySelector('.md-diagram svg.pele')`);
