@@ -8,7 +8,7 @@ relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passw
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
 # Optional cluster-internal runtime companion listener. The agent must be web-only
-# (not targeted by relayConfig.routes), and relayDemoCredentials must be disabled.
+# (not targeted by relayConfig.routes or relayConfig.rooms), and relayDemoCredentials must be disabled.
 runtimeAgent: ''
 # Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
 runtimeIngressFrom: []
@@ -17,6 +17,7 @@ relayConfig:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
     tester: {agent: canary, passwordEnv: MANOLO_TESTER_PASSWORD}
   routes: []
+  rooms: [] # Opt-in direct Telegram text rooms; see README for the binding shape.
   inbox:
     - {from: primary, to: canary}
 
