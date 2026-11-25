@@ -227,3 +227,53 @@ summary { cursor: pointer; width: fit-content; font-weight: 600; }
   .chat-empty p { font-size: .9rem; }
   #inbox li { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Sign-in page: the same rail/canvas palette, centred, with no workspace chrome behind it. */
+body.login-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  place-items: center;
+  padding: clamp(1.25rem, 6vw, 3rem);
+  background:
+    radial-gradient(circle at 50% 0%, #241f31 0%, transparent 60%),
+    var(--canvas);
+}
+.login-card {
+  display: grid;
+  gap: 1rem;
+  inline-size: min(24rem, 100%);
+  padding: clamp(1.5rem, 4vw, 2.25rem);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: var(--surface);
+  box-shadow: 0 1.5rem 3.5rem #00000055;
+}
+.login-card .brand { gap: .65rem; padding: 0 0 .35rem; }
+.login-card .brand strong { font-size: 1.05rem; }
+.login-card h1 { font-size: 1.5rem; letter-spacing: -.01em; }
+.login-help, .login-note { color: var(--muted); font-size: .85rem; }
+.login-card form { display: grid; gap: .45rem; }
+.login-card label { color: var(--muted); font-size: .78rem; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.login-card input {
+  min-block-size: 2.6rem;
+  padding: .55rem .75rem;
+  border: 1px solid var(--line);
+  border-radius: .6rem;
+  color: var(--ink);
+  background: var(--rail);
+  font: inherit;
+}
+.login-card input:focus-visible { border-color: var(--focus); }
+.login-card button.primary-button { justify-content: center; min-block-size: 2.7rem; margin-block-start: .5rem; }
+.login-error {
+  padding: .6rem .75rem;
+  border: 1px solid #6b3b46;
+  border-radius: .6rem;
+  color: #ffd9e0;
+  background: #2e1f24;
+  font-size: .85rem;
+}
+@media (max-width: 30rem) {
+  body.login-page { padding: 1rem; }
+  .login-card { padding: 1.25rem; }
+}

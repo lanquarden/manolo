@@ -457,7 +457,13 @@ async function main() {
   installRelayTools(registry, cfg);
   const runtimeExec = installRuntimeTools(registry, cfg);
   const redact = redactSecrets([cfg.token, apiKey].filter(Boolean));
-  const workSessions = installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints, mcpServers });
+  const workSessions = installWorkSessions(registry, {
+    cfg, model, thinkingLevel, Turns, redact, blueprints, mcpServers,
+    // Report what a child actually receives: every installed tool except this orchestration extension.
+    childTools: () => registry.snapshot().installed()
+      .filter(extension => extension.name !== workSessions.extension.name)
+      .flatMap(extension => extension.tools.map(tool => tool.name)),
+  });
   process.umask(0o077);
   await mkdir(cfg.dataDir, { recursive: true, mode: 0o700 });
   // The workspace is the tools' default cwd: it survives restarts and belongs to this agent alone.

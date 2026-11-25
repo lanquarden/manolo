@@ -132,8 +132,9 @@ test('only a trusted parent turn is offered the Inbox question tool and can send
     title: 'Untrusted child', task: question({ prompt: 'Must not open' }),
   }), true);
   const child = tool(await settled(worker, 'child-attempt'), 'delegate_work');
-  assert.equal(child.status, 'error');
-  assert.equal(JSON.parse(child.output).status, 'failed');
+  // The child cannot open a question: it is not offered request_human_input, and the relay is never called.
+  assert.equal(child.status, 'ok');
+  assert.equal(JSON.parse(child.output).result, 'Fixture tool failed');
   assert.equal(relay.calls.length, 1);
 });
 

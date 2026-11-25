@@ -598,7 +598,8 @@ test('web work session stays linked to its original turn and readable only in it
   const metadata = JSON.parse(app.output);
   assert.equal(metadata.identity.id, 'canary');
   assert.equal(metadata.capabilities.podCodingTools, false);
-  assert.deepEqual(metadata.capabilities.workSessions, { target: 'pod', childTools: [] });
+  // This canary runs with coding tools off, so only the relay and runtime tools reach a child.
+  assert.deepEqual(metadata.capabilities.workSessions, { target: 'pod', childTools: ['send_inbox', 'write_dashboard_draft', 'runtime_exec'] });
   assert.deepEqual(metadata.blueprints, [{ ...active.blueprint, description: 'Review notes' }]);
   assert.ok(!app.output.includes('Lead with the conclusion.'));
   assert.equal(app.output.includes(env.CANARY_TOKEN), false);
