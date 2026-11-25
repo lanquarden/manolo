@@ -26,10 +26,7 @@ async function until(check, description) {
 }
 
 function launch(t, env) {
-  // Ports are ephemeral: a parallel test file may already hold the relay's default internal port.
-  const child = spawn(process.execPath, ['src/relay.mjs'], {
-    cwd, env: { PATH: process.env.PATH, MANOLO_INTERNAL_PORT: '0', ...env }, stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const child = spawn(process.execPath, ['src/relay.mjs'], { cwd, env: { PATH: process.env.PATH, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   child.stdout.on('data', chunk => { log += chunk; });
   child.stderr.on('data', chunk => { log += chunk; });
@@ -172,97 +169,6 @@ test('the relay proxies only the signed-in owner’s desktop and never leaks cre
   await nowhere.close();
 });
 
-test('a watched desktop tells the owner’s worker the browser is in use', { timeout: 30000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'manolo-desktop-touch-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-
-  // A stand-in for the worker's touch endpoint. It records what the relay sent and can fail on demand, because a
-  // person must still see the desktop when the worker's bookkeeping is down.
-  const touches = [];
-  let failing = false;
-  const workerToken = secret();
-  const worker = createServer((req, res) => {
-    touches.push({ method: req.method, url: req.url, authorization: req.headers.authorization });
-    if (failing) {
-      res.writeHead(500, { 'content-type': 'text/plain' });
-      res.end('no');
-      return;
-    }
-    res.writeHead(204, { 'cache-control': 'no-store' });
-    res.end();
-  });
-  worker.listen(0, '127.0.0.1');
-  await once(worker, 'listening');
-  t.after(() => { worker.closeAllConnections(); return new Promise(resolve => worker.close(resolve)); });
-
-  const upgraded = new Set();
-  const desktop = createServer((req, res) => {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(`<p>desktop ${req.url}</p>`);
-  });
-  desktop.on('upgrade', (req, socket) => {
-    upgraded.add(socket);
-    socket.on('close', () => upgraded.delete(socket));
-    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
-    socket.write('tunnel-ok\n');
-  });
-  desktop.listen(0, '127.0.0.1');
-  await once(desktop, 'listening');
-  t.after(() => {
-    for (const socket of upgraded) socket.destroy();
-    desktop.closeAllConnections();
-    return new Promise(resolve => desktop.close(resolve));
-  });
-
-  const env = { PRIMARY_TOKEN: workerToken, CANARY_TOKEN: secret(), OWNER_PASSWORD: secret(), TESTER_PASSWORD: secret() };
-  const configPath = join(root, 'relay.json');
-  await writeFile(configPath, JSON.stringify({
-    agents: {
-      primary: { url: `http://127.0.0.1:${worker.address().port}`, tokenEnv: 'PRIMARY_TOKEN' },
-      canary: { url: 'http://127.0.0.1:2', tokenEnv: 'CANARY_TOKEN' },
-    },
-    owners: { owner: { agent: 'primary', passwordEnv: 'OWNER_PASSWORD' }, tester: { agent: 'canary', passwordEnv: 'TESTER_PASSWORD' } },
-    routes: [],
-    inbox: [],
-  }));
-  const relay = launch(t, {
-    MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0', ...env,
-    MANOLO_BROWSER_URLS: JSON.stringify({ primary: `http://127.0.0.1:${desktop.address().port}` }),
-  });
-  const origin = `http://127.0.0.1:${await relay.port()}`;
-  const owner = basic('owner', env.OWNER_PASSWORD);
-  const expectedTouch = { method: 'POST', url: '/v1/browser/touch', authorization: `Bearer ${workerToken}` };
-
-  // Loading the desktop is one viewer; the relay reports it to the owner's own worker with that worker's credential.
-  const page = await fetch(`${origin}/desktop/vnc.html`, { headers: owner, redirect: 'manual', signal: AbortSignal.timeout(5000) });
-  assert.equal(page.status, 200);
-  assert.equal(await page.text(), '<p>desktop /vnc.html</p>');
-  await until(() => touches.length === 1, 'touch after a desktop fetch');
-  assert.deepEqual(touches[0], expectedTouch);
-  await sleep(50);
-  assert.equal(touches.length, 1, 'one request must not produce two touches');
-
-  // The websocket is the actual VNC stream, so it counts as activity too.
-  const socket = connect(Number(new URL(origin).port), '127.0.0.1');
-  socket.setEncoding('utf8');
-  let received = '';
-  socket.on('data', chunk => { received += chunk; });
-  const closed = once(socket, 'close');
-  socket.write(`GET /desktop/websockify HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nAuthorization: ${owner.authorization}\r\n\r\n`);
-  t.after(async () => { socket.destroy(); await closed; });
-  await until(() => received.includes('tunnel-ok'), 'tunnelled payload');
-  await until(() => touches.length === 2, 'touch after a desktop upgrade');
-  assert.deepEqual(touches[1], expectedTouch);
-
-  // A failing or unreachable touch endpoint never breaks the desktop itself.
-  failing = true;
-  const afterFailure = await fetch(`${origin}/desktop/vnc.html`, { headers: owner, redirect: 'manual', signal: AbortSignal.timeout(5000) });
-  assert.equal(afterFailure.status, 200);
-  assert.equal(await afterFailure.text(), '<p>desktop /vnc.html</p>');
-  await until(() => touches.length === 3, 'touch attempt against a failing worker');
-  assert.deepEqual(touches[2], expectedTouch);
-});
-
 test('a browser URL for an unknown agent stops the relay at startup', async t => {
   const root = await mkdtemp(join(tmpdir(), 'manolo-desktop-config-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -277,7 +183,6 @@ test('a browser URL for an unknown agent stops the relay at startup', async t =>
     cwd,
     env: {
       PATH: process.env.PATH, MANOLO_DATA_DIR: join(root, 'data'), MANOLO_RELAY_CONFIG: configPath, PORT: '0',
-      MANOLO_INTERNAL_PORT: '0',
       PRIMARY_TOKEN: secret(), OWNER_PASSWORD: secret(), MANOLO_BROWSER_URLS: '{"ghost":"http://127.0.0.1:5800"}',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

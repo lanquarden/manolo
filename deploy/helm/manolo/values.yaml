@@ -56,11 +56,6 @@ agents:
       profileSize: 5Gi
       width: 1280
       height: 800
-      # Stop the browser container after this many minutes without a tool call or
-      # anyone watching the desktop, so an unused Chromium frees its memory. The
-      # kubelet restarts it on the next use and --restore-last-session returns the
-      # tabs. 0 keeps it running always; the worker's default is 10.
-      idleMinutes: 10
     # Optional seed for the agent's own <data>/mcp.json. The file on the volume is the source of truth afterwards: the
     # owner or the agent edits it and the worker applies changes without a restart.
     mcpServers: {}
@@ -87,7 +82,6 @@ agents:
       profileSize: 5Gi
       width: 1280
       height: 800
-      idleMinutes: 10 # Minutes without use before the browser container is stopped; 0 keeps it running.
     mcpServers: {}
     codemode: false
     remoteEnvs: {}

@@ -32,16 +32,9 @@
 {{- $height := int ($browser.height | default 800) -}}
 {{- if or (lt $width 640) (gt $width 3840) -}}{{ fail (printf "agents.%s.browser.width must be from 640 to 3840" $id) }}{{- end -}}
 {{- if or (lt $height 480) (gt $height 2160) -}}{{ fail (printf "agents.%s.browser.height must be from 480 to 2160" $id) }}{{- end -}}
-{{- /* How long the worker lets an unused browser run before stopping its container to free memory. 0 keeps it
-       always running; the worker sets a default of 10 minutes when this is not set. `default` would swallow an
-       explicit 0, so the key is checked instead. */ -}}
-{{- $idleMinutes := 10 -}}
-{{- if hasKey $browser "idleMinutes" -}}{{- $idleMinutes = $browser.idleMinutes -}}{{- end -}}
-{{- if not (regexMatch "^[0-9]{1,4}$" (toString $idleMinutes)) -}}{{ fail (printf "agents.%s.browser.idleMinutes must be an integer" $id) }}{{- end -}}
-{{- if or (lt (int $idleMinutes) 0) (gt (int $idleMinutes) 1440) -}}{{ fail (printf "agents.%s.browser.idleMinutes must be from 0 to 1440" $id) }}{{- end -}}
 {{- if hasKey $entries "browser" -}}{{ fail "browser is a reserved agent ID when a worker browser is enabled" }}{{- end -}}
 {{- $url := printf "http://manolo-%s:5800" $id -}}
-{{- $_ := set $browsers $id (dict "url" $url "image" $browser.image "profileSize" $profileSize "width" $width "height" $height "idleMinutes" (int $idleMinutes)) -}}
+{{- $_ := set $browsers $id (dict "url" $url "image" $browser.image "profileSize" $profileSize "width" $width "height" $height) -}}
 {{- $_ := set $browserUrls $id $url -}}
 {{- end -}}
 {{- end -}}
@@ -185,11 +178,6 @@ spec:
       {{- end }}
     spec:
       automountServiceAccountToken: false
-      {{- if $browser }}
-      # The worker stops an idle browser container with SIGTERM, so it must see the sibling's processes. This is
-      # pod-wide and only set for a worker that actually has a browser.
-      shareProcessNamespace: true
-      {{- end }}
       terminationGracePeriodSeconds: 25
       securityContext:
         runAsNonRoot: true
@@ -208,13 +196,7 @@ spec:
           args: ["node", "src/{{ $w.kind }}.mjs"]
           securityContext:
             allowPrivilegeEscalation: false
-            {{- if $browser }}
-            # The browser container's supervisor runs as root, so a worker running as UID 1000 needs CAP_KILL to
-            # SIGTERM it across the shared PID namespace. Nothing else is added for a worker without a browser.
-            capabilities: {drop: [ALL], add: [KILL]}
-            {{- else }}
             capabilities: {drop: [ALL]}
-            {{- end }}
             readOnlyRootFilesystem: true
           ports:
             - {name: http, containerPort: {{ $w.port }}}
@@ -263,8 +245,6 @@ spec:
             {{- if $browser }}
             # Chromium's native debugger binds loopback in the shared pod netns, so only this container can drive it.
             - {name: MANOLO_BROWSER_CDP, value: "http://127.0.0.1:9222"}
-            # The worker stops the sidecar container after this many idle minutes; 0 leaves it running.
-            - {name: MANOLO_BROWSER_IDLE_MINUTES, value: {{ $browser.idleMinutes | quote }}}
             {{- end }}
             {{- if $publicUrl }}
             - {name: MANOLO_PUBLIC_URL, value: {{ $publicUrl | quote }}}

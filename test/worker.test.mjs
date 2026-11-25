@@ -369,33 +369,6 @@ test('auth, request boundaries, and secret-safe responses', { timeout: 15_000 },
   assert.deepEqual(await worker.stop(), [0, null]);
 });
 
-test('the browser idle touch is bearer-only, and a bad idle window stops startup', { timeout: 15_000 }, async t => {
-  const dir = await dataDir(t);
-  const worker = launch(t, dir);
-  const url = await worker.start();
-  assert.equal((await request(url, '/v1/browser/touch', { method: 'POST' })).code, 401);
-  assert.equal((await request(url, '/v1/browser/touch', { method: 'POST', headers: { authorization: 'Bearer wrong' } })).code, 401);
-  // A read with a valid token is a wrong method, not a touch nobody asked for.
-  assert.equal((await request(url, '/v1/browser/touch', { headers: auth })).code, 405);
-  const touched = await fetch(`${url}/v1/browser/touch`, { method: 'POST', headers: auth, signal: AbortSignal.timeout(3000) });
-  assert.equal(touched.status, 204);
-  assert.equal(await touched.text(), '');
-  assert.deepEqual(await worker.stop(), [0, null]);
-
-  // The window is validated before anything is opened, so a typo cannot leave an idle browser running forever.
-  for (const value of ['abc', '', '-1', '1441', '1.5']) {
-    const badDir = await dataDir(t);
-    const bad = launch(t, badDir, { MANOLO_BROWSER_CDP: 'http://127.0.0.1:9222', MANOLO_BROWSER_IDLE_MINUTES: value });
-    assert.deepEqual(await bad.closed, [1, null], value);
-    assert.match(bad.logs(), /MANOLO_BROWSER_IDLE_MINUTES/, value);
-  }
-  // 0 is an explicit opt-out and still starts the worker; it just never stops the sidecar.
-  const offDir = await dataDir(t);
-  const off = launch(t, offDir, { MANOLO_BROWSER_CDP: 'http://127.0.0.1:9222', MANOLO_BROWSER_IDLE_MINUTES: '0' });
-  await off.start();
-  assert.deepEqual(await off.stop(), [0, null]);
-});
-
 test('racing PUTs preserve one input per ID and separate answers/sessions', { timeout: 15_000 }, async t => {
   const dir = await dataDir(t);
   const url = await launch(t, dir, { MANOLO_FIXTURE_DELAY_MS: '100' }).start();

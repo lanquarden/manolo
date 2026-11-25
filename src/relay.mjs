@@ -491,19 +491,6 @@ async function workerApi(agent, path, { method = 'GET', body } = {}) {
   return result;
 }
 
-// A quiet but open desktop tunnel still means a person is watching; the heartbeat stays well inside the worker's
-// shortest sensible idle window.
-const DESKTOP_TOUCH_MS = 60_000;
-
-// The worker stops an idle browser container to free its memory, so a person watching the desktop is activity just
-// like a tool call. This is best effort and bounded: it must never delay, break, or outlive the proxied request.
-function touchBrowser(agent) {
-  const { url, token } = config.agents.get(agent);
-  fetch(`${url}/v1/browser/touch`, {
-    method: 'POST', redirect: 'error', headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1_000),
-  }).then(response => response.body?.cancel()).catch(() => {});
-}
-
 async function web(req, res, path, search = '') {
   if (path === '/login') {
     if (req.method === 'GET') return sendLogin(res, 200);
@@ -554,8 +541,6 @@ async function web(req, res, path, search = '') {
     if (path === DESKTOP_PATH) return respond(res, 308, { error: 'Desktop lives at /desktop/' }, { location: `${DESKTOP_PATH}/${search}` });
     res.removeHeader('content-security-policy');
     res.removeHeader('x-content-type-options');
-    // A reloaded desktop is a new viewer as much as a reloaded page is; keep the sidecar awake for it.
-    touchBrowser(owner.agent);
     return proxyDesktop(req, res, base, path.slice(DESKTOP_PATH.length), search);
   }
   // Read-only capability inventory for the owner's own agent. The relay holds the agent token; the browser never does.
@@ -740,16 +725,7 @@ function webUpgrade(req, socket, head) {
   if (!owner) return reject('401 Unauthorized', 'www-authenticate: Basic realm="Manolo", charset="UTF-8"\r\n');
   const base = browserUrls.get(owner.agent);
   if (!base) return reject('404 Not Found');
-  if (!upgradeDesktop(req, socket, head, base)) return reject('404 Not Found');
-  // The websocket is the live VNC stream: while it is open someone is watching, so the browser is not idle. The
-  // stream itself is quiet — mouse and screen updates are not HTTP requests — so an open tunnel is kept alive with
-  // its own heartbeat, cleared when the socket closes.
-  touchBrowser(owner.agent);
-  const heartbeat = setInterval(() => touchBrowser(owner.agent), DESKTOP_TOUCH_MS);
-  heartbeat.unref?.();
-  const stopHeartbeat = () => clearInterval(heartbeat);
-  socket.once('close', stopHeartbeat);
-  socket.once('error', stopHeartbeat);
+  if (!upgradeDesktop(req, socket, head, base)) reject('404 Not Found');
 }
 
 async function pollTelegram() {
