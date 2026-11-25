@@ -2,6 +2,17 @@ const byId = (id) => document.getElementById(id);
 const POLL_INTERVAL_MS = 800;
 const POLL_WINDOW_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const SESSION_PATH = '/api/session';
+const LOGOUT_PATH = '/logout';
+const LOGIN_PATH = '/login';
+
+let leavingWorkspace = false;
+function redirectToLogin() {
+  // One navigation only: parallel requests can each come back 401.
+  if (leavingWorkspace) return;
+  leavingWorkspace = true;
+  location.replace(LOGIN_PATH);
+}
 
 function textNode(tag, text, className) {
   const node = document.createElement(tag);
@@ -24,6 +35,9 @@ async function api(path, method = 'GET', body, timeout = REQUEST_TIMEOUT_MS) {
   }
   const response = await fetch(path, options);
   if (!response.ok) {
+    // A browser session that ended means the sign-in page, not an inline error. The initial
+    // session probe handles its own 401 so the workspace never navigates twice.
+    if (response.status === 401 && path !== SESSION_PATH) redirectToLogin();
     throw Object.assign(new Error(`Request failed (${response.status}).`), { status: response.status });
   }
   return response.json();
@@ -37,6 +51,7 @@ function failure(error) {
 
 const tabList = byId('workspace-tabs');
 const tabs = [...tabList.querySelectorAll('[role="tab"]')];
+// The browser tab only exists for an agent with a desktop, so keyboard navigation skips hidden tabs.
 const visibleTabs = () => tabs.filter(tab => !tab.hidden);
 const compactNav = matchMedia('(max-width: 48.999rem)');
 function orientTabs() {
@@ -50,6 +65,8 @@ function showTab(selected) {
     byId(tab.getAttribute('aria-controls')).hidden = !active;
   }
   if (selected.id === 'chat-tab') scrollChatToEnd();
+  if (selected.id === 'sessions-tab') void refreshSessions();
+  if (selected.id === 'inbox-tab') void refreshInbox();
   if (selected.id === 'browser-tab') openDesktop();
 }
 for (const tab of tabs) tab.addEventListener('click', () => showTab(tab));
@@ -72,35 +89,6 @@ tabList.addEventListener('keydown', (event) => {
 compactNav.addEventListener('change', orientTabs);
 orientTabs();
 
-// The desktop is another same-origin document that the relay proxies to this owner's worker browser. It is only
-// loaded once the session says this agent has one, and only when the tab is first opened.
-const browserTab = byId('browser-tab');
-const browserFrame = byId('browser-frame');
-const browserStatus = byId('browser-status');
-const reloadBrowserButton = byId('reload-browser');
-let browserAvailable = false;
-function openDesktop() {
-  browserFrame.hidden = false;
-  if (!browserFrame.getAttribute('src')) browserFrame.src = '/desktop/';
-}
-async function refreshBrowser() {
-  let available = false;
-  try {
-    available = Boolean((await api('/api/session')).browser);
-  } catch {
-    available = false;
-  }
-  browserAvailable = available;
-  browserTab.hidden = !available;
-  if (!available) return;
-  if (browserStatus.textContent === 'The desktop is loading.') {
-    browserStatus.textContent = 'The agent and you share this window; activity appears on both.';
-  }
-}
-reloadBrowserButton.addEventListener('click', () => {
-  if (!browserAvailable) return;
-  browserFrame.src = '/desktop/';
-});
 const dashboardControls = byId('dashboard-controls');
 const dashboardStatus = byId('dashboard-status');
 const publishButton = byId('publish-dashboard');
@@ -191,12 +179,128 @@ byId('draft-form').addEventListener('submit', (event) => {
 
 const refreshInboxButton = byId('refresh-inbox');
 const inboxStatus = byId('inbox-status');
+const inboxPanel = byId('inbox-panel');
+const questionsSection = byId('inbox-questions-section');
+const questionsList = byId('inbox-questions');
+const WORKER_INPUT_LIMIT = 4000;
+const questionViews = new Map();
+let inboxBusy = false;
+let verifyInboxBeforeResponding = false;
+
+function setInboxBusy(busy) {
+  inboxBusy = busy;
+  refreshInboxButton.disabled = busy;
+  for (const { controls } of questionViews.values()) {
+    if (controls) controls.disabled = busy || verifyInboxBeforeResponding;
+  }
+}
+
+function validInboxId(value) {
+  return typeof value === 'string' && value.length > 0 && value !== '.' && value !== '..';
+}
+
+function inboxQuestion({ id, parentTurnId, prompt, status, continuationTurnId }) {
+  if (!validInboxId(id) || !validInboxId(parentTurnId) || typeof prompt !== 'string'
+    || !['open', 'answered', 'declined'].includes(status)
+    || (continuationTurnId !== undefined && !validInboxId(continuationTurnId))) {
+    throw new Error('Unexpected inbox question');
+  }
+  return { id, parentTurnId, prompt, status, continuationTurnId };
+}
+
+function answerBudget({ id, parentTurnId, prompt }) {
+  // Match the relay's continuation framing: the worker counts UTF-16 units after JSON quoting.
+  const context = `Previous assistant context (original web turn ${parentTurnId}; inbox question ${id}):\n${JSON.stringify(prompt)}\n\nOwner input (answer):\n`;
+  return WORKER_INPUT_LIMIT - context.length;
+}
+
+function createQuestionView(question, draft = '') {
+  const { prompt, status, continuationTurnId } = question;
+  const row = document.createElement('li');
+  row.className = 'inbox-question';
+  row.tabIndex = -1;
+  row.append(textNode('p', prompt, 'plain-text'), textNode('p', {
+    open: 'Awaiting a response', answered: 'Answered', declined: 'Declined',
+  }[status], 'question-state'));
+  const view = { question, row };
+
+  if (status === 'open') {
+    const form = document.createElement('form');
+    const controls = document.createElement('fieldset');
+    const label = textNode('label', 'Your answer');
+    const answer = document.createElement('textarea');
+    const budget = answerBudget(question);
+    answer.rows = 2;
+    answer.maxLength = Math.max(0, budget - 2); // The surrounding JSON quotes need two units.
+    answer.required = true;
+    answer.value = draft;
+    label.append(answer);
+    const actions = document.createElement('div');
+    actions.className = 'question-actions';
+    const send = textNode('button', 'Send answer', 'primary-button');
+    send.type = 'submit';
+    const decline = textNode('button', 'Decline');
+    decline.type = 'button';
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const text = answer.value.trim();
+      if (!text) {
+        inboxStatus.textContent = 'Enter an answer before sending.';
+        return;
+      }
+      if (JSON.stringify(text).length > budget) {
+        inboxStatus.textContent = 'This answer is too long for the continuation. Shorten it and try again.';
+        return;
+      }
+      void respondToQuestion(view, { answer: text });
+    });
+    decline.addEventListener('click', () => void respondToQuestion(view, { decline: true }));
+    actions.append(send, decline);
+    controls.append(label, actions);
+    form.append(controls);
+    row.append(form);
+    Object.assign(view, { controls, answer });
+  } else if (continuationTurnId) {
+    const button = textNode('button', 'Refresh and view in Chat');
+    button.type = 'button';
+    const notice = textNode('p', '', 'question-state');
+    notice.setAttribute('role', 'status');
+    button.addEventListener('click', () => void viewContinuation(continuationTurnId, button, notice));
+    row.append(button, notice);
+    view.continuationButton = button;
+  }
+  return view;
+}
+
+function renderInboxQuestions(questions) {
+  questionsSection.hidden = questions === undefined;
+  const visibleIds = new Set((questions ?? []).map(({ id }) => id));
+  for (const [id, { row }] of questionViews) {
+    if (visibleIds.has(id)) continue;
+    row.remove();
+    questionViews.delete(id);
+  }
+  for (const [index, question] of (questions ?? []).entries()) {
+    const previous = questionViews.get(question.id);
+    let view = previous;
+    if (!previous || JSON.stringify(previous.question) !== JSON.stringify(question)) {
+      view = createQuestionView(question, previous?.answer?.value);
+      previous?.row.remove();
+      questionViews.set(question.id, view);
+    }
+    const atIndex = questionsList.children[index];
+    if (view.row !== atIndex) questionsList.insertBefore(view.row, atIndex ?? null);
+  }
+  byId('inbox-questions-empty').hidden = Boolean(questions?.length);
+}
 
 async function refreshInbox() {
-  refreshInboxButton.disabled = true;
+  if (inboxBusy) return;
+  setInboxBusy(true);
   inboxStatus.textContent = 'Loading inbox…';
   try {
-    const { messages } = await api('/api/inbox');
+    const { messages, questions } = await api('/api/inbox');
+    const nextQuestions = questions?.map(inboxQuestion);
     const entries = messages.map(({ from, text, createdAt }) => {
       const item = document.createElement('li');
       const date = new Date(createdAt);
@@ -206,11 +310,72 @@ async function refreshInbox() {
       return item;
     });
     byId('inbox').replaceChildren(...entries);
-    inboxStatus.textContent = entries.length ? '' : 'No messages yet.';
+    byId('inbox-messages-empty').hidden = Boolean(entries.length);
+    renderInboxQuestions(nextQuestions);
+    inboxStatus.textContent = verifyInboxBeforeResponding ? 'Inbox refreshed. Check the question’s current status before retrying.' : '';
+    verifyInboxBeforeResponding = false;
   } catch (error) {
-    inboxStatus.textContent = failure(error);
+    inboxStatus.textContent = `${failure(error)} Use “Refresh inbox” to try again.`;
   } finally {
-    refreshInboxButton.disabled = false;
+    setInboxBusy(false);
+  }
+}
+
+async function respondToQuestion(view, body) {
+  if (inboxBusy || verifyInboxBeforeResponding) return;
+  const { question, row } = view;
+  const restoreFocus = row.contains(document.activeElement);
+  setInboxBusy(true);
+  inboxStatus.textContent = body.decline ? 'Declining question…' : 'Sending answer…';
+  try {
+    const { id, status, continuationTurnId } = await api(`/api/inbox/questions/${encodeURIComponent(question.id)}/respond`, 'POST', body);
+    if (id !== question.id || status !== (body.decline ? 'declined' : 'answered')) throw new Error('Unexpected question receipt');
+    const updated = createQuestionView(inboxQuestion({ ...question, status, continuationTurnId }));
+    questionViews.set(id, updated);
+    row.replaceWith(updated.row);
+    inboxStatus.textContent = body.decline ? 'Question declined.' : 'Answer sent.';
+    if (restoreFocus && !inboxPanel.hidden && document.activeElement === document.body) {
+      (updated.continuationButton ?? updated.row).focus();
+    }
+  } catch (error) {
+    // A lost response or a conflict can mean the question was already resolved. Read
+    // the latest state before allowing another response; never replay a POST ourselves.
+    verifyInboxBeforeResponding = !error.status || error.status >= 500 || [404, 408, 409].includes(error.status);
+    inboxStatus.textContent = verifyInboxBeforeResponding
+      ? `${failure(error)} Use “Refresh inbox” to check the question before retrying.`
+      : `${failure(error)} Review your response and try again.`;
+  } finally {
+    setInboxBusy(false);
+  }
+}
+
+async function viewContinuation(id, button, notice) {
+  if (chatBusy) {
+    notice.textContent = 'Chat is busy. Try again after the current Chat request finishes.';
+    return;
+  }
+  button.disabled = true;
+  notice.textContent = 'Refreshing Chat…';
+  try {
+    if (!await refreshHistory()) {
+      notice.textContent = 'Could not refresh Chat. Use “Refresh and view in Chat” to try again.';
+      return;
+    }
+    const row = chatRows.get(id)?.row;
+    if (!row) {
+      notice.textContent = 'The continuation is not in recent Chat history. Try refreshing again.';
+      return;
+    }
+    notice.textContent = '';
+    // Do not steal the tab if the owner left the Inbox while history loaded.
+    if (!inboxPanel.hidden && button.isConnected) {
+      showTab(byId('chat-tab'));
+      row.tabIndex = -1;
+      row.focus({ preventScroll: true });
+      row.scrollIntoView({ block: 'start' });
+    }
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -328,6 +493,7 @@ let turns = new Map();
 let unconfirmedTurn;
 let historyLoaded = false;
 let chatBusy = false;
+const chatRows = new Map();
 
 function pendingTurn() {
   return [...turns.values()].findLast((turn) => turn.status === 'pending');
@@ -351,6 +517,215 @@ function idleChatStatus() {
 function scrollChatToEnd() {
   if (!chatPanel.hidden) transcript.scrollTop = transcript.scrollHeight;
 }
+
+const SESSIONS_PATH = '/api/sessions';
+const SESSION_STATUS = new Map([
+  ['queued', 'Queued'], ['running', 'Running'], ['waiting', 'Waiting'], ['done', 'Done'], ['failed', 'Failed'],
+]);
+const ACTIVE_SESSION_STATES = new Set(['queued', 'running', 'waiting']);
+const sessionsTab = byId('sessions-tab');
+const sessionListView = byId('sessions-list-view');
+const sessionList = byId('session-list');
+const sessionsStatus = byId('sessions-status');
+const includeEnded = byId('include-ended');
+const sessionDetail = byId('session-detail');
+const sessionTitle = byId('session-title');
+const sessionMeta = byId('session-meta');
+const sessionDetailStatus = byId('session-detail-status');
+const sessionTranscript = byId('session-transcript');
+let sessions;
+let sessionsByTurn = new Map();
+let sessionsError = '';
+let sessionsBlocked = false;
+let sessionsRefreshing = false;
+let queuedSessionsRefresh;
+let sessionsPollUntil = 0;
+let sessionsPollTimer;
+let renderedSessionList;
+let selectedSession;
+let detailRequest;
+
+function sessionSummary({ id, parentTurnId, title, status, target, blueprint }) {
+  // An ID is a single URL path segment, never an endpoint or a navigation URL.
+  if (typeof id !== 'string' || !id || id === '.' || id === '..') throw new Error('Invalid session ID');
+  return {
+    id, parentTurnId, status, blueprint: typeof blueprint?.id === 'string' ? blueprint.id : undefined,
+    title: typeof title === 'string' && title.trim() ? title : 'Untitled session',
+    target: typeof target === 'string' && target.trim() ? target : 'Not assigned',
+  };
+}
+
+function sessionMetadata(session) {
+  return [
+    textNode('span', `Status: ${SESSION_STATUS.get(session.status) ?? 'Unknown'}`),
+    textNode('span', `Target: ${session.target}`, 'plain-text'),
+    ...(session.blueprint ? [textNode('span', `Blueprint: ${session.blueprint}`, 'plain-text')] : []),
+  ];
+}
+
+function sessionButton(session, className) {
+  const button = textNode('button', session.title, className);
+  button.type = 'button';
+  button.dataset.sessionId = session.id;
+  button.addEventListener('click', () => {
+    if (byId('sessions-panel').hidden) showTab(sessionsTab);
+    openSession(session);
+  });
+  return button;
+}
+
+function renderChatSessionLinks(id, view) {
+  const related = sessionsByTurn.get(id) ?? [];
+  const key = JSON.stringify(related.map(({ id, title }) => [id, title]));
+  if (key === view.relatedKey) return;
+  view.relatedKey = key;
+  view.links.replaceChildren(...related.map((session) => sessionButton(session, 'chat-session-link')));
+  view.links.hidden = !related.length;
+}
+
+function focusSessionRow(id) {
+  const button = [...sessionList.querySelectorAll('button')].find((row) => row.dataset.sessionId === id);
+  (button ?? includeEnded).focus();
+}
+
+function renderSessionList() {
+  const visible = (sessions ?? []).filter(({ status }) => includeEnded.checked || ACTIVE_SESSION_STATES.has(status));
+  const key = JSON.stringify(visible);
+  if (key !== renderedSessionList) {
+    renderedSessionList = key;
+    const focusedId = sessionList.contains(document.activeElement) && document.activeElement.dataset.sessionId;
+    sessionList.replaceChildren(...visible.map((session) => {
+      const row = document.createElement('li');
+      const meta = document.createElement('div');
+      meta.className = 'session-meta';
+      meta.append(...sessionMetadata(session));
+      row.append(sessionButton(session, 'session-list-title'), meta);
+      return row;
+    }));
+    if (focusedId) focusSessionRow(focusedId);
+  }
+  const emptyMessage = includeEnded.checked ? 'No sessions yet.' : 'No active sessions.';
+  const message = sessionsError || (!sessions ? 'Loading sessions…' : visible.length ? '' : emptyMessage);
+  if (sessionsStatus.textContent !== message) sessionsStatus.textContent = message;
+}
+
+function indexSessions() {
+  sessionsByTurn = new Map();
+  for (const session of sessions ?? []) {
+    if (!session.parentTurnId) continue;
+    const related = sessionsByTurn.get(session.parentTurnId) ?? [];
+    related.push(session);
+    sessionsByTurn.set(session.parentTurnId, related);
+  }
+  // Summary polling never rewrites the chat, scroll position or composer.
+  for (const [id, view] of chatRows) renderChatSessionLinks(id, view);
+}
+
+function sessionAccessDenied(error) {
+  return error.status === 401 || error.status === 403;
+}
+
+function clearSessionDetail(message) {
+  detailRequest = undefined;
+  sessionTitle.textContent = 'Session';
+  sessionMeta.replaceChildren();
+  sessionTranscript.replaceChildren();
+  sessionDetailStatus.textContent = message;
+}
+
+async function refreshSessions({ force = false, afterCurrent = false } = {}) {
+  if (sessionsBlocked && !force) return;
+  if (sessionsRefreshing) {
+    if (afterCurrent || force) queuedSessionsRefresh = { force: force || queuedSessionsRefresh?.force };
+    return;
+  }
+  clearTimeout(sessionsPollTimer);
+  sessionsRefreshing = true;
+  if (force || (!sessions && !sessionsError)) sessionsStatus.textContent = 'Loading sessions…';
+  try {
+    const result = await api(SESSIONS_PATH);
+    sessions = result.sessions.map(sessionSummary);
+    sessionsBlocked = false;
+    sessionsError = '';
+  } catch (error) {
+    const unavailable = [404, 405, 501].includes(error.status);
+    const denied = sessionAccessDenied(error);
+    sessionsBlocked = unavailable || denied;
+    sessionsError = unavailable ? 'Sessions are not available on this relay.'
+      : denied ? 'Sign in as an owner and try again.'
+      : `${failure(error)} Use “Refresh sessions” to try again.`;
+    if (sessionsBlocked) {
+      sessions = undefined;
+      if (selectedSession) clearSessionDetail(sessionsError);
+    }
+  } finally {
+    indexSessions();
+    renderSessionList();
+    sessionsRefreshing = false;
+    if (queuedSessionsRefresh) {
+      const next = queuedSessionsRefresh;
+      queuedSessionsRefresh = undefined;
+      void refreshSessions(next);
+    } else if (!sessionsBlocked && pendingTurn() && performance.now() < sessionsPollUntil) {
+      // Separate from turn polling: summary errors can't change its cadence or end it.
+      sessionsPollTimer = setTimeout(() => {
+        if (pendingTurn() && performance.now() < sessionsPollUntil) void refreshSessions();
+      }, sessionsError ? 15_000 : 2_000);
+    }
+  }
+}
+
+async function refreshSessionDetail() {
+  const id = selectedSession;
+  const request = Symbol();
+  detailRequest = request;
+  sessionDetailStatus.textContent = 'Loading transcript…';
+  try {
+    const { session } = await api(`${SESSIONS_PATH}/${encodeURIComponent(id)}`);
+    if (detailRequest !== request) return; // Navigation or an authorization error superseded this read.
+    const summary = sessionSummary(session);
+    if (summary.id !== id) throw new Error('Unexpected session ID');
+    const rows = session.transcript.map(({ role, text }) => {
+      const row = document.createElement('li');
+      row.append(textNode('strong', role, 'plain-text'), textNode('p', text, 'plain-text'));
+      return row;
+    });
+    sessionTitle.textContent = summary.title;
+    sessionMeta.replaceChildren(...sessionMetadata(summary));
+    sessionTranscript.replaceChildren(...rows);
+    sessionDetailStatus.textContent = rows.length ? '' : 'No transcript yet.';
+  } catch (error) {
+    if (detailRequest !== request) return;
+    clearSessionDetail(error.status === 404 ? 'This session is no longer available.'
+      : sessionAccessDenied(error) ? 'Sign in as an owner and try again.'
+      : `${failure(error)} Use “Refresh sessions” to try again.`);
+  }
+}
+
+function openSession(session) {
+  selectedSession = session.id;
+  sessionTitle.textContent = session.title;
+  sessionMeta.replaceChildren(...sessionMetadata(session));
+  sessionTranscript.replaceChildren();
+  sessionListView.hidden = true;
+  sessionDetail.hidden = false;
+  sessionTitle.focus();
+  void refreshSessionDetail();
+}
+
+byId('back-to-sessions').addEventListener('click', () => {
+  const id = selectedSession;
+  selectedSession = undefined;
+  clearSessionDetail('');
+  sessionDetail.hidden = true;
+  sessionListView.hidden = false;
+  focusSessionRow(id);
+});
+includeEnded.addEventListener('change', renderSessionList);
+byId('refresh-sessions').addEventListener('click', () => {
+  void refreshSessions({ force: true });
+  if (selectedSession) void refreshSessionDetail();
+});
 
 const TOOL_STATUS = { ok: 'ok', error: 'failed', pending: 'queued', running: 'running', done: 'ok' };
 
@@ -410,34 +785,70 @@ function renderTools(tools, turnId) {
   return list;
 }
 
-function renderHistory() {
-  const rows = [...turns.values()].slice(-HISTORY_LIMIT).map(({ id, text, status, reply, tools, live }) => {
-    const row = document.createElement('li');
-    row.className = 'chat-turn';
-    row.append(textNode('strong', 'You', 'chat-user'), textNode('div', text, 'chat-prompt plain-text'));
-    const answer = document.createElement('div');
-    answer.className = 'chat-answer';
-    answer.dataset.state = status;
-    answer.append(textNode('strong', 'Manolo'));
-    if (status === 'done') {
-      if (Array.isArray(tools) && tools.length > 0) answer.append(renderTools(tools, id));
-      answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
-    } else {
-      const message = status === 'failed' ? 'Turn failed.' : 'Reply pending.';
-      answer.append(textNode('div', message, 'chat-turn-state'));
-      if (status === 'failed' && reply) answer.append(textNode('div', reply, 'plain-text'));
-      if (status === 'pending' && live) {
-        if (live.thinking) answer.append(renderThinking(live.thinking));
-        if (live.tools?.length) answer.append(renderTools(live.tools, id));
-        if (live.text) answer.append(textNode('div', live.text, 'chat-stream plain-text'));
-        if (live.retry) answer.append(textNode('div', 'Retrying the model request…', 'chat-turn-state'));
-      }
+function pendingActivityLabel(activity) {
+  if (activity === 'queued') return 'Queued.';
+  if (activity === 'running') return 'Running.';
+  return 'Reply pending.';
+}
+
+function renderChatAnswer({ id, status, activity, reply, tools, live }) {
+  const answer = document.createElement('div');
+  answer.className = 'chat-answer';
+  answer.dataset.state = status;
+  answer.append(textNode('strong', 'Manolo'));
+  if (status === 'done') {
+    if (Array.isArray(tools) && tools.length > 0) answer.append(renderTools(tools, id));
+    answer.append(textNode('div', reply ?? '(No reply text.)', 'plain-text'));
+  } else {
+    const message = status === 'failed' ? 'Turn failed.' : pendingActivityLabel(activity);
+    answer.append(textNode('div', message, 'chat-turn-state'));
+    if (status === 'failed' && reply) answer.append(textNode('div', reply, 'plain-text'));
+    if (status === 'pending' && live) {
+      if (live.thinking) answer.append(renderThinking(live.thinking));
+      if (live.tools?.length) answer.append(renderTools(live.tools, id));
+      if (live.text) answer.append(textNode('div', live.text, 'chat-stream plain-text'));
+      if (live.retry) answer.append(textNode('div', 'Retrying the model request…', 'chat-turn-state'));
     }
-    row.append(answer);
-    return row;
-  });
-  chatLog.replaceChildren(...rows);
-  chatEmpty.hidden = !historyLoaded || rows.length > 0;
+  }
+  return answer;
+}
+
+function renderHistory() {
+  const visible = [...turns.values()].slice(-HISTORY_LIMIT);
+  const visibleIds = new Set(visible.map(({ id }) => id));
+  for (const [id, { row }] of chatRows) {
+    if (visibleIds.has(id)) continue;
+    row.remove();
+    chatRows.delete(id);
+  }
+  for (const [index, turn] of visible.entries()) {
+    const { id, text } = turn;
+    let view = chatRows.get(id);
+    if (!view) {
+      const row = document.createElement('li');
+      row.className = 'chat-turn';
+      const prompt = textNode('div', text, 'chat-prompt plain-text');
+      const answer = renderChatAnswer(turn);
+      const links = document.createElement('div');
+      links.className = 'chat-session-links';
+      links.setAttribute('role', 'group');
+      links.setAttribute('aria-label', 'Related sessions');
+      row.append(textNode('strong', 'You', 'chat-user'), prompt, answer, links);
+      view = { row, turn, prompt, answer, links };
+      chatRows.set(id, view);
+      renderChatSessionLinks(id, view);
+    } else if (view.turn !== turn) {
+      // Keep work links intact (including keyboard focus) while live chat updates the answer.
+      view.prompt.textContent = text;
+      const answer = renderChatAnswer(turn);
+      view.answer.replaceWith(answer);
+      view.answer = answer;
+      view.turn = turn;
+    }
+    const atIndex = chatLog.children[index];
+    if (view.row !== atIndex) chatLog.insertBefore(view.row, atIndex ?? null);
+  }
+  chatEmpty.hidden = !historyLoaded || visible.length > 0;
   scrollChatToEnd();
 }
 
@@ -454,28 +865,36 @@ async function refreshHistory() {
     turns = saved;
     historyLoaded = true;
     renderHistory();
+    if (pendingTurn()) sessionsPollUntil = performance.now() + POLL_WINDOW_MS;
+    void refreshSessions({ afterCurrent: true });
     chatStatus.textContent = notSaved
       ? 'The last submission was not found in history. Review before retrying. ' + idleChatStatus()
       : idleChatStatus();
+    return true;
   } catch (error) {
     chatStatus.textContent = `${failure(error)} Use “Refresh history” to try again.`;
+    return false;
   } finally {
     setChatBusy(false);
   }
 }
 
-function recordTurnStatus(turn, result) {
+function recordTurnStatus(id, result) {
   if (!['done', 'failed', 'pending'].includes(result?.status)) throw new Error('Unexpected turn status');
-  if (unconfirmedTurn?.id === turn.id) unconfirmedTurn = undefined;
+  if (unconfirmedTurn?.id === id) unconfirmedTurn = undefined;
+  const turn = turns.get(id);
   if (result.status === 'pending') {
-    if (result.live) {
-      turns.set(turn.id, { ...turn, status: 'pending', live: result.live });
+    const { activity } = result;
+    // A status-only update should not discard the last live output.
+    const live = result.live ?? turn.live;
+    if (activity !== turn.activity || live !== turn.live) {
+      turns.set(id, { ...turn, activity, live });
       renderHistory();
     }
     return;
   }
-  turns.set(turn.id, {
-    ...turn, status: result.status, live: undefined,
+  turns.set(id, {
+    ...turn, status: result.status, activity: undefined, live: undefined,
     reply: typeof result.text === 'string' ? result.text : undefined,
     tools: Array.isArray(result.tools) ? result.tools : undefined,
   });
@@ -490,9 +909,11 @@ async function runTurn(turn, submit) {
   const path = `/api/turns/${encodeURIComponent(id)}`;
   try {
     let result = submit ? await api('/api/turns', 'POST', { id, text }) : await api(path);
-    recordTurnStatus(turn, result);
+    recordTurnStatus(id, result);
     // Stream while the turn runs: poll the relay faster than history refreshes, but never more than the window.
     const deadline = performance.now() + POLL_WINDOW_MS;
+    sessionsPollUntil = deadline;
+    void refreshSessions({ afterCurrent: true });
     while (result.status === 'pending') {
       const remaining = Math.floor(deadline - performance.now());
       if (remaining <= 0) break;
@@ -500,7 +921,8 @@ async function runTurn(turn, submit) {
       const left = Math.floor(deadline - performance.now());
       if (left <= 0) break;
       result = await api(path, 'GET', undefined, Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, left)));
-      recordTurnStatus(turn, result);
+      recordTurnStatus(id, result);
+      if (result.status !== 'pending') void refreshSessions({ afterCurrent: true });
     }
     chatStatus.textContent = idleChatStatus();
   } catch (error) {
@@ -532,7 +954,7 @@ chatForm.addEventListener('submit', (event) => {
     chatStatus.textContent = 'Chat requires HTTPS or localhost.';
     return;
   }
-  const turn = { id: crypto.randomUUID(), text, status: 'pending' };
+  const turn = { id: crypto.randomUUID(), text, status: 'pending', activity: 'queued' };
   turns.set(turn.id, turn);
   unconfirmedTurn = turn;
   chatInput.value = '';
@@ -544,6 +966,81 @@ checkButton.addEventListener('click', () => {
   if (!chatBusy && turn) void runTurn(turn, false);
 });
 refreshHistoryButton.addEventListener('click', refreshHistory);
+
+const sessionUser = byId('session-user');
+const signOutButton = byId('sign-out');
+const sessionStatus = byId('session-status');
+let signingOut = false;
+
+function showSignedIn(user) {
+  sessionUser.textContent = user;
+  sessionUser.dataset.state = 'signed-in';
+  signOutButton.disabled = false;
+}
+
+async function loadSession() {
+  try {
+    const session = await api(SESSION_PATH);
+    const { user } = session;
+    if (typeof user !== 'string' || !user.trim()) throw new Error('Unexpected session response');
+    showSignedIn(user);
+    applyBrowserAvailability(Boolean(session.browser));
+  } catch (error) {
+    if (error.status === 401) return redirectToLogin();
+    // Never guess a name: an unknown session stays neutral and says why.
+    sessionUser.textContent = 'Unknown';
+    sessionUser.dataset.state = 'unknown';
+    sessionStatus.textContent = `${failure(error)} Reload the page to try again.`;
+  }
+}
+
+async function signOut() {
+  if (signingOut) return;
+  signingOut = true;
+  signOutButton.disabled = true;
+  sessionStatus.textContent = 'Signing out…';
+  try {
+    // The relay requires the same request header its other state changes use.
+    const result = await api(LOGOUT_PATH, 'POST', {});
+    if (result?.ok !== true) throw new Error('Unexpected sign-out response');
+    redirectToLogin();
+  } catch (error) {
+    // A 401 means the session already ended; api() has started the sign-in navigation.
+    if (error.status === 401) return;
+    signingOut = false;
+    signOutButton.disabled = false;
+    sessionStatus.textContent = `Could not sign out. ${failure(error)} You are still signed in.`;
+  }
+}
+
+signOutButton.addEventListener('click', () => void signOut());
+
+void loadSession();
+void refreshDashboard();
+const browserTab = byId('browser-tab');
+const browserFrame = byId('browser-frame');
+const browserStatus = byId('browser-status');
+const reloadBrowserButton = byId('reload-browser');
+let browserAvailable = false;
+
+function openDesktop() {
+  browserFrame.hidden = false;
+  if (!browserFrame.getAttribute('src')) browserFrame.src = '/desktop/';
+}
+
+function applyBrowserAvailability(available) {
+  browserAvailable = available;
+  browserTab.hidden = !available;
+  if (!available) return;
+  if (browserStatus.textContent === 'The desktop is loading.') {
+    browserStatus.textContent = 'The agent and you share this window; activity appears on both.';
+  }
+}
+
+reloadBrowserButton.addEventListener('click', () => {
+  if (!browserAvailable) return;
+  browserFrame.src = '/desktop/';
+});
 
 const mcpList = byId('mcp-list');
 const mcpStatus = byId('mcp-status');
@@ -604,9 +1101,7 @@ mcpForm.addEventListener('submit', async (event) => {
   }
 });
 
-void refreshDashboard();
 void refreshInbox();
 void refreshHistory();
 void refreshRuntimes();
-void refreshBrowser();
 void refreshMcp();

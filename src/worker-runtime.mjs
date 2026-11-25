@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { defineDoc, defineExtension, defineTool, ProviderDoc, wrapTool } from '@earendil-works/pi-durable';
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
+import { WORK_TOOL_NAMES } from './work-sessions.mjs';
 
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
 const PROVIDERS = new Map(Object.entries({
@@ -37,15 +38,17 @@ export async function createWorkerModels(cfg, env) {
       if (text === 'fixture:fail') {
         return fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'Fixture failure' });
       }
-      if (cfg.relay && text.startsWith('fixture-tool:')) {
-        if (messages.at(-1)?.role === 'toolResult') {
-          return fauxAssistantMessage(messages.at(-1).isError ? 'Fixture tool failed' : 'Fixture tool succeeded');
-        }
+      if (text.startsWith('fixture-tool:')) {
         try {
           const { name, args } = JSON.parse(text.slice('fixture-tool:'.length));
-          return fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
+          if (cfg.relay || WORK_TOOL_NAMES.includes(name)) {
+            if (messages.at(-1)?.role === 'toolResult') {
+              return fauxAssistantMessage(messages.at(-1).isError ? 'Fixture tool failed' : 'Fixture tool succeeded');
+            }
+            return fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
+          }
         } catch {
-          return fauxAssistantMessage('Invalid fixture tool input');
+          if (cfg.relay) return fauxAssistantMessage('Invalid fixture tool input');
         }
       }
       return fauxAssistantMessage(`Fixture: ${text}`);

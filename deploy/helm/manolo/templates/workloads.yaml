@@ -47,8 +47,37 @@
 {{- end -}}
 {{- end -}}
 
+{{- $workSessionAgent := .Values.workSessionAgent -}}
+{{- if not (kindIs "string" $workSessionAgent) -}}{{ fail "workSessionAgent must be a string" }}{{- end -}}
+{{- if and $workSessionAgent .Values.relayDemoCredentials -}}
+{{- fail "workSessionAgent cannot be enabled with relayDemoCredentials" -}}
+{{- end -}}
+{{- if $workSessionAgent -}}
+{{- range $name := splitList "," $workSessionAgent -}}
+{{- $trimmed := trim $name -}}
+{{- if not $trimmed -}}{{ fail "workSessionAgent must be a comma-separated list of agent IDs" }}{{- end -}}
+{{- if not (hasKey $entries $trimmed) -}}{{ fail (printf "workSessionAgent %q is not configured in agents" $trimmed) }}{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $runtimeAgent := .Values.runtimeAgent -}}
 {{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
+{{- if not (kindIs "slice" .Values.relayConfig.rooms) -}}{{ fail "relayConfig.rooms must be a list" }}{{- end -}}
+{{- $roomIds := dict -}}
+{{- range .Values.relayConfig.rooms -}}
+{{- if not (and (kindIs "map" .) (kindIs "string" .agent) (hasKey $entries .agent)) -}}
+{{- fail "Each relayConfig.rooms entry must reference a configured agent" -}}
+{{- end -}}
+{{- if eq .agent $runtimeAgent -}}{{ fail "runtimeAgent must be web-only: relayConfig.rooms must not target it" }}{{- end -}}
+{{- if not (and (kindIs "string" .chatId) (regexMatch "^-[1-9][0-9]{0,15}$" .chatId)) -}}
+{{- fail "relayConfig.rooms requires a negative chatId string" -}}
+{{- end -}}
+{{- if hasKey $roomIds .chatId -}}{{ fail "Configure only one agent per Telegram room" }}{{- end -}}
+{{- $_ := set $roomIds .chatId true -}}
+{{- if not (and (kindIs "string" .wake) (has .wake (list "all" "mentions"))) -}}
+{{- fail "relayConfig.rooms wake must be all or mentions" -}}
+{{- end -}}
+{{- if not (and (kindIs "slice" .members) .members) -}}{{ fail "relayConfig.rooms requires a nonempty members list" }}{{- end -}}
+{{- end -}}
 {{- if $runtimeAgent -}}
 {{- if not (hasKey $entries $runtimeAgent) -}}{{ fail (printf "runtimeAgent %q is not configured in agents" $runtimeAgent) }}{{- end -}}
 {{- if hasKey $entries "runtimes" -}}{{ fail "runtimes is a reserved agent ID when the runtime companion listener is enabled" }}{{- end -}}
@@ -192,7 +221,13 @@ spec:
             - {name: PORT, value: {{ $w.port | quote }}}
             {{- if eq $w.kind "relay" }}
             - {name: MANOLO_RELAY_CONFIG, value: /config/relay.json}
+            {{- if $workSessionAgent }}
+            - {name: MANOLO_WORK_SESSION_AGENT, value: {{ $workSessionAgent | quote }}}
+            {{- end }}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- with $.Values.webProxyAuthHeader }}
+            - {name: MANOLO_PROXY_AUTH_HEADER, value: {{ . | quote }}}
+            {{- end }}
             {{- if $runtimeAgent }}
             - {name: MANOLO_RUNTIME_AGENT, value: {{ $runtimeAgent | quote }}}
             - {name: MANOLO_RUNTIME_HOST, value: "0.0.0.0"}
@@ -236,6 +271,12 @@ spec:
             {{- end }}
             {{- with $w.instructions }}
             - {name: MANOLO_AGENT_INSTRUCTIONS, value: {{ . | quote }}}
+            {{- end }}
+            {{- if hasKey $w "workBlueprints" }}
+            {{- if not (kindIs "map" $w.workBlueprints) }}{{ fail "agents.<id>.workBlueprints must be a mapping" }}{{ end }}
+            {{- if $w.workBlueprints }}
+            - {name: MANOLO_WORK_BLUEPRINTS, value: {{ $w.workBlueprints | mustToJson | quote }}}
+            {{- end }}
             {{- end }}
             {{- with $w.bashEnv }}
             - {name: MANOLO_BASH_ENV, value: {{ join "," . | quote }}}
@@ -358,6 +399,19 @@ spec:
     {{- with $browser }}
     - {name: desktop, port: 5800, targetPort: desktop}
     {{- end }}
+{{- end }}
+{{- if $runtimeAgent }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: manolo-runtimes
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: manolo-relay}
+  ports:
+    - {name: runtimes, port: 8084, targetPort: runtimes}
 {{- end }}
 {{- if $runtimeAgent }}
 ---

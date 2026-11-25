@@ -68,7 +68,7 @@ try {
     routes: [], inbox: [{ from: 'primary', to: 'canary' }],
   }));
   const relay = run('relay', {
-    MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: join(root, 'relay'), MANOLO_DEMO: '1',
+    MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: join(root, 'relay'), MANOLO_DEMO: '1', MANOLO_COOKIE_SECURE: '0',
     PRIMARY_TOKEN: primary, CANARY_TOKEN: canary, OWNER_PASSWORD: owner, TESTER_PASSWORD: tester,
     PORT: '0', MANOLO_INTERNAL_PORT: '0',
   });

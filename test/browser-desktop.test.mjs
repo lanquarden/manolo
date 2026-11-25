@@ -110,12 +110,18 @@ test('the relay proxies only the signed-in owner’s desktop and never leaks cre
 
   // The workspace learns from the same authenticated session whether this agent has a desktop at all.
   const session = await (await get('/api/session', owner)).json();
-  assert.deepEqual(session, { owner: 'owner', agent: 'primary', browser: true });
+  assert.deepEqual(session, { user: 'owner', agent: 'primary', via: 'basic', browser: true });
   assert.equal((await (await get('/api/session', tester)).json()).browser, false);
 
-  const signedOut = await get('/desktop/');
-  assert.equal(signedOut.status, 401);
-  assert.equal(await signedOut.text().then(() => 1), 1);
+  // An unauthenticated browser navigation is sent to the sign-in page; the proxy itself is never reached. A fetch
+  // without an HTML accept header keeps the machine-readable 401.
+  const signedOut = await get('/desktop/', { accept: 'text/html' });
+  assert.equal(signedOut.status, 303);
+  assert.equal(signedOut.headers.get('location'), '/login');
+  await signedOut.body?.cancel();
+  const signedOutFetch = await get('/desktop/');
+  assert.equal(signedOutFetch.status, 401);
+  await signedOutFetch.body?.cancel();
 
   const redirected = await get('/desktop?x=1', owner);
   assert.equal(redirected.status, 308);

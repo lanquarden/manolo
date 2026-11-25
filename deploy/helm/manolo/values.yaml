@@ -6,20 +6,30 @@ storageClassName: longhorn
 # Public origin of the relay, e.g. https://manolo.example.com. Needed for MCP OAuth: the authorization server redirects
 # the owner's browser to <publicUrl>/mcp/oauth/callback, which forwards the code to the agent's worker.
 publicUrl: ''
-# The PoC uses Basic Auth; expose through HTTPS or kubectl port-forward only.
+# Browsers sign in at /login and get an in-memory session cookie; Basic Auth stays for scripts.
+# Expose through HTTPS or kubectl port-forward only. Cookie sessions reset when the relay restarts.
 relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passwords load. Isolated smoke tests only.
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
+# Optional SSO bypass. When set (for example x-auth-request-user), the relay trusts that
+# header from an authenticating gateway as an already-verified owner name. Enable it only
+# when the relay is reachable exclusively through that gateway.
+webProxyAuthHeader: ''
 # Optional cluster-internal runtime companion listener. The agent must be web-only
-# (not targeted by relayConfig.routes), and relayDemoCredentials must be disabled.
+# (not targeted by relayConfig.routes or relayConfig.rooms), and relayDemoCredentials must be disabled.
 runtimeAgent: ''
 # Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
 runtimeIngressFrom: []
+# Enable work-session delegation for these agents' authenticated web turns only, as a
+# comma-separated list of agent IDs (for example "primary,canary"). Update the relay and
+# each listed worker's image before opting in.
+workSessionAgent: ''
 relayConfig:
   owners:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
     tester: {agent: canary, passwordEnv: MANOLO_TESTER_PASSWORD}
   routes: []
+  rooms: [] # Opt-in direct Telegram text rooms; see README for the binding shape.
   inbox:
     - {from: primary, to: canary}
 
@@ -36,6 +46,7 @@ agents:
     # Extra environment names the worker's bash tool receives. Only an allowlist reaches the shell; the agent token
     # and provider key are refused even when named here.
     bashEnv: []
+    workBlueprints: {} # Optional named, non-secret instructions for delegated work.
     # Opt-in headed Chromium sidecar. The agent drives it over loopback CDP and the
     # relay proxies its web desktop into the Manolo UI. Needs an immutable image
     # digest, a persistent profile claim and roughly 2Gi of pod memory.
@@ -64,6 +75,7 @@ agents:
     instructions: ""
     codingTools: true
     bashEnv: []
+    workBlueprints: {}
     browser:
       enabled: false
       image: ""
