@@ -18,6 +18,7 @@ import { McpConfigError } from './mcp-config.mjs';
 import { RUNTIME_NAME } from './runtime-relay.mjs';
 import { installWorkSessions, WORK_PARENT_RULES } from './work-sessions.mjs';
 import { loadWorkBlueprints } from './work-blueprints.mjs';
+import { discoverSkills, readCapabilities, skillSection } from './capabilities.mjs';
 import { normalizeRoomInstructions } from './telegram-room.mjs';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -255,7 +256,7 @@ function redactSecrets(secrets) {
   return text => text.replace(pattern, '[redacted]');
 }
 
-function turnService(harness, model, thinkingLevel, instructions, redact, runtimeExec, workExtension) {
+function turnService(harness, model, thinkingLevel, instructions, redact, runtimeExec, workExtension, readSkillSection) {
   const thinking = thinkingLevel ? { thinkingLevel } : {};
   async function status(id, turn) {
     const submission = await harness.commit(async tx => {
@@ -308,15 +309,18 @@ function turnService(harness, model, thinkingLevel, instructions, redact, runtim
     },
     async put(id, { sessionId, text, runtimes = [], workSessions = false, room }) {
       const isRoom = room !== undefined;
-      // Private operator prompt text never crosses into the shared audience.
-      const baseInstructions = isRoom
-        ? `${WORKER_RULES}\n\n${ROOM_RULES}${room.instructions ? `\n\nRoom instructions:\n${room.instructions}` : ''}`
-        : instructions;
       const existing = await harness.snapshot(Turns, id, context);
       if (existing) {
         matchInput(existing, sessionId, text, isRoom);
         return status(id, existing);
       }
+      // Skills describe the private operator's own checkout; a shared room never receives them. A retry or an
+      // already-admitted ID returns above, so a poll does not rescan the tree.
+      const skillText = isRoom ? '' : await readSkillSection();
+      // Private operator prompt text never crosses into the shared audience.
+      const baseInstructions = isRoom
+        ? `${WORKER_RULES}\n\n${ROOM_RULES}${room.instructions ? `\n\nRoom instructions:\n${room.instructions}` : ''}`
+        : skillText ? `${instructions}\n\n${skillText}` : instructions;
       // Assign the external session and create its conversation atomically. Conversation.admit(tx, ...) needs
       // a committed conversation handle, so this is a separate transaction from the turn admission below.
       const conversationId = await harness.commit(async tx => {
@@ -410,6 +414,7 @@ async function readTurn(req) {
 }
 
 const MCP_PATH = /^\/v1\/mcp(?:\/([a-z-]+))?$/;
+const CAPABILITIES_PATH = '/v1/capabilities';
 
 async function readJsonBody(req, maxBytes = 32 * 1024) {
   if (req.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new RequestError(415, 'expected JSON');
@@ -428,7 +433,7 @@ async function readJsonBody(req, maxBytes = 32 * 1024) {
   }
 }
 
-function httpWorker(turns, workSessions, token, mcp) {
+function httpWorker(turns, workSessions, token, mcp, capabilities) {
   const expected = digest(token);
   function reply(res, statusCode, body) {
     const json = JSON.stringify(body);
@@ -446,11 +451,20 @@ function httpWorker(turns, workSessions, token, mcp) {
       const mcpMatch = MCP_PATH.exec(req.url);
       const match = TURN_PATH.exec(req.url);
       const work = WORK_PATH.exec(req.url);
-      if (!match && !work && !mcpMatch) throw new RequestError(404, 'not found');
+      const capabilitiesPath = req.url === CAPABILITIES_PATH;
+      if (!match && !work && !mcpMatch && !capabilitiesPath) throw new RequestError(404, 'not found');
       const bearer = /^Bearer ([!-~]+)$/i.exec(req.headers.authorization ?? '');
       if (!bearer || !timingSafeEqual(digest(bearer[1]), expected)) {
         res.setHeader('www-authenticate', 'Bearer');
         throw new RequestError(401, 'unauthorized');
+      }
+      if (capabilitiesPath) {
+        if (req.method !== 'GET') {
+          res.setHeader('allow', 'GET');
+          throw new RequestError(405, 'method not allowed');
+        }
+        // Read-only and already bounded: names, descriptions, relative paths and sizes, never contents or secrets.
+        return reply(res, 200, await capabilities());
       }
       if (mcpMatch) {
         const action = mcpMatch[1] ?? '';
@@ -607,7 +621,12 @@ async function main() {
     await harness.commit(async tx => { Object.assign(await tx.doc(Identity), binding); }, context);
   }
   workSessions.attach(harness);
-  const server = httpWorker(turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension), workSessions, cfg.token, mcp);
+  const readSkillSection = async () => skillSection(await discoverSkills(cfg.workspaceDir));
+  const server = httpWorker(
+    turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension, readSkillSection),
+    workSessions, cfg.token, mcp,
+    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES }),
+  );
   mcp.watch();
   const shutdown = () => {
     const deadline = setTimeout(() => process.exit(1), 5_000);

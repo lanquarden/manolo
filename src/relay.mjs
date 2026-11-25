@@ -523,6 +523,11 @@ async function web(req, res, path, search = '') {
     res.removeHeader('x-content-type-options');
     return proxyDesktop(req, res, base, path.slice(DESKTOP_PATH.length), search);
   }
+  // Read-only capability inventory for the owner's own agent. The relay holds the agent token; the browser never does.
+  if (path === '/api/capabilities') {
+    if (req.method !== 'GET') throw fail(404);
+    return respond(res, 200, await workerApi(owner.agent, '/v1/capabilities'));
+  }
   if (path === '/api/mcp' || path.startsWith('/api/mcp/')) {
     if (req.method === 'GET' && path === '/api/mcp') {
       const state = await workerApi(owner.agent, '/v1/mcp');
