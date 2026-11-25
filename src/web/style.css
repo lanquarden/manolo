@@ -79,8 +79,18 @@ textarea::placeholder { color: var(--muted); }
 .workspace-tabs button { justify-content: flex-start; min-inline-size: 0; padding-inline: .65rem; border-color: transparent; color: var(--muted); background: transparent; }
 .workspace-tabs button[aria-selected="true"] { color: var(--ink); border-color: var(--line); background: var(--raised); }
 .workspace-tabs button[aria-selected="true"] .icon { color: var(--violet); }
-.sidebar-footer { display: flex; align-items: center; gap: .45rem; margin-top: auto; padding: .8rem .4rem .1rem; color: var(--muted); border-top: 1px solid var(--line); font-size: .8rem; }
+.sidebar-footer { display: grid; gap: .45rem; margin-top: auto; padding: .8rem .4rem .1rem; color: var(--muted); border-top: 1px solid var(--line); font-size: .8rem; }
 .sidebar-footer .icon { inline-size: 1rem; block-size: 1rem; }
+.session-chip { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: .3rem .55rem; min-inline-size: 0; }
+.session-avatar { display: grid; place-items: center; inline-size: 1.9rem; block-size: 1.9rem; border: 1px solid #51436c; border-radius: 99rem; color: var(--violet); background: var(--violet-wash); }
+.session-avatar .icon { inline-size: 1.05rem; block-size: 1.05rem; }
+.session-identity { display: grid; min-inline-size: 0; }
+.session-caption { color: var(--muted); font-size: .68rem; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
+#session-user { font-size: .84rem; font-weight: 650; line-height: 1.3; }
+#session-user[data-state="unknown"] { color: var(--muted); font-weight: 550; }
+#sign-out { grid-column: 1 / -1; min-height: 2.1rem; border-color: var(--line); color: var(--ink); background: var(--surface); font-size: .82rem; }
+.session-status { grid-column: 1 / -1; color: var(--warning); font-size: .78rem; overflow-wrap: anywhere; }
+.session-status:empty { display: none; }
 
 .workspace { min-inline-size: 0; min-block-size: 0; }
 .view { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; }
@@ -196,7 +206,12 @@ summary { cursor: pointer; width: fit-content; font-weight: 600; }
   .brand { padding: 0 .22rem .18rem; gap: .55rem; }
   .brand-mark:not(.hero-mark) { width: 1.8rem; height: 1.8rem; border-radius: .48rem; }
   .brand-mark:not(.hero-mark) .icon { width: 1.1rem; height: 1.1rem; }
-  .sidebar-label, .sidebar-footer, .brand-caption { display: none; }
+  .sidebar-label, .brand-caption { display: none; }
+  .sidebar-footer { padding: 0; border-top: 0; }
+  .session-chip { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  .session-avatar, .session-caption { display: none; }
+  #session-user { font-size: .8rem; }
+  #sign-out { grid-column: auto; min-height: 1.9rem; padding: .2rem .65rem; }
   .workspace-tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .workspace-tabs button { justify-content: center; min-height: 2.6rem; padding-inline: .2rem; }
   .toolbar { min-height: 3.1rem; }

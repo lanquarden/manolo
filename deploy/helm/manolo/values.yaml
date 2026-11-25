@@ -3,10 +3,14 @@ relayImage: ""
 relaySecret: manolo-relay
 relayStorage: 1Gi
 storageClassName: longhorn
-# The PoC uses Basic Auth; expose through HTTPS or kubectl port-forward only.
+# Browsers sign in at /login and get an in-memory session cookie; Basic Auth stays for scripts.
+# Expose through HTTPS or kubectl port-forward only. Cookie sessions reset when the relay restarts.
 relayDemoCredentials: false # Sets MANOLO_DEMO on the relay so short owner passwords load. Isolated smoke tests only.
 # A future HTTPRoute requires explicitly permitting the Gateway's source namespace/pods.
 webIngressFrom: []
+# Optional SSO bypass. When set (for example x-auth-request-user), the relay trusts that
+# header from an authenticating gateway as an already-verified owner name. Enable it only
+# when the relay is reachable exclusively through that gateway.
 # Optional cluster-internal runtime companion listener. The agent must be web-only
 # (not targeted by relayConfig.routes or relayConfig.rooms), and relayDemoCredentials must be disabled.
 runtimeAgent: ''
@@ -15,6 +19,7 @@ runtimeAgent: ''
 workSessionAgent: ''
 # Required when runtimeAgent is set. Supply restricted Kubernetes NetworkPolicy peers.
 runtimeIngressFrom: []
+webProxyAuthHeader: ''
 relayConfig:
   owners:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}

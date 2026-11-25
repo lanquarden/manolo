@@ -85,7 +85,12 @@ async function openBrowser(t) {
 
 async function waitFor(run, expression) {
   for (let i = 0; i < 100; i++) {
-    if (await run(expression)) return;
+    try {
+      if (await run(expression)) return;
+    } catch (error) {
+      // A page navigation interrupts an in-flight evaluation; retry on the new document.
+      if (!/navigated or closed/.test(error.message)) throw error;
+    }
     await sleep(50);
   }
   assert.fail(`Browser did not reach: ${expression}`);
@@ -104,6 +109,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
 }, async (t) => {
   const literal = '<b data-untrusted>plain text</b>';
+  const ownerName = '<b data-untrusted>Owner Name</b>';
   const tools = [
     { name: 'bash', status: 'ok', args: '{"command":"echo hi"}', output: 'hi\n', durationMs: 12,
       diagnostics: [{ severity: 'info', code: 'full_output', message: 'Full output: /tmp/manolo/tool-output' }] },
@@ -144,6 +150,7 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
     }
     if (url === '/api/dashboard') return json({ history: [] });
     if (url === '/api/inbox') return json({ messages: [] });
+    if (url === '/api/session') return json({ user: ownerName, agent: 'browser', via: 'cookie' });
     if (url === '/api/sessions') {
       sessionRequests++;
       return json({}, 404); // Older relay.
@@ -193,6 +200,10 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   await firstTab.resize(1200, 800);
   const { run } = firstTab;
   await waitFor(run, `${logCount} === 4 && document.getElementById('workspace-tabs').getAttribute('aria-orientation') === 'vertical'`);
+  await waitFor(run, `document.querySelector('#session-user').textContent === ${JSON.stringify(ownerName)}`);
+  assert.equal(await run(`document.querySelector('#session-user').children.length`), 0);
+  assert.equal(await run(`document.querySelector('#session-user').dataset.state`), 'signed-in');
+  assert.equal(await run(`document.querySelector('#sign-out').disabled`), false);
   assert.deepEqual(await run(`[...document.querySelector('#chat-log').children].map(row => row.children[1].textContent)`),
     [literal, 'Saved failure', 'Older pending', 'Latest pending']);
   assert.equal(await run(`document.querySelectorAll('[data-untrusted]').length`), 0);
@@ -343,6 +354,7 @@ test('browser Sessions links work to turns and reads transcripts with owner auth
     }
     if (url === '/api/dashboard') return json({ history: [] });
     if (url === '/api/inbox') return json({ messages: [] });
+    if (url === '/api/session') return json({ user: 'owner', agent: 'browser', via: 'basic' });
     if (url === '/api/turns') return json({ turns });
     if (url === '/api/turns/pending') {
       await finishTurn.promise;
@@ -372,6 +384,10 @@ test('browser Sessions links work to turns and reads transcripts with owner auth
   const includes = (value) => `.textContent.includes(${JSON.stringify(value)})`;
 
   await waitFor(run, `${chatLinks('first')}?${includes('Previous work')}`);
+  assert.equal(await run(`document.querySelector('#session-user').textContent`), 'owner');
+  assert.equal(await run(`document.querySelector('#session-user').dataset.state`), 'signed-in');
+  assert.equal(await run(`document.querySelector('#sign-out').disabled`), false);
+  assert.equal(await run(`document.querySelector('#session-status').textContent`), '');
   assert.equal(await run(`${chatLinks('last')}.textContent`), 'Active work');
   await run(click('sessions-tab'));
   assert.equal(await run(`document.querySelector('#include-ended').checked`), false);
@@ -473,6 +489,7 @@ test('browser Inbox answers and declines questions without sending Chat drafts',
     }
     if (url === '/api/dashboard') return json({ history: [] });
     if (url === '/api/sessions') return json({ sessions: [] });
+    if (url === '/api/session') return json({ user: 'owner', agent: 'browser', via: 'cookie' });
     if (url === '/api/inbox' && method === 'GET') return json({ messages, questions }, inboxStatus);
     if (url === '/api/turns' && method === 'GET') {
       historyReads++;
@@ -518,6 +535,9 @@ test('browser Inbox answers and declines questions without sending Chat drafts',
   const inboxIdle = `!document.querySelector('#refresh-inbox').disabled`;
   const inboxVisible = `!document.querySelector('#inbox-panel').hidden`;
   await waitFor(run, `!${sendDisabled} && ${first}`);
+  assert.equal(await run(`document.querySelector('#session-user').textContent`), 'owner');
+  assert.equal(await run(`document.querySelector('#sign-out').disabled`), false);
+  assert.equal(await run(`document.querySelector('#sign-out').getBoundingClientRect().width > 0`), true);
   await run(`${fill('Keep this Chat draft')}; ${click('inbox-tab')}`);
   await waitFor(run, inboxIdle);
   assert.ok(await run(`${first}.textContent.includes(${JSON.stringify(questions[0].prompt)})`));
@@ -587,4 +607,137 @@ test('browser Inbox answers and declines questions without sending Chat drafts',
   ]);
   assert.ok(responses.every(({ csrf, type }) => csrf === '1' && type === 'application/json'));
   assert.equal(chatPosts, 0);
+});
+
+test('workspace shows the signed-in user and signs out of the browser session', {
+  skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
+}, async (t) => {
+  const ownerName = '<b data-untrusted>Ana</b>';
+  const sessionRequests = [];
+  const logoutRequests = [];
+  let logoutStatus = 503;
+  const assets = new Map(await Promise.all([
+    ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
+    ['/login', 'login.html', 'text/html'],
+  ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
+  const server = createServer((req, res) => {
+    const { url, method, headers } = req;
+    const json = (body, status = 200, extra = {}) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', ...extra });
+      res.end(JSON.stringify(body));
+    };
+    const asset = assets.get(url);
+    if (asset) {
+      res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-store' });
+      res.end(asset.body);
+      return;
+    }
+    if (url === '/api/session') {
+      sessionRequests.push(method);
+      return json({ user: ownerName, agent: 'browser', via: 'cookie' });
+    }
+    if (url === '/logout') {
+      logoutRequests.push({ method, request: headers['x-manolo-request'] });
+      if (method !== 'POST' || headers['x-manolo-request'] !== '1') return json({ error: 'Forbidden' }, 403);
+      if (logoutStatus !== 200) return json({}, logoutStatus);
+      return json({ ok: true }, 200, { 'set-cookie': 'manolo_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' });
+    }
+    if (url === '/api/dashboard') return json({ history: [] });
+    if (url === '/api/inbox') return json({ messages: [] });
+    if (url === '/api/turns') return json({ turns: [] });
+    if (url === '/api/sessions') return json({ sessions: [] });
+    return json({}, 404);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.close(); server.closeAllConnections(); });
+  const openTab = await openBrowser(t);
+  const { run } = await openTab(`http://127.0.0.1:${server.address().port}/`);
+  const user = `document.querySelector('#session-user')`;
+  const signOut = `document.querySelector('#sign-out')`;
+  const status = `document.querySelector('#session-status').textContent`;
+
+  await waitFor(run, `${user}.textContent === ${JSON.stringify(ownerName)}`);
+  assert.equal(await run(`${user}.dataset.state`), 'signed-in');
+  assert.equal(await run(`${user}.children.length`), 0);
+  assert.equal(await run(`document.querySelectorAll('#session-user [data-untrusted]').length`), 0);
+  assert.equal(await run(`document.querySelector('.session-caption').textContent`), 'Signed in as');
+  assert.equal(await run(`${signOut}.textContent`), 'Sign out');
+  assert.equal(await run(`${signOut}.disabled`), false);
+  assert.equal(await run(status), '');
+  assert.deepEqual(sessionRequests, ['GET']);
+  const historyBefore = await run('history.length');
+
+  // A failed sign-out keeps the owner signed in and explains why.
+  await run(`${signOut}.click()`);
+  await waitFor(run, `${status}.includes('still signed in')`);
+  assert.ok(await run(`${status}.includes('(503)')`));
+  assert.equal(await run('location.pathname'), '/');
+  assert.equal(await run(`${user}.textContent`), ownerName);
+  assert.equal(await run(`${signOut}.disabled`), false);
+  assert.equal(logoutRequests.length, 1);
+  assert.deepEqual(logoutRequests[0], { method: 'POST', request: '1' });
+
+  logoutStatus = 200;
+  await run(`${signOut}.click()`);
+  await waitFor(run, `document.querySelector('#login-form') !== null`);
+  assert.equal(await run('location.pathname'), '/login');
+  assert.equal(await run(`document.querySelector('#session-user')`), null);
+  assert.equal(await run(`document.querySelector('#workspace-tabs')`), null);
+  assert.equal(await run('history.length'), historyBefore); // location.replace added no entry
+  assert.deepEqual(logoutRequests, [
+    { method: 'POST', request: '1' },
+    { method: 'POST', request: '1' },
+  ]);
+});
+
+test('workspace whose session probe returns 401 goes to the sign-in page', {
+  skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 30_000,
+}, async (t) => {
+  let sessionProbes = 0;
+  let loginPages = 0;
+  const assets = new Map(await Promise.all([
+    ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
+    ['/login', 'login.html', 'text/html'],
+  ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
+  const server = createServer((req, res) => {
+    const { url } = req;
+    const json = (body, status = 200) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    if (url === '/login') loginPages++;
+    const asset = assets.get(url);
+    if (asset) {
+      res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-store' });
+      res.end(asset.body);
+      return;
+    }
+    if (url === '/api/session') sessionProbes++;
+    return json({ error: 'Sign in as an owner' }, 401);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.close(); server.closeAllConnections(); });
+  const openTab = await openBrowser(t);
+  await openTab(`http://127.0.0.1:${server.address().port}/`);
+
+  // location.replace discards the workspace document, so its CDP execution context cannot be
+  // queried afterwards. Prove the redirect from the server side instead: one session probe and
+  // exactly one sign-in page request, from one workspace load.
+  for (let i = 0; i < 100 && !(sessionProbes === 1 && loginPages === 1); i++) await sleep(50);
+  assert.equal(sessionProbes, 1);
+  assert.equal(loginPages, 1);
+
+  // The sign-in page is a real page: login chrome present, workspace chrome absent.
+  const login = await openTab(`http://127.0.0.1:${server.address().port}/login`);
+  await waitFor(login.run, `document.querySelector('#login-form') !== null`);
+  assert.equal(await login.run('location.pathname'), '/login');
+  assert.equal(await login.run(`document.querySelector('#session-user')`), null);
+  assert.equal(await login.run(`document.querySelector('#sign-out')`), null);
+  assert.equal(await login.run(`document.querySelector('#session-status')`), null);
+  assert.equal(await login.run(`document.querySelector('#workspace-tabs')`), null);
+  assert.equal(await login.run(`document.querySelector('#chat-panel')`), null);
+  assert.equal(loginPages, 2); // The workspace redirect plus this explicit visit.
+  assert.equal(sessionProbes, 1);
 });

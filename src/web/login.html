@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17171b">
+  <meta name="referrer" content="no-referrer">
+  <title>Sign in · Manolo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M4 18V6l8 7 8-7v12"/></svg>
+      </span>
+      <div><strong>Manolo</strong><span class="brand-caption">Household workspace</span></div>
+    </div>
+    <h1>Sign in</h1>
+    <p class="login-help">Use the workspace account you were given. Sessions end when the relay restarts.</p>
+    <!--LOGIN-ERROR-->
+    <form id="login-form" method="post" action="/login" autocomplete="on">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required maxlength="128" autocapitalize="none" spellcheck="false">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+      <button type="submit" class="primary-button">Sign in</button>
+    </form>
+    <p class="login-note">If this workspace is behind a gateway that already authenticates you, sign-in is skipped automatically.</p>
+  </main>
+</body>
+</html>

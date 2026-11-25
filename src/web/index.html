@@ -17,7 +17,7 @@
     <symbol id="icon-inbox" viewBox="0 0 24 24"><path d="M4 13l2.8-7h10.4l2.8 7v5H4zM4 13h5l1 2h4l1-2h5"/></symbol>
     <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19 10a7 7 0 0 0-12-3L5 9m0 0V4m0 5h5m-5 5a7 7 0 0 0 12 3l2-2m0 0v5m0-5h-5"/></symbol>
     <symbol id="icon-send" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
-    <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3"/></symbol>
+    <symbol id="icon-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></symbol>
   </svg>
   <aside class="sidebar" aria-label="Workspace">
     <div class="brand">
@@ -39,7 +39,17 @@
         <svg class="icon" aria-hidden="true"><use href="#icon-inbox"/></svg><span>Inbox</span>
       </button>
     </div>
-    <div class="sidebar-footer"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg>Private workspace</div>
+    <div class="sidebar-footer">
+      <div class="session-chip">
+        <span class="session-avatar" aria-hidden="true"><svg class="icon"><use href="#icon-user"/></svg></span>
+        <div class="session-identity">
+          <span class="session-caption">Signed in as</span>
+          <strong id="session-user" class="plain-text" data-state="unknown">Checking…</strong>
+        </div>
+        <button id="sign-out" type="button" class="quiet-button" disabled>Sign out</button>
+      </div>
+      <p id="session-status" class="session-status" role="status" aria-live="polite"></p>
+    </div>
   </aside>
   <main class="workspace">
     <section id="chat-panel" class="view chat-view" role="tabpanel" aria-labelledby="chat-tab" tabindex="0">

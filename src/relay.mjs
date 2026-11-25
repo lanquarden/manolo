@@ -14,6 +14,7 @@ import { createTelegramTransport } from './telegram.mjs';
 import { admittedRoom, roomBotUsername } from './telegram-room.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
+import { createWebSessions } from './web-session.mjs';
 import { BLUEPRINT_ID } from './work-blueprints.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
@@ -101,6 +102,40 @@ const WEB = new Map([
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ].map(([path, [file, type]]) => [path, { type, body: readFileSync(new URL(`./web/${file}`, import.meta.url)) }]));
 
+// Browser sign-in. The relay keeps sessions in memory; a restart signs everyone out.
+const loginPage = readFileSync(new URL('./web/login.html', import.meta.url), 'utf8');
+const LOGIN_CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+const sessions = createWebSessions();
+const COOKIE = 'manolo_session';
+const cookieSecure = process.env.MANOLO_COOKIE_SECURE !== '0';
+const proxyHeader = process.env.MANOLO_PROXY_AUTH_HEADER;
+if (proxyHeader !== undefined && !/^[a-z0-9-]{1,64}$/.test(proxyHeader)) throw new Error('MANOLO_PROXY_AUTH_HEADER must be a lowercase header name');
+if (proxyHeader) {
+  console.warn('WARNING: MANOLO_PROXY_AUTH_HEADER trusts an upstream identity header; enable it only behind an authenticating gateway');
+}
+const loginFailures = new Map();
+const MAX_LOGIN_FAILURES = 10;
+const LOGIN_FAILURE_WINDOW = 10 * 60_000;
+function loginBlocked(address) {
+  const entry = loginFailures.get(address);
+  if (!entry) return false;
+  if (entry.reset <= Date.now()) {
+    loginFailures.delete(address);
+    return false;
+  }
+  return entry.count >= MAX_LOGIN_FAILURES;
+}
+function recordLoginFailure(address) {
+  const now = Date.now();
+  if (loginFailures.size > 1000) for (const [key, value] of loginFailures) if (value.reset <= now) loginFailures.delete(key);
+  const entry = loginFailures.get(address);
+  if (!entry || entry.reset <= Date.now()) {
+    loginFailures.set(address, { count: 1, reset: Date.now() + LOGIN_FAILURE_WINDOW });
+    return;
+  }
+  entry.count += 1;
+}
+
 const fail = (statusCode) => Object.assign(new Error('Request rejected'), { statusCode });
 const digest = (s) => createHash('sha256').update(s).digest();
 const equal = (a, b) => timingSafeEqual(digest(a), digest(b));
@@ -139,7 +174,39 @@ async function readJson(req, maxBytes = 32 * 1024) {
   return value;
 }
 
+function sessionToken(req) {
+  const cookies = req.headersDistinct.cookie;
+  if (cookies?.length !== 1) return;
+  const values = cookies[0].split(';').map(part => part.trim())
+    .filter(part => part.startsWith(`${COOKIE}=`)).map(part => part.slice(COOKIE.length + 1));
+  return values.length === 1 ? values[0] : undefined;
+}
+
+// A gateway can assert the identity once it has authenticated the browser. Only a configured header
+// is trusted, only for a known owner, and only when exactly one copy arrives.
+function proxyOwner(req) {
+  if (!proxyHeader) return;
+  const values = req.headersDistinct[proxyHeader];
+  if (values?.length !== 1 || !/^[A-Za-z0-9_.@-]{1,128}$/.test(values[0])) return;
+  const entry = config.owners.get(values[0]);
+  if (!entry) return;
+  return { name: values[0], ...entry, via: 'proxy' };
+}
+
+function cookieOwner(req) {
+  const token = sessionToken(req);
+  if (token === undefined) return;
+  const name = sessions.resolve(token);
+  const entry = name === undefined ? undefined : config.owners.get(name);
+  if (!entry) return;
+  return { name, ...entry, via: 'cookie', token };
+}
+
 function ownerAuth(req) {
+  const proxied = proxyOwner(req);
+  if (proxied) return proxied;
+  const cookie = cookieOwner(req);
+  if (cookie) return cookie;
   const authorization = req.headers.authorization ?? '';
   const match = /^Basic ([A-Za-z0-9+/]+={0,2})$/i.exec(authorization);
   if (!match) return;
@@ -148,7 +215,7 @@ function ownerAuth(req) {
   if (sep < 1) return;
   const name = decoded.slice(0, sep);
   const entry = config.owners.get(name);
-  if (equal(decoded.slice(sep + 1), entry?.password ?? '\0') && entry) return { name, ...entry };
+  if (equal(decoded.slice(sep + 1), entry?.password ?? '\0') && entry) return { name, ...entry, via: 'basic' };
 }
 
 function agentAuth(req) {
@@ -323,9 +390,87 @@ async function worker(agent, id, input) {
   return { status: 'failed', text: 'This turn could not be completed.' };
 }
 
+const escapeHtml = value => value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+const sessionCookie = (token, maxAge) => `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${cookieSecure ? '; Secure' : ''}`;
+const clearedCookie = () => `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${cookieSecure ? '; Secure' : ''}`;
+
+function sendLogin(res, status, message) {
+  const body = loginPage.replace('<!--LOGIN-ERROR-->', message
+    ? `<p id="login-error" class="login-error" role="alert">${escapeHtml(message)}</p>` : '');
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+    'content-security-policy': LOGIN_CSP, 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+    ...(status === 401 && { 'www-authenticate': 'Basic realm="Manolo", charset="UTF-8"' }),
+  });
+  res.end(body);
+}
+
+async function readLoginForm(req) {
+  if (req.headersDistinct['content-type']?.length !== 1 ||
+      req.headersDistinct['content-type'][0].split(';')[0].trim().toLowerCase() !== 'application/x-www-form-urlencoded') throw fail(415);
+  if (Number(req.headers['content-length']) > 4096) throw fail(413);
+  let size = 0;
+  const chunks = [];
+  for await (const part of req.iterator({ destroyOnReturn: false })) {
+    size += part.length;
+    if (size > 4096) throw fail(413);
+    chunks.push(part);
+  }
+  const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+  return { username: form.get('username') ?? '', password: form.get('password') ?? '' };
+}
+
+async function login(req, res) {
+  // A cross-site form post must not be able to sign the browser into someone else's account.
+  const site = req.headers['sec-fetch-site'];
+  if (site !== undefined && !['same-origin', 'none'].includes(site)) throw fail(403);
+  const address = req.socket.remoteAddress ?? 'unknown';
+  if (loginBlocked(address)) {
+    return sendLogin(res, 429, 'Too many failed sign-in attempts. Wait a few minutes and try again.');
+  }
+  const { username, password } = await readLoginForm(req);
+  const entry = config.owners.get(username);
+  const valid = entry !== undefined && password.length <= 256 && equal(password, entry.password);
+  if (!valid) {
+    recordLoginFailure(address);
+    // One message for every failure: never reveal whether the username exists.
+    return sendLogin(res, 401, 'That username and password did not match.');
+  }
+  loginFailures.delete(address);
+  const { token, maxAge } = sessions.issue(username);
+  res.writeHead(303, { location: '/', 'set-cookie': sessionCookie(token, maxAge), 'cache-control': 'no-store' });
+  res.end();
+}
+
 async function web(req, res, path) {
+  if (path === '/login') {
+    if (req.method === 'GET') return sendLogin(res, 200);
+    if (req.method === 'POST') return login(req, res);
+    return respond(res, 405, { error: 'Method not allowed' }, { allow: 'GET, POST' });
+  }
+  if (path === '/logout' && req.method === 'POST') {
+    if (req.headers['x-manolo-request'] !== '1') throw fail(403);
+    const owner = ownerAuth(req);
+    if (!owner) return respond(res, 401, { error: 'Sign in as an owner' });
+    if (owner.token !== undefined) sessions.revoke(owner.token);
+    return respond(res, 200, { ok: true }, { 'set-cookie': clearedCookie() });
+  }
+  // The stylesheet is public so the sign-in form is not a bare page. It holds no data.
+  if (req.method === 'GET' && path === '/style.css') {
+    const { type, body } = WEB.get(path);
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
+    return res.end(body);
+  }
   const owner = ownerAuth(req);
-  if (!owner) return respond(res, 401, { error: 'Sign in as an owner' }, { 'www-authenticate': 'Basic realm="Manolo", charset="UTF-8"' });
+  if (!owner) {
+    // A browser navigation gets the sign-in page; an API caller keeps the machine-readable 401.
+    if (req.method === 'GET' && !path.startsWith('/api/') && req.headers.accept?.includes('text/html')) {
+      res.writeHead(303, { location: '/login', 'cache-control': 'no-store' });
+      return res.end();
+    }
+    return respond(res, 401, { error: 'Sign in as an owner' }, { 'www-authenticate': 'Basic realm="Manolo", charset="UTF-8"' });
+  }
+  if (req.method === 'GET' && path === '/api/session') return respond(res, 200, { user: owner.name, agent: owner.agent, via: owner.via });
   if (req.method === 'GET' && WEB.has(path)) {
     const { type, body } = WEB.get(path);
     res.writeHead(200, { 'content-type': type });

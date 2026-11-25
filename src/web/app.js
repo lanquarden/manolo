@@ -2,6 +2,17 @@ const byId = (id) => document.getElementById(id);
 const POLL_INTERVAL_MS = 800;
 const POLL_WINDOW_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const SESSION_PATH = '/api/session';
+const LOGOUT_PATH = '/logout';
+const LOGIN_PATH = '/login';
+
+let leavingWorkspace = false;
+function redirectToLogin() {
+  // One navigation only: parallel requests can each come back 401.
+  if (leavingWorkspace) return;
+  leavingWorkspace = true;
+  location.replace(LOGIN_PATH);
+}
 
 function textNode(tag, text, className) {
   const node = document.createElement(tag);
@@ -24,6 +35,9 @@ async function api(path, method = 'GET', body, timeout = REQUEST_TIMEOUT_MS) {
   }
   const response = await fetch(path, options);
   if (!response.ok) {
+    // A browser session that ended means the sign-in page, not an inline error. The initial
+    // session probe handles its own 401 so the workspace never navigates twice.
+    if (response.status === 401 && path !== SESSION_PATH) redirectToLogin();
     throw Object.assign(new Error(`Request failed (${response.status}).`), { status: response.status });
   }
   return response.json();
@@ -949,6 +963,53 @@ checkButton.addEventListener('click', () => {
 });
 refreshHistoryButton.addEventListener('click', refreshHistory);
 
+const sessionUser = byId('session-user');
+const signOutButton = byId('sign-out');
+const sessionStatus = byId('session-status');
+let signingOut = false;
+
+function showSignedIn(user) {
+  sessionUser.textContent = user;
+  sessionUser.dataset.state = 'signed-in';
+  signOutButton.disabled = false;
+}
+
+async function loadSession() {
+  try {
+    const { user } = await api(SESSION_PATH);
+    if (typeof user !== 'string' || !user.trim()) throw new Error('Unexpected session response');
+    showSignedIn(user);
+  } catch (error) {
+    if (error.status === 401) return redirectToLogin();
+    // Never guess a name: an unknown session stays neutral and says why.
+    sessionUser.textContent = 'Unknown';
+    sessionUser.dataset.state = 'unknown';
+    sessionStatus.textContent = `${failure(error)} Reload the page to try again.`;
+  }
+}
+
+async function signOut() {
+  if (signingOut) return;
+  signingOut = true;
+  signOutButton.disabled = true;
+  sessionStatus.textContent = 'Signing out…';
+  try {
+    // The relay requires the same request header its other state changes use.
+    const result = await api(LOGOUT_PATH, 'POST', {});
+    if (result?.ok !== true) throw new Error('Unexpected sign-out response');
+    redirectToLogin();
+  } catch (error) {
+    // A 401 means the session already ended; api() has started the sign-in navigation.
+    if (error.status === 401) return;
+    signingOut = false;
+    signOutButton.disabled = false;
+    sessionStatus.textContent = `Could not sign out. ${failure(error)} You are still signed in.`;
+  }
+}
+
+signOutButton.addEventListener('click', () => void signOut());
+
+void loadSession();
 void refreshDashboard();
 void refreshInbox();
 void refreshHistory();

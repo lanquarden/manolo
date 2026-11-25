@@ -165,6 +165,9 @@ spec:
             - {name: MANOLO_WORK_SESSION_AGENT, value: {{ $workSessionAgent | quote }}}
             {{- end }}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
+            {{- with $.Values.webProxyAuthHeader }}
+            - {name: MANOLO_PROXY_AUTH_HEADER, value: {{ . | quote }}}
+            {{- end }}
             {{- if $runtimeAgent }}
             - {name: MANOLO_RUNTIME_AGENT, value: {{ $runtimeAgent | quote }}}
             - {name: MANOLO_RUNTIME_HOST, value: "0.0.0.0"}
