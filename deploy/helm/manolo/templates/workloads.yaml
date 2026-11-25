@@ -16,6 +16,23 @@
 {{- end -}}
 {{- $runtimeAgent := .Values.runtimeAgent -}}
 {{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
+{{- if not (kindIs "slice" .Values.relayConfig.rooms) -}}{{ fail "relayConfig.rooms must be a list" }}{{- end -}}
+{{- $roomIds := dict -}}
+{{- range .Values.relayConfig.rooms -}}
+{{- if not (and (kindIs "map" .) (kindIs "string" .agent) (hasKey $entries .agent)) -}}
+{{- fail "Each relayConfig.rooms entry must reference a configured agent" -}}
+{{- end -}}
+{{- if eq .agent $runtimeAgent -}}{{ fail "runtimeAgent must be web-only: relayConfig.rooms must not target it" }}{{- end -}}
+{{- if not (and (kindIs "string" .chatId) (regexMatch "^-[1-9][0-9]{0,15}$" .chatId)) -}}
+{{- fail "relayConfig.rooms requires a negative chatId string" -}}
+{{- end -}}
+{{- if hasKey $roomIds .chatId -}}{{ fail "Configure only one agent per Telegram room" }}{{- end -}}
+{{- $_ := set $roomIds .chatId true -}}
+{{- if not (and (kindIs "string" .wake) (has .wake (list "all" "mentions"))) -}}
+{{- fail "relayConfig.rooms wake must be all or mentions" -}}
+{{- end -}}
+{{- if not (and (kindIs "slice" .members) .members) -}}{{ fail "relayConfig.rooms requires a nonempty members list" }}{{- end -}}
+{{- end -}}
 {{- if $runtimeAgent -}}
 {{- if not (hasKey $entries $runtimeAgent) -}}{{ fail (printf "runtimeAgent %q is not configured in agents" $runtimeAgent) }}{{- end -}}
 {{- if hasKey $entries "runtimes" -}}{{ fail "runtimes is a reserved agent ID when the runtime companion listener is enabled" }}{{- end -}}

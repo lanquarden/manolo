@@ -14,7 +14,7 @@ Use Node 24. Open the printed URL and sign in with `owner`/`owner` (primary) or 
 
 ## What the PoC can do
 
-- **Telegram:** routes exact, allowlisted private user/chat IDs to one fixed agent. No username matching, fallback agent, group chats, attachments or forwarding. The relay persists admitted updates before acknowledging them to Telegram and replies to the original chat. It does not move Telegram conversation data into a web session.
+- **Telegram:** routes exact, allowlisted private user/chat IDs to one fixed agent. Direct Bot API also supports [opt-in text rooms](#opt-in-telegram-rooms). No fallback agent, and no Telegram data moves into web history.
 - **Discord (opt-in):** exact user ID and bot DM channel ID route to one worker, independently of Telegram. No guild messages or group conversations. Discord Gateway resumption is best effort; messages never received by the relay are not backfilled. Once admitted, replies survive relay restarts. Discord's short nonce window reduces duplicate sends, but it is not an exactly-once guarantee.
 - **Browser:** the owner can chat with their assigned worker and see the latest 30 browser turns after reload. A queued turn survives relay restart even if the worker was down when it was submitted. Telegram and Discord transcripts are separate; older conversations created before browser history was added keep their Pi Durable context, but their old turns aren't backfilled into the UI. The owner can edit, preview, publish, or roll back a dashboard. The worker can propose headings and notes with `write_dashboard_draft` but cannot publish them or rewrite the trusted web shell. No generated HTML, scripts, actions or URLs are rendered.
 - **Per-agent instructions:** set `agents.<id>.instructions` in Helm (or `MANOLO_AGENT_INSTRUCTIONS` on the worker). Changing one worker's value rolls only that worker. Instructions are non-secret text, up to 4,000 UTF-16 code units; they are stored and sent to the model. A new turn adopts them without clearing conversation history. Restart and idempotent retries alone don't rewrite a pending turn's instructions; admitting a fresh turn can update instructions for queued work because Pi Durable stores them per conversation.
@@ -67,8 +67,27 @@ Worker pods get a `1Gi` memory limit and a `256Mi` `/tmp`, because image prepara
 
 Create a separate Discord bot with no administrator permission. Use a small private server shared with the bot if needed to open the DM. Enable Developer Mode to copy your user ID and the DM channel ID. Add `MANOLO_DISCORD_TOKEN` to the relay Secret and a route such as `{transport: discord, userId: '123456789012345678', chatId: '234567890123456789', agent: primary}`. Keep both IDs quoted: they exceed JavaScript's safe integer range. Discord starts only if there is a Discord route and uses no public HTTP callback. No privileged Message Content intent is required for a DM with the bot. Test an allowed DM and verify that a different account and a guild channel don't receive a reply. Existing Telegram routing doesn't change.
 
+### Opt-in Telegram rooms
+
+Set `relayConfig.rooms` in Helm (the `rooms` array in `relay.json` outside Helm). Use one binding per room, with quoted numeric IDs:
+
+```yaml
+relayConfig:
+  rooms:
+    - transport: telegram
+      chatId: '-1001234567890'
+      agent: canary
+      wake: mentions
+      members: ['123456', '789012']
+      instructions: 'Answer scheduling questions concisely.'
+```
+
+- Rooms require the direct Bot API; the relay refuses room config in XMPP mode. For `mentions`, set `MANOLO_TELEGRAM_BOT_USERNAME` in the relay environment (from `relaySecret` in Helm), without `@`. Only matching Telegram mention entities wake the agent; plain text, replies to the bot alone, and mentions with no remaining text do not. `all` wakes on eligible text from any allowlisted sender that Telegram delivers. BotFather privacy mode can suppress ordinary group traffic; disable it on a dedicated bot if you want `all` to see every eligible message.
+- Rooms accept stand-alone human text only: no forwards, edits, service messages, anonymous senders, voice, or forum topics. The relay holds up to four active jobs per room session; overflow is silent. Replies attach to the triggering message. Typing is best effort and never posts a progress message.
+- Members share an agent conversation, separate from other rooms, DMs and web. Replies are visible to everyone with room access, not just senders on the allowlist. Instructions are non-secret, at most 2,000 UTF-16 code units, and set through relay config, not through chat. Rooms don't inherit the private operator prompt and have no worker tools, paired runtime, work links, or web mirror.
+
 ### Where to extend it
 
 `src/telegram.mjs` and `src/discord.mjs` translate messaging APIs. `src/relay.mjs` owns routing authorization, durable delivery and reply correlation. The normalized sender key is `(transport, userId, chatId)`, not an identity supplied to a model. WhatsApp and an XMPP bridge can sit at this boundary. An XMPP bridge should preserve authenticated upstream sender/conversation IDs and the return route; if it collapses everyone to one bridge account, there is no safe per-person route. No translation server is needed for Telegram or Discord.
 
-`src/worker.mjs` owns the Pi Durable state. `src/dashboard.mjs` owns per-agent dashboard revisions. No shared worker volume, agent plug-ins, scheduling, or room membership in this slice. For opt-in unattended commands on a paired Linux machine, see [Paired Linux runtimes](pilots/RUNTIME.md). The `read`/`write`/`edit`/`bash` tools run in each worker's own container and workspace; anything that needs a real boundary (per-user file access, a network sandbox, a second writer) belongs outside them, not in a path check the shell can walk around. Nolan can use the browser from Windows; native Windows execution and scoped device enrollment are separate milestones. A paired desktop should not inherit a cluster or owner credential, or implicitly grant remote shell access.
+`src/worker.mjs` owns the Pi Durable state. `src/dashboard.mjs` owns per-agent dashboard revisions. No shared worker volume, agent plug-ins, or scheduling. For opt-in unattended commands on a paired Linux machine, see [Paired Linux runtimes](pilots/RUNTIME.md). The `read`/`write`/`edit`/`bash` tools run in each worker's own container and workspace; anything that needs a real boundary (per-user file access, a network sandbox, a second writer) belongs outside them, not in a path check the shell can walk around. Nolan can use the browser from Windows; native Windows execution and scoped device enrollment are separate milestones. A paired desktop should not inherit a cluster or owner credential, or implicitly grant remote shell access.

@@ -1,4 +1,5 @@
 import { MAX_VOICE_BYTES, MAX_VOICE_SECONDS, readBounded, speechError, validVoiceFileId } from './speech.mjs';
+import { roomBotUsername } from './telegram-room.mjs';
 
 const POLL_SECONDS = 25;
 const POLL_DEADLINE_MS = 35_000;
@@ -47,13 +48,40 @@ function endpointPrefix(baseUrl) {
 
 const positiveSafeInteger = (value) => Number.isSafeInteger(value) && value > 0;
 
-function toEnvelope(message) {
+function withoutBotMentions(text, entities, username) {
+  if (!username || !Array.isArray(entities)) return undefined;
+  const matches = new Set();
+  const length = username.length + 1;
+  for (const entity of entities) {
+    const offset = entity?.offset;
+    if (entity?.type === 'mention' && entity.length === length && Number.isSafeInteger(offset) &&
+        offset >= 0 && offset + length <= text.length) {
+      const mention = text.slice(offset, offset + length);
+      if (/^@[A-Za-z0-9_]+$/.test(mention) && mention.toLowerCase() === `@${username}`) matches.add(offset);
+    }
+  }
+  if (!matches.size) return undefined;
+  for (const offset of [...matches].sort((a, b) => b - a)) {
+    text = text.slice(0, offset) + text.slice(offset + length);
+  }
+  return text.trim();
+}
+
+function toEnvelope(message, roomsEnabled, username) {
   const { from, chat, text, voice, message_id: messageId } = message ?? {};
-  if (chat?.type !== 'private' || !positiveSafeInteger(chat.id) ||
-    !positiveSafeInteger(from?.id) || from.is_bot === true ||
+  if (!positiveSafeInteger(from?.id) || from.is_bot === true ||
     message.is_automatic_forward === true || FORWARD_FIELDS.some((key) => Object.hasOwn(message, key))) {
     return null;
   }
+  if (roomsEnabled && ['group', 'supergroup'].includes(chat?.type) && Number.isSafeInteger(chat.id) && chat.id < 0) {
+    // Only human-authored standalone text. Anonymous senders, bot-via messages and forum topics are unsupported.
+    if (from.is_bot !== false || message.sender_chat || message.via_bot || chat.is_forum ||
+        message.is_topic_message || Object.hasOwn(message, 'message_thread_id') || voice ||
+        !positiveSafeInteger(messageId) || typeof text !== 'string' || !text.trim() || text.length > MAX_INPUT_UNITS) return null;
+    const mentionedText = withoutBotMentions(text, message.entities, username);
+    return { transport: 'telegram', kind: 'room', userId: String(from.id), chatId: String(chat.id), messageId, text, mentionedText };
+  }
+  if (chat?.type !== 'private' || !positiveSafeInteger(chat.id)) return null;
   const dm = { transport: 'telegram', userId: String(from.id), chatId: String(chat.id) };
   if (typeof text === 'string' && text.length > 0 && text.length <= MAX_INPUT_UNITS) return { ...dm, text };
   if (chat.id === from.id && positiveSafeInteger(messageId) && validVoiceFileId(voice?.file_id) &&
@@ -85,10 +113,12 @@ const replyParameters = messageId => {
   return { message_id: messageId };
 };
 
-export function createTelegramTransport({ token, baseUrl = 'https://api.telegram.org', fetchImpl = fetch, limit, speech }) {
+export function createTelegramTransport({ token, baseUrl = 'https://api.telegram.org', fetchImpl = fetch, limit, speech,
+  roomsEnabled = false, botUsername }) {
   if (typeof token !== 'string' || !token || /[^a-zA-Z0-9:_-]/u.test(token)) {
     throw new TypeError('Invalid Telegram token');
   }
+  const username = roomsEnabled ? roomBotUsername(botUsername) : undefined;
   const base = endpointPrefix(baseUrl);
   const prefix = `${base}/bot${token}`;
 
@@ -172,7 +202,7 @@ export function createTelegramTransport({ token, baseUrl = 'https://api.telegram
       for (const update of updates) {
         if (!positiveSafeInteger(update?.update_id)) continue;
         // Keep unsupported updates so the caller can advance its cursor.
-        entries.push({ updateId: update.update_id, envelope: toEnvelope(update.message) });
+        entries.push({ updateId: update.update_id, envelope: toEnvelope(update.message, roomsEnabled, username) });
       }
       return entries.sort((a, b) => a.updateId - b.updateId);
     },
@@ -186,7 +216,7 @@ export function createTelegramTransport({ token, baseUrl = 'https://api.telegram
 
     async typing({ chatId }, signal) {
       const id = telegramChatId(chatId);
-      if (id.startsWith('-')) throw new TypeError('Expected a private Telegram chat');
+      if (!roomsEnabled && id.startsWith('-')) throw new TypeError('Expected a private Telegram chat');
       const result = await request('sendChatAction', { chat_id: id, action: 'typing' }, signal, TYPING_DEADLINE_MS);
       if (result !== true) throw new TelegramTransportError('Invalid Telegram typing response');
     },

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { isRoomChatId, isRoomMemberId, normalizeRoomInstructions } from './telegram-room.mjs';
 
 export const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TG_ID = /^[1-9][0-9]{0,15}$/;
@@ -33,7 +34,8 @@ function identifier(value, label) {
  */
 export function loadRelayConfig(path, env = process.env, { demo = false } = {}) {
   if (!path) throw new Error('Set MANOLO_RELAY_CONFIG to a JSON config file');
-  const raw = object(JSON.parse(readFileSync(path, 'utf8')), 'config', ['agents', 'owners', 'routes', 'inbox']);
+  const raw = object(JSON.parse(readFileSync(path, 'utf8')), 'config');
+  object(raw, 'config', ['agents', 'owners', 'routes', 'inbox', ...(Object.hasOwn(raw, 'rooms') ? ['rooms'] : [])]);
   const secrets = new Set();
   function credential(name) {
     invariant(typeof name === 'string' && ENV_NAME.test(name), 'Invalid credentials env var name');
@@ -76,6 +78,21 @@ export function loadRelayConfig(path, env = process.env, { demo = false } = {}) 
     invariant(!routes.has(id), 'Duplicate transport route');
     routes.set(id, agentId(entry.agent));
   }
+  const rooms = new Map();
+  const roomEntries = Object.hasOwn(raw, 'rooms') ? raw.rooms : [];
+  invariant(Array.isArray(roomEntries), 'Expected rooms array');
+  for (const entry of roomEntries) {
+    object(entry, 'room');
+    object(entry, 'room', ['transport', 'chatId', 'agent', 'wake', 'members',
+      ...(Object.hasOwn(entry, 'instructions') ? ['instructions'] : [])]);
+    const { transport, chatId, agent, wake, members, instructions = '' } = entry;
+    invariant(transport === 'telegram' && isRoomChatId(chatId), 'Configure a negative Telegram room chat ID as a string');
+    invariant(!rooms.has(chatId), 'Configure only one agent per Telegram room');
+    invariant(wake === 'all' || wake === 'mentions', 'Telegram room wake must be all or mentions');
+    invariant(Array.isArray(members) && members.length > 0 && members.every(isRoomMemberId) &&
+      new Set(members).size === members.length, 'Configure a nonempty Telegram room member allowlist of unique positive user ID strings');
+    rooms.set(chatId, { agent: agentId(agent), wake, members: new Set(members), instructions: normalizeRoomInstructions(instructions) });
+  }
   const inbox = new Set();
   for (const entry of raw.inbox) {
     object(entry, 'inbox edge', ['from', 'to']);
@@ -84,5 +101,7 @@ export function loadRelayConfig(path, env = process.env, { demo = false } = {}) 
     invariant(from !== to, 'Inbox edges must connect different agents');
     inbox.add(edgeKey(from, to));
   }
-  return { agents, owners, routes, inbox, transports: new Set(raw.routes.map(route => route.transport)) };
+  const transports = new Set(raw.routes.map(route => route.transport));
+  if (rooms.size) transports.add('telegram');
+  return { agents, owners, routes, rooms, inbox, transports };
 }

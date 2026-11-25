@@ -11,6 +11,7 @@ import { openRelayStore } from './relay-store.mjs';
 import { createRuntimeRelay } from './runtime-relay.mjs';
 import { createSpeechFromEnv, readBounded } from './speech.mjs';
 import { createTelegramTransport } from './telegram.mjs';
+import { admittedRoom, roomBotUsername } from './telegram-room.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
 import { BLUEPRINT_ID } from './work-blueprints.mjs';
@@ -32,23 +33,32 @@ if (workSessionAgent && (!config.agents.has(workSessionAgent) ||
     ![...config.owners.values()].some(owner => owner.agent === workSessionAgent))) {
   throw new Error('Work sessions require a configured agent with a browser owner');
 }
+const rooms = [...config.rooms.values()];
+const telegramMode = process.env.MANOLO_TELEGRAM_MODE;
+const useXmpp = telegramMode === 'xmpp';
+if (rooms.length && telegramMode !== undefined && telegramMode !== 'direct') {
+  throw new Error('Telegram rooms require direct Bot API mode; XMPP is not supported');
+}
+const botUsername = rooms.length
+  ? roomBotUsername(process.env.MANOLO_TELEGRAM_BOT_USERNAME, rooms.some(room => room.wake === 'mentions'))
+  : undefined;
 if (runtimeAgent && (demo || !config.agents.has(runtimeAgent) || ![...config.owners.values()].some(owner => owner.agent === runtimeAgent) ||
-    [...config.routes.values()].includes(runtimeAgent))) {
+    [...config.routes.values()].includes(runtimeAgent) || rooms.some(room => room.agent === runtimeAgent))) {
   throw new Error('A runtime agent requires non-demo authentication and must be web-only');
 }
 const dataDir = process.env.MANOLO_DATA_DIR;
 if (!dataDir) throw new Error('Set MANOLO_DATA_DIR');
 const telegramToken = process.env.MANOLO_TELEGRAM_TOKEN;
-const useXmpp = process.env.MANOLO_TELEGRAM_MODE === 'xmpp';
 const discordToken = process.env.MANOLO_DISCORD_TOKEN;
 const stop = new AbortController();
-if (config.transports.has('telegram') && !useXmpp && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for direct Telegram routes');
+if (config.transports.has('telegram') && !useXmpp && !telegramToken) throw new Error('Set MANOLO_TELEGRAM_TOKEN for direct Telegram');
 if (config.transports.has('telegram') && useXmpp && telegramToken) throw new Error('Remove MANOLO_TELEGRAM_TOKEN from the relay when using the XMPP bridge');
 if (config.transports.has('discord') && !discordToken) throw new Error('Set MANOLO_DISCORD_TOKEN for Discord routes');
 const botScope = useXmpp ? process.env.MANOLO_TELEGRAM_BOT_ID : telegramToken?.split(':')[0];
 const telegram = config.transports.has('telegram') && (useXmpp
   ? createTelegramXmppTransport(process.env, stop.signal)
-  : createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL, speech: createSpeechFromEnv(process.env) }));
+  : createTelegramTransport({ token: telegramToken, baseUrl: process.env.MANOLO_TELEGRAM_BASE_URL, speech: createSpeechFromEnv(process.env),
+    roomsEnabled: rooms.length > 0, botUsername }));
 const discordScope = config.transports.has('discord') ? Buffer.from(discordToken.split('.')[0], 'base64url').toString('ascii') : null;
 if (discordScope !== null && !SNOWFLAKE.test(discordScope)) throw new Error('Invalid MANOLO_DISCORD_TOKEN format');
 let discordClient;
@@ -438,7 +448,7 @@ async function pollTelegram() {
   while (!stop.signal.aborted) {
     try {
       const updates = await telegram.poll(store.cursor(), stop.signal);
-      store.ingest(updates, config.routes, botScope);
+      store.ingest(updates, config.routes, botScope, config.rooms);
       wait = 1000;
       if (updates.length === 0) await sleep(250, undefined, { signal: stop.signal });
     } catch {
@@ -457,7 +467,15 @@ async function runMessage(transport, adapter, job) {
   const { agent, user_id: userId, chat_id: chatId, turn_id: id, session_id: sessionId } = job;
   const advance = (...args) => store.advance(transport, job, ...args);
   const typing = transport === 'telegram' ? telegramTyping : null;
-  if (config.routes.get(routeKey({ transport, userId, chatId })) !== agent) {
+  // Recheck durable jobs against the current config before worker admission and before every delivery.
+  const isRoom = transport === 'telegram' && job.room_mentioned != null;
+  const room = isRoom ? config.rooms.get(chatId) : undefined;
+  const allowed = isRoom
+    ? room?.agent === agent && admittedRoom(room, userId, job.room_mentioned === 1) &&
+      sessionId === key('telegram-room', botScope, chatId, agent) &&
+      !job.voice_file_id && !job.voice_reply && Number.isSafeInteger(job.reply_message_id) && job.reply_message_id > 0
+    : config.routes.get(routeKey({ transport, userId, chatId })) === agent;
+  if (!allowed) {
     typing?.end(chatId);
     return advance('dead');
   }
@@ -476,7 +494,9 @@ async function runMessage(transport, adapter, job) {
       else await adapter.send(delivery, stop.signal);
       return advance('sent');
     }
-    const turn = await worker(agent, id, job.state === 'submit' ? { sessionId, text: job.input } : undefined);
+    const turn = await worker(agent, id, job.state === 'submit' ? {
+      sessionId, text: job.input, ...(isRoom && { room: { instructions: room.instructions } }),
+    } : undefined);
     if (turn.status === 'pending') return advance('wait', null, Date.now() + 1000);
     typing?.end(chatId);
     return advance('send', turn.text || 'The agent returned no text.');

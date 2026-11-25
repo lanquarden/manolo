@@ -1,7 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { validTranscript, validVoiceFileId } from './speech.mjs';
 import { key, routeKey, SNOWFLAKE } from './relay-config.mjs';
+import { admittedRoom, ROOM_BACKLOG_LIMIT } from './telegram-room.mjs';
 
+const active = "('submit','wait','send')";
 const conflict = () => Object.assign(new Error('Turn ID was already used'), { statusCode: 409 });
 const inboxError = (statusCode) => Object.assign(new Error('Inbox question request rejected'), { statusCode });
 const MAX_OPEN_QUESTIONS = 50;
@@ -39,6 +41,7 @@ export function openRelayStore(path) {
     );
     CREATE INDEX IF NOT EXISTS telegram_due ON telegram_jobs(state, next_at);
     CREATE INDEX IF NOT EXISTS telegram_session ON telegram_jobs(session_id, update_id);
+    CREATE INDEX IF NOT EXISTS telegram_active_session ON telegram_jobs(session_id, update_id) WHERE state IN ${active};
     CREATE TABLE IF NOT EXISTS discord_jobs (
       seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL, bot TEXT NOT NULL,
       turn_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -85,6 +88,8 @@ export function openRelayStore(path) {
     if (!columns.has('voice_file_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_file_id TEXT');
     if (!columns.has('reply_message_id')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN reply_message_id INTEGER');
     if (!columns.has('voice_reply')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN voice_reply INTEGER NOT NULL DEFAULT 0');
+    // NULL is a private job; 0/1 records a room job's original entity wake signal.
+    if (!columns.has('room_mentioned')) db.exec('ALTER TABLE telegram_jobs ADD COLUMN room_mentioned INTEGER CHECK(room_mentioned IN (0,1))');
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
@@ -92,9 +97,9 @@ export function openRelayStore(path) {
   }
   const cursor = () => db.prepare('SELECT cursor FROM telegram_state WHERE id=1').get().cursor;
   const add = db.prepare(`INSERT INTO telegram_jobs
-    (update_id,turn_id,session_id,user_id,chat_id,agent,input,voice_file_id,reply_message_id,voice_reply,state)
-    VALUES (?,?,?,?,?,?,?,?,?,?,'submit')`);
-  const active = "('submit','wait','send')";
+    (update_id,turn_id,session_id,user_id,chat_id,agent,input,voice_file_id,reply_message_id,voice_reply,room_mentioned,state)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,'submit')`);
+  const roomBacklog = db.prepare(`SELECT count(*) AS n FROM telegram_jobs WHERE session_id=? AND state IN ${active}`);
   const selection = (table, extra, sequence, states) => db.prepare(`SELECT j.* FROM ${table} j WHERE j.state IN ${states} AND j.next_at<=? ${extra}
     AND NOT EXISTS(SELECT 1 FROM ${table} p WHERE p.session_id=j.session_id AND p.${sequence}<j.${sequence} AND p.state IN ${states})
     ORDER BY j.${sequence} LIMIT 10`);
@@ -144,7 +149,7 @@ export function openRelayStore(path) {
         throw new Error('This relay data directory is already bound to another Telegram bot');
       }
     },
-    ingest(updates, routes, botScope) {
+    ingest(updates, routes, botScope, rooms) {
       db.exec('BEGIN IMMEDIATE');
       try {
         let next = cursor();
@@ -152,14 +157,29 @@ export function openRelayStore(path) {
           if (!Number.isSafeInteger(updateId) || updateId < next || updateId >= Number.MAX_SAFE_INTEGER) continue;
           next = updateId + 1;
           if (envelope?.transport !== 'telegram') continue;
+          const { userId, chatId, voiceFileId, messageId, text } = envelope;
+          if (envelope.kind === 'room') {
+            const room = rooms?.get(chatId);
+            const { mentionedText } = envelope;
+            const mentioned = typeof mentionedText === 'string' && !!mentionedText.trim();
+            if (!admittedRoom(room, userId, mentioned) || voiceFileId !== undefined ||
+                !Number.isSafeInteger(messageId) || messageId <= 0) continue;
+            const input = room.wake === 'mentions' ? mentionedText : text;
+            if (typeof input !== 'string' || !input.trim() || input.length > 4000) continue;
+            const session = key('telegram-room', botScope, chatId, room.agent);
+            // Drop overflow silently, still advancing the Telegram cursor.
+            if (roomBacklog.get(session).n >= ROOM_BACKLOG_LIMIT) continue;
+            add.run(updateId, key(session, updateId), session, userId, chatId, room.agent,
+              input, null, messageId, 0, Number(mentioned));
+            continue;
+          }
           const agent = routes.get(routeKey(envelope));
           if (agent) {
-            const session = key('telegram', botScope, envelope.userId, envelope.chatId, agent);
-            const { voiceFileId, messageId, text } = envelope;
+            const session = key('telegram', botScope, userId, chatId, agent);
             if (validVoiceFileId(voiceFileId) && envelope.userId === envelope.chatId && Number.isSafeInteger(messageId) && messageId > 0) {
-              add.run(updateId, key(session, updateId), session, envelope.userId, envelope.chatId, agent, '', voiceFileId, messageId, 1);
+              add.run(updateId, key(session, updateId), session, userId, chatId, agent, '', voiceFileId, messageId, 1, null);
             } else if (typeof text === 'string' && text.length > 0 && text.length <= 4000) {
-              add.run(updateId, key(session, updateId), session, envelope.userId, envelope.chatId, agent, text, null, null, 0);
+              add.run(updateId, key(session, updateId), session, userId, chatId, agent, text, null, null, 0, null);
             }
           }
         }
