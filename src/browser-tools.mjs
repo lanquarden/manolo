@@ -291,8 +291,11 @@ async function clickElement(cdp, sessionId, refValue) {
 /**
  * Installs the `browser_*` tools when the operator gave the worker a Chromium sidecar endpoint. Without one, the agent
  * is not offered a browser at all rather than being handed a tool that fails at runtime.
+ *
+ * `touch` is called at the start of every tool call so the worker's idle watcher keeps the sidecar container alive
+ * while it is being used. It is bookkeeping, never part of the tool result, so a failure there is swallowed.
  */
-export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BROWSER_CDP, signal } = {}) {
+export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BROWSER_CDP, signal, touch } = {}) {
   if (!endpoint) return;
   let base;
   try { base = new URL(endpoint); } catch { throw new Error('MANOLO_BROWSER_CDP must be an http origin'); }
@@ -300,6 +303,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
       (base.pathname !== '/' && base.pathname !== '') || !['127.0.0.1', '::1', 'localhost'].includes(base.hostname)) {
     throw new Error('MANOLO_BROWSER_CDP must be a loopback http origin');
   }
+  const activity = () => { try { touch?.(); } catch { /* never let activity tracking fail a tool */ } };
 
   // Every call opens its own short DevTools connection, so a restarted sidecar never leaves a stale session behind.
   async function withPage({ create = false, url = 'about:blank' }, run) {
@@ -326,6 +330,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Open a URL in the shared agent browser, or use newTab to keep the current page. Returns the page title, its interactive elements with refs, and its visible text.',
     parameters: schema({ url: text(MAX_URL), newTab: { type: 'boolean' } }, ['url']),
     async execute({ url, newTab }, _api, context) {
+      activity();
       const target = assertUrl(url);
       return { output: [{ type: 'text', text: await withPage({ create: newTab === true, url: target }, async ({ cdp, sessionId }) => {
         if (newTab !== true) await cdp.send('Page.navigate', { url: target }, sessionId);
@@ -340,6 +345,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Describe the page the browser is showing: title, URL, interactive elements with click/type refs, and visible text.',
     parameters: schema({}),
     async execute(_args, _api, context) {
+      activity();
       return { output: [{ type: 'text', text: await withPage({}, ({ cdp, sessionId }) => readPage(cdp, sessionId)) }] };
     },
   });
@@ -349,6 +355,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Click the element with a ref from the latest snapshot. Returns the resulting page.',
     parameters: schema({ ref }),
     async execute({ ref: refValue }, _api, context) {
+      activity();
       if (!REF.test(refValue)) throw new Error('The ref is not a snapshot ref such as e7');
       return { output: [{ type: 'text', text: await withPage({}, async ({ cdp, sessionId }) => {
         await clickElement(cdp, sessionId, refValue);
@@ -363,6 +370,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Type text into the element with a ref from the latest snapshot, or into whatever is focused when ref is omitted. submit presses Enter afterwards.',
     parameters: schema({ text: text(4000), ref, submit: { type: 'boolean' } }, ['text']),
     async execute({ text: value, ref: refValue, submit }, _api, context) {
+      activity();
       if (refValue !== undefined && !REF.test(refValue)) throw new Error('The ref is not a snapshot ref such as e7');
       return { output: [{ type: 'text', text: await withPage({}, async ({ cdp, sessionId }) => {
         if (refValue !== undefined) await focusElement(cdp, sessionId, refValue);
@@ -379,6 +387,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Press one key in the browser, such as Enter, Tab, Escape, PageDown, or a combination like ctrl+a.',
     parameters: schema({ key: text(40) }),
     async execute({ key: spec }, _api, context) {
+      activity();
       keyEvents(spec);
       return { output: [{ type: 'text', text: await withPage({}, async ({ cdp, sessionId }) => {
         await press(cdp, sessionId, spec);
@@ -393,6 +402,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'Capture what the browser is showing as a JPEG image, for pages whose layout matters more than their text.',
     parameters: schema({}),
     async execute() {
+      activity();
       const { data, text: summary } = await withPage({}, async ({ cdp, sessionId }) => {
         const shot = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 75 }, sessionId);
         const details = await evaluate(cdp, sessionId, '({ url: location.href, title: document.title })');
@@ -410,6 +420,7 @@ export function installBrowserTools(registry, { endpoint = process.env.MANOLO_BR
     description: 'List the browser tabs, or select or close one by its id. The selected tab receives later browser_open, click, type and key calls.',
     parameters: schema({ action: { type: 'string', enum: ['list', 'select', 'close'] }, tab: { type: 'string', pattern: '^[A-F0-9]{8,32}$' } }, ['action']),
     async execute({ action, tab }) {
+      activity();
       const list = await pages(base, AbortSignal.timeout(5_000));
       const lines = list.map(page => `${page.id === currentTarget ? '*' : ' '} ${page.id} ${clip(page.title || '(no title)', 80)} — ${clip(page.url, 200)}`);
       if (action === 'list') return { output: [{ type: 'text', text: lines.length ? lines.join('\n') : 'No tabs are open' }] };

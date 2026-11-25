@@ -12,6 +12,7 @@ import { openNodeSqliteDatabase } from '@earendil-works/pi-durable/storage/sqlit
 import { createFitImagesExtension } from '@earendil-works/pi-durable/images/fit';
 import { createWorkerModels, DEFAULT_BASH_TIMEOUT_SECONDS, installCodingTools, installRelayTools, installRuntimeTools, RuntimeAccess } from './worker-runtime.mjs';
 import { installBrowserTools } from './browser-tools.mjs';
+import { createBrowserIdle, findSidecarBrowserPid } from './browser-idle.mjs';
 import { createMcp } from './mcp.mjs';
 import { RemoteEnvError, WorkspaceTarget, createRemoteTargets, installWorkspaceTools, parseRemoteEnvs } from './remote-env.mjs';
 import { McpConfigError } from './mcp-config.mjs';
@@ -23,6 +24,9 @@ import { normalizeRoomInstructions } from './telegram-room.mjs';
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const TURN_PATH = /^\/v1\/turns\/([A-Za-z0-9_-]{1,128})$/;
 const WORK_PATH = /^\/v1\/work-sessions\/([A-Za-z0-9_-]{1,128})(?:\/([0-9a-f]{64}))?$/;
+const BROWSER_TOUCH_PATH = '/v1/browser/touch';
+const DEFAULT_BROWSER_IDLE_MINUTES = 10;
+const MAX_BROWSER_IDLE_MINUTES = 1440;
 const MAX_PRIVATE_BODY_BYTES = 32 * 1024;
 const MAX_BODY_BYTES = 38 * 1024; // Includes JSON-escaped text and room instructions.
 const MAX_INSTRUCTION_UNITS = 4000;
@@ -227,10 +231,17 @@ function loadConfig(env) {
       throw new ConfigurationError('MANOLO_BROWSER_CDP must be a loopback http origin.');
     }
   }
+  // An idle sidecar holds its memory until it is stopped, so the window is bounded and `0` is an explicit opt-out.
+  // Validate the value whenever it is present, even without a browser, so a typo cannot sit unnoticed in a Secret.
+  const rawIdle = env.MANOLO_BROWSER_IDLE_MINUTES ?? (browserCdp ? String(DEFAULT_BROWSER_IDLE_MINUTES) : '0');
+  const browserIdleMinutes = Number(rawIdle);
+  if (!/^\d{1,4}$/.test(rawIdle) || browserIdleMinutes > MAX_BROWSER_IDLE_MINUTES) {
+    throw new ConfigurationError(`MANOLO_BROWSER_IDLE_MINUTES must be an integer from 0 to ${MAX_BROWSER_IDLE_MINUTES}.`);
+  }
   return {
     agentId, token, dataDir, mode, relay, fixtureDelay, instructions, codingTools: codingTools === '1', host: env.HOST ?? '127.0.0.1', port,
     workspaceDir: join(dataDir, 'workspace'), bashEnv: loadBashEnv(env.MANOLO_BASH_ENV), timeoutSeconds, browserCdp, publicUrl,
-    codemode: codemode === '1', remoteTargets,
+    browserIdleMinutes, codemode: codemode === '1', remoteTargets,
   };
 }
 
@@ -428,7 +439,7 @@ async function readJsonBody(req, maxBytes = 32 * 1024) {
   }
 }
 
-function httpWorker(turns, workSessions, token, mcp) {
+function httpWorker(turns, workSessions, token, mcp, browserTouch) {
   const expected = digest(token);
   function reply(res, statusCode, body) {
     const json = JSON.stringify(body);
@@ -446,11 +457,23 @@ function httpWorker(turns, workSessions, token, mcp) {
       const mcpMatch = MCP_PATH.exec(req.url);
       const match = TURN_PATH.exec(req.url);
       const work = WORK_PATH.exec(req.url);
-      if (!match && !work && !mcpMatch) throw new RequestError(404, 'not found');
+      const touch = req.url === BROWSER_TOUCH_PATH;
+      if (!match && !work && !mcpMatch && !touch) throw new RequestError(404, 'not found');
       const bearer = /^Bearer ([!-~]+)$/i.exec(req.headers.authorization ?? '');
       if (!bearer || !timingSafeEqual(digest(bearer[1]), expected)) {
         res.setHeader('www-authenticate', 'Bearer');
         throw new RequestError(401, 'unauthorized');
+      }
+      if (touch) {
+        if (req.method !== 'POST') {
+          res.setHeader('allow', 'POST');
+          throw new RequestError(405, 'method not allowed');
+        }
+        // The relay reports a person watching the desktop, not a tool call. Nothing is stored and nothing is returned.
+        browserTouch?.();
+        res.writeHead(204, { 'cache-control': 'no-store' });
+        res.end();
+        return;
       }
       if (mcpMatch) {
         const action = mcpMatch[1] ?? '';
@@ -538,7 +561,15 @@ async function main() {
   // Fits the images of every result the model gets, not just `read`: MCP tools, browser screenshots and code mode.
   registry.install(createFitImagesExtension(images));
   installRelayTools(registry, cfg);
-  installBrowserTools(registry, { endpoint: cfg.browserCdp });
+  // The sidecar is a sibling container in this pod's PID namespace; when it has been unused for a while the worker
+  // stops it so the kubelet can restart it later with a fresh, smaller footprint. Disabled without a browser or at 0.
+  const browserIdle = cfg.browserCdp && cfg.browserIdleMinutes > 0
+    ? createBrowserIdle({
+      idleMs: cfg.browserIdleMinutes * 60_000,
+      findBrowserPid: () => findSidecarBrowserPid(),
+    })
+    : undefined;
+  installBrowserTools(registry, { endpoint: cfg.browserCdp, touch: browserIdle ? () => browserIdle.touch() : undefined });
   const runtimeExec = installRuntimeTools(registry, cfg);
   // Only offered when the operator configured a machine to work on; the pod stays the default environment.
   const remoteTargets = createRemoteTargets({ targets: cfg.remoteTargets });
@@ -607,11 +638,13 @@ async function main() {
     await harness.commit(async tx => { Object.assign(await tx.doc(Identity), binding); }, context);
   }
   workSessions.attach(harness);
-  const server = httpWorker(turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension), workSessions, cfg.token, mcp);
+  const server = httpWorker(turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension), workSessions, cfg.token, mcp,
+    browserIdle ? () => browserIdle.touch() : undefined);
   mcp.watch();
   const shutdown = () => {
     const deadline = setTimeout(() => process.exit(1), 5_000);
     deadline.unref();
+    browserIdle?.stop();
     server.close(async () => {
       try {
         await mcp.stop();

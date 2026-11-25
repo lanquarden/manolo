@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { installBrowserTools } from '../src/browser-tools.mjs';
 
 const workerPath = fileURLToPath(new URL('../src/worker.mjs', import.meta.url));
 const chromium = process.env.CHROMIUM_BIN ?? 'chromium';
@@ -227,4 +228,31 @@ test('a browser endpoint outside the pod’s loopback stops the worker at startu
   await closed;
   assert.notEqual(child.exitCode, 0);
   assert.match(stderr, /MANOLO_BROWSER_CDP must be a loopback http origin/);
+});
+
+test('every browser tool reports activity before it talks to the sidecar', async () => {
+  // A stub registry captures the extension without a model, so the touch wiring is proven without a Chromium.
+  const install = touch => {
+    let installed;
+    installBrowserTools({ install: extension => { installed = extension; } }, { endpoint: 'http://127.0.0.1:1', touch });
+    return installed.tools;
+  };
+  const argumentsFor = {
+    browser_open: { url: 'http://127.0.0.1:1/' }, browser_snapshot: {}, browser_click: { ref: 'e1' },
+    browser_type: { text: 'hello' }, browser_key: { key: 'Enter' }, browser_screenshot: {}, browser_tabs: { action: 'list' },
+  };
+  let touches = 0;
+  const tools = install(() => { touches += 1; });
+  assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(argumentsFor).sort());
+  for (const tool of tools) {
+    // Nothing listens on the endpoint, so the call fails after the activity was recorded — the point of the test.
+    await assert.rejects(tool.execute(argumentsFor[tool.name], {}, {}), /browser is not running|not a snapshot ref/);
+  }
+  assert.equal(touches, tools.length);
+
+  // Bookkeeping is never part of the result: a broken touch callback must not turn into a tool failure of its own.
+  let broken = 0;
+  const open = install(() => { broken += 1; throw new Error('idle watcher broke'); }).find(tool => tool.name === 'browser_open');
+  await assert.rejects(open.execute(argumentsFor.browser_open, {}, {}), /browser is not running/);
+  assert.equal(broken, 1);
 });
