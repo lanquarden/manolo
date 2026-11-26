@@ -286,6 +286,12 @@ spec:
             {{- else }}
             - {name: MANOLO_PROVIDER, value: {{ required (printf "%s provider required outside fixture mode" $w.agentId) $w.provider | quote }}}
             - {name: MANOLO_MODEL, value: {{ required (printf "%s model required outside fixture mode" $w.agentId) $w.model | quote }}}
+            {{- if eq $w.provider "model-proxy" }}
+            - {name: MANOLO_MODEL_PROXY_URL, value: {{ required (printf "%s modelProxyUrl required for model-proxy" $w.agentId) $w.modelProxyUrl | quote }}}
+            {{- end }}
+            {{- with $w.rebindFrom }}
+            - {name: MANOLO_REBIND_FROM, value: {{ . | quote }}}
+            {{- end }}
             {{- with $w.thinkingLevel }}
             - {name: MANOLO_THINKING_LEVEL, value: {{ . | quote }}}
             {{- end }}

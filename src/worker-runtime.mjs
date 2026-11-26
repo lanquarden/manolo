@@ -71,6 +71,7 @@ export async function createWorkerModels(cfg, env) {
   }
   const providerId = env.MANOLO_PROVIDER;
   const modelId = env.MANOLO_MODEL;
+  if (providerId === 'model-proxy') return createProxyModels(modelId, env);
   const [factory, keyName] = PROVIDERS.get(providerId) ?? [];
   const apiKey = factory && env[keyName]?.trim();
   if (!apiKey || !modelId) throw new Error('Provider configuration missing');
@@ -88,6 +89,39 @@ export async function createWorkerModels(cfg, env) {
     throw new Error('Unsupported thinking level');
   }
   return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey, credentialEnv: keyName };
+}
+
+async function createProxyModels(modelId, env) {
+  const credentialEnv = 'MANOLO_MODEL_PROXY_KEY';
+  const apiKey = env[credentialEnv]?.trim();
+  const url = URL.parse(env.MANOLO_MODEL_PROXY_URL ?? '');
+  if (!apiKey || !modelId || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(modelId) || !url ||
+      !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash ||
+      url.pathname !== '/v1') throw new Error('Invalid model proxy configuration');
+  const { openrouterProvider } = await import('@earendil-works/pi-ai/providers/openrouter');
+  const transport = openrouterProvider();
+  const provider = 'model-proxy';
+  const thinkingLevel = env.MANOLO_THINKING_LEVEL;
+  const catalogModel = {
+    id: modelId, name: modelId, provider, baseUrl: url.href, api: 'openai-completions',
+    input: ['text'], reasoning: Boolean(thinkingLevel), contextWindow: 128_000, maxTokens: 8192,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: Boolean(thinkingLevel) },
+  };
+  if (thinkingLevel && !getSupportedThinkingLevels(catalogModel).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
+  // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.
+  const optionsFor = opts => ({ ...opts, headers: { ...opts?.headers, 'user-agent': 'Manolo/1.0',
+    ...(opts?.sessionId && { 'x-opencode-session': opts.sessionId }) } });
+  const models = createModels();
+  models.setProvider({
+    id: provider, name: 'Model proxy', baseUrl: url.href,
+    auth: { apiKey: { name: 'Model proxy key', resolve: async () => ({ auth: { apiKey }, source: credentialEnv }) } },
+    getModels: () => [catalogModel],
+    stream: (model, transcript, options) => transport.stream(model, transcript, optionsFor(options)),
+    streamSimple: (model, transcript, options) => transport.streamSimple(model, transcript, optionsFor(options)),
+  });
+  if ((await models.checkAuth(provider))?.type !== 'api_key') throw new Error('Model proxy key unavailable');
+  return { models, model: { provider, modelId }, thinkingLevel, apiKey, credentialEnv };
 }
 
 function schema(properties) {

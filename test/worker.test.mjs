@@ -718,6 +718,67 @@ test('an invalid or credential bash environment name fails startup', { timeout: 
   assert.match(worker.logs(), /MANOLO_BASH_TIMEOUT_SECONDS/);
 });
 
+test('an idle fixture worker can rebind to a proxy without losing history', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const fixture = launch(t, dir);
+  const first = await fixture.start();
+  await put(first, 'before', 'chat', 'Before migration');
+  assert.deepEqual(await settled(first, 'before'), expected('Before migration'));
+  await fixture.stop();
+
+  const requests = [];
+  const proxy = createServer(async (req, res) => {
+    let data = '';
+    for await (const chunk of req) data += chunk;
+    requests.push({ url: req.url, headers: req.headers, body: JSON.parse(data) });
+    const chunk = (delta, finish_reason) => `data: ${JSON.stringify({ id: 'chunk', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(chunk({ role: 'assistant', content: 'Proxy reply' }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+  const settings = {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'opencode-go/deepseek-v4.1-flash',
+    MANOLO_MODEL_PROXY_URL: `http://127.0.0.1:${proxy.address().port}/v1`, MANOLO_MODEL_PROXY_KEY: 'synthetic-proxy-key',
+  };
+  const refused = launch(t, dir, settings);
+  assert.notEqual((await refused.closed)[0], 0);
+  assert.match(refused.logs(), /belongs to another agent or model/);
+  const worker = launch(t, dir, { ...settings, MANOLO_REBIND_FROM: 'manolo-fixture/fixture' });
+  const url = await worker.start();
+  assert.deepEqual(await settled(url, 'before'), expected('Before migration'));
+  for (const id of ['after', 'later']) {
+    await put(url, id, 'chat', id);
+    assert.deepEqual(await settled(url, id), { status: 'done', text: 'Proxy reply' });
+  }
+  assert.equal(requests[0].url, '/v1/chat/completions');
+  assert.equal(requests[0].headers.authorization, 'Bearer synthetic-proxy-key');
+  assert.equal(requests[0].headers['user-agent'], 'Manolo/1.0');
+  assert.ok(requests[0].headers['x-opencode-session']);
+  assert.equal(requests[0].headers['x-opencode-session'], requests[1].headers['x-opencode-session']);
+  assert.equal(requests[0].body.model, 'opencode-go/deepseek-v4.1-flash');
+  assert.match(JSON.stringify(requests[0].body.messages), /Before migration/);
+  await worker.stop();
+  await launch(t, dir, settings).start();
+});
+
+test('a model rebind refuses to resume unfinished work under the new provider', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const fixture = launch(t, dir, { MANOLO_FIXTURE_DELAY_MS: '10000' });
+  const first = await fixture.start();
+  expectPending(await put(first, 'pending', 'chat', 'In progress'));
+  await waitForRequest(dir);
+  await fixture.stop('SIGKILL');
+  const worker = launch(t, dir, {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'opencode-go/deepseek-v4.1-flash',
+    MANOLO_MODEL_PROXY_URL: 'http://127.0.0.1:9/v1', MANOLO_MODEL_PROXY_KEY: 'synthetic-proxy-key',
+    MANOLO_REBIND_FROM: 'manolo-fixture/fixture',
+  });
+  assert.notEqual((await worker.closed)[0], 0);
+  assert.match(worker.logs(), /unfinished turns or background work/);
+});
+
 test('live-mode startup validates the pinned provider catalog and explicit keys without making a request', { timeout: 15_000 }, async t => {
   const dir = await dataDir(t);
   const opts = { MANOLO_MODE: 'live', MANOLO_PROVIDER: 'openai', MANOLO_MODEL: 'gpt-6-sol' };
