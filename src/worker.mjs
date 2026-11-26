@@ -331,7 +331,7 @@ function turnService(harness, model, thinkingLevel, instructions, redact, runtim
           return session.conversationId;
         }
         const { id: conversationId } = await tx.createConversation({ ownership: { kind: 'ownerless' } });
-        await configure(tx, conversationId, { model, maxTurns: 8, instructions: baseInstructions, ...thinking,
+        await configure(tx, conversationId, { model, instructions: baseInstructions, ...thinking,
           ...(isRoom && { tools: [] }),
         });
         Object.assign(session, { conversationId, isRoom });
@@ -366,6 +366,7 @@ function turnService(harness, model, thinkingLevel, instructions, redact, runtim
           : '';
         await configure(tx, conversationId, {
           model,
+          maxTurns: null, // Clear the persisted cap on conversations created by older workers.
           instructions: baseInstructions + runtimeInstructions + (workSessions ? WORK_PARENT_RULES : ''),
           ...thinking, extensions: workSessions ? { add: [workExtension] } : null,
           ...(isRoom ? { tools: [] } : runtimeExec ? { tools: targets.length ? null : { remove: [runtimeExec] } } : {}),
