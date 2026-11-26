@@ -104,7 +104,7 @@ export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns
         // A work session inherits the pod's installed tools, except this orchestration extension, which the
         // harness already keeps out of the host default selection. Paired-runtime calls stay refused because
         // RuntimeAccess is never written for a child conversation. An operator cuts this back with tools: { remove }.
-        maxTurns: 8, compaction: { enabled: false },
+        compaction: { enabled: false },
       });
       const scope = await tx.doc(Scope, sessionId, null);
       scope.ids = [id, ...(scope.ids ?? []).slice(0, MAX_RECENT - 1)];

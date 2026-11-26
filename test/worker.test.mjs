@@ -705,6 +705,38 @@ test('a running live turn streams its reasoning and text', { timeout: 20_000 }, 
   assert.deepEqual(await settled(url, 'stream'), { status: 'done', text: 'live-text-marker' });
 });
 
+test('a worker answers after more than eight tool rounds', { timeout: 15_000 }, async t => {
+  const dir = await dataDir(t);
+  const preload = join(dir, 'many-rounds.mjs');
+  await writeFile(preload, `globalThis.fetch = async (input, init) => {
+    const req = new Request(input, init);
+    if (req.url !== 'https://opencode.ai/inference/go/openai/v1/chat/completions') throw new Error('Unexpected outbound destination');
+    const body = await req.json();
+    const count = body.messages.filter(message => message.role === 'tool').length;
+    const chunk = (delta, finish_reason = null) => 'data: ' + JSON.stringify({
+      id: 'round-' + count, object: 'chat.completion.chunk', created: 1, model: body.model,
+      choices: [{ index: 0, delta, finish_reason }],
+    }) + '\\n\\n';
+    const delta = count < 9
+      ? { tool_calls: [{ index: 0, id: 'call_' + count, type: 'function', function: {
+        name: 'bash', arguments: JSON.stringify({ command: 'printf round-' + count }),
+      } }] }
+      : { content: 'Finished after ' + count + ' tool rounds' };
+    return new Response(chunk({ role: 'assistant', ...delta }) + chunk({}, count < 9 ? 'tool_calls' : 'stop') + 'data: [DONE]\\n\\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };`);
+  const url = await launch(t, dir, {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'opencode-go', MANOLO_MODEL: 'deepseek-v4.1-flash',
+    OPENCODE_API_KEY: 'fake-opencode-key', NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+  }).start();
+  expectPending(await put(url, 'many-rounds', 'chat', 'Check the tool-round limit'));
+  const result = await settled(url, 'many-rounds');
+  assert.equal(result.status, 'done');
+  assert.equal(result.text, 'Finished after 9 tool rounds');
+  assert.equal(result.tools.filter(tool => tool.name === 'bash' && tool.status === 'ok').length, 9);
+});
+
 test('an invalid or credential bash environment name fails startup', { timeout: 15_000 }, async t => {
   for (const value of ['not-a-name', 'MANOLO_AGENT_TOKEN']) {
     const dir = await dataDir(t);
