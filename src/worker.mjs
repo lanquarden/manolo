@@ -10,15 +10,16 @@ import { createNodePhotonImages } from '@earendil-works/pi-durable/images/node';
 import { SqliteStorage } from '@earendil-works/pi-durable/storage/sqlite';
 import { openNodeSqliteDatabase } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { createFitImagesExtension } from '@earendil-works/pi-durable/images/fit';
-import { createWorkerModels, DEFAULT_BASH_TIMEOUT_SECONDS, installCodingTools, installRelayTools, installRuntimeTools, RuntimeAccess } from './worker-runtime.mjs';
+import { createWorkerModels, DEFAULT_BASH_TIMEOUT_SECONDS, installCodingTools, installRelayTools, installRuntimeTools, resolveProfiles, RuntimeAccess } from './worker-runtime.mjs';
 import { installBrowserTools } from './browser-tools.mjs';
 import { createMcp } from './mcp.mjs';
 import { RemoteEnvError, WorkspaceTarget, createRemoteTargets, installWorkspaceTools, parseRemoteEnvs } from './remote-env.mjs';
 import { McpConfigError } from './mcp-config.mjs';
 import { RUNTIME_NAME } from './runtime-relay.mjs';
 import { installWorkSessions, WORK_PARENT_RULES } from './work-sessions.mjs';
-import { installTasks, TASK_PARENT_RULES } from './task-tools.mjs';
+import { installTasks, TASK_PARENT_RULES, TaskWorkspace } from './task-tools.mjs';
 import { loadWorkBlueprints } from './work-blueprints.mjs';
+import { openTaskGit } from './task-git.mjs';
 import { discoverSkills, readCapabilities, skillSection } from './capabilities.mjs';
 import { normalizeRoomInstructions } from './telegram-room.mjs';
 
@@ -29,6 +30,7 @@ const TASK_PATH = /^\/v1\/tasks\/([0-9a-f]{32})(?:\/(executions|resume|cancel|tr
 const MAX_TASK_NOTICES = 8;
 const MAX_TASK_NOTICE = 500;
 const MAX_PRIVATE_BODY_BYTES = 32 * 1024;
+const MAX_TASK_BODY_BYTES = 64 * 1024;
 const MAX_BODY_BYTES = 38 * 1024; // Includes JSON-escaped text and room instructions.
 const MAX_INSTRUCTION_UNITS = 4000;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -525,7 +527,7 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
           res.setHeader('allow', 'POST');
           throw new RequestError(405, 'method not allowed');
         }
-        const body = await readJsonBody(req);
+        const body = await readJsonBody(req, MAX_TASK_BODY_BYTES);
         const executionId = body?.executionId;
         if (typeof executionId !== 'string' || !/^[0-9a-f]{32}$/.test(executionId)) throw new RequestError(400, 'invalid execution');
         try {
@@ -535,8 +537,11 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
                 typeof assignment.title !== 'string' || assignment.title.length > 120 ||
                 typeof assignment.input !== 'string' || assignment.input.length > 4000 ||
                 (assignment.context !== undefined && (typeof assignment.context !== 'string' || assignment.context.length > 4000)) ||
+                (assignment.profile !== undefined && (typeof assignment.profile !== 'object' || assignment.profile === null)) ||
                 (assignment.blueprint !== undefined && (!assignment.blueprint || typeof assignment.blueprint !== 'object' ||
-                  typeof assignment.blueprint.id !== 'string' || typeof assignment.blueprint.revision !== 'string'))) {
+                  typeof assignment.blueprint.id !== 'string' || typeof assignment.blueprint.revision !== 'string' ||
+                  (assignment.blueprint.snapshot !== undefined && (typeof assignment.blueprint.snapshot !== 'object' ||
+                    assignment.blueprint.snapshot === null))))) {
               throw new RequestError(400, 'invalid task');
             }
             return reply(res, 200, await tasks.dispatch({ taskId, executionId, task: assignment }));
@@ -590,14 +595,22 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
 
 async function main() {
   const cfg = loadConfig(process.env);
-  let blueprints;
+  let bundles;
   try {
-    blueprints = loadWorkBlueprints(process.env.MANOLO_WORK_BLUEPRINTS);
+    bundles = loadWorkBlueprints(process.env.MANOLO_WORK_BLUEPRINTS, { dir: process.env.MANOLO_BLUEPRINTS_DIR });
   } catch (error) { throw new ConfigurationError(error.message); }
-  const runtime = await createWorkerModels(cfg, process.env).catch(() => {
+  const { blueprints, profiles: declaredProfiles } = bundles;
+  const runtime = await createWorkerModels(cfg, process.env,
+    [...declaredProfiles.values()].map(profile => profile.model)).catch(() => {
     throw new ConfigurationError('Invalid MANOLO_PROVIDER, MANOLO_MODEL, MANOLO_THINKING_LEVEL, or missing upstream API key.');
   });
   const { models, model, thinkingLevel, apiKey, credentialEnv } = runtime;
+  // A declared profile this worker cannot reach is dropped before anything can select it. A Task pinned to one is
+  // refused at dispatch with an actionable reason rather than running on a substituted model.
+  const profiles = resolveProfiles({ models, model, thinkingLevel, profiles: declaredProfiles });
+  // A Task Blueprint whose profile this worker cannot resolve is not discoverable at all.
+  const taskBlueprints = new Map([...blueprints].filter(([, blueprint]) =>
+    blueprint.role !== 'conversation' && (!blueprint.profile || profiles.has(blueprint.profile.id))));
   const registry = createRegistry();
   // The shell never receives a credential, whatever the operator lists.
   for (const name of [credentialEnv, 'MANOLO_AGENT_TOKEN']) {
@@ -627,13 +640,14 @@ async function main() {
   }
   const redact = redactSecrets([cfg.token, apiKey, ...mcp.secrets].filter(Boolean));
   const workSessions = installWorkSessions(registry, {
-    cfg, model, thinkingLevel, Turns, redact, blueprints,
+    cfg, model, thinkingLevel, Turns, redact, blueprints: taskBlueprints,
     // Report what a child actually receives: every installed tool except this orchestration extension.
     childTools: () => registry.snapshot().installed()
       .filter(extension => extension.name !== workSessions.extension.name && !extension.name.startsWith('manolo-task-'))
       .flatMap(extension => (extension.tools ?? []).map(tool => tool.name)),
   });
-  const tasks = installTasks(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints });
+  const taskGit = openTaskGit({ dataDir: cfg.dataDir });
+  const tasks = installTasks(registry, { cfg, model, thinkingLevel, models, profiles, Turns, redact, blueprints, taskGit });
   // The task extensions are opt-in per conversation like the work-session extension: the default selection omits them.
   const orchestrationNames = new Set([workSessions.extension.name, tasks.orchestrator.name, tasks.worker.name]);
   process.umask(0o077);
@@ -670,6 +684,10 @@ async function main() {
     models, registry, identity: { attribution: { name: 'Manolo' } },
     // A conversation that chose a workspace target runs its file and shell tools there; everything else stays in the pod.
     env: async (target, context) => {
+      const taskWorkspace = await target.read.snapshot(TaskWorkspace, target.conversationId, context).catch(() => undefined);
+      if (typeof taskWorkspace?.path === 'string' && taskWorkspace.path.startsWith('/')) {
+        return new NodeExecutionEnv({ cwd: taskWorkspace.path });
+      }
       const chosen = await target.read.snapshot(WorkspaceTarget, target.conversationId, context).catch(() => undefined);
       if (typeof chosen?.name === 'string' && remoteTargets.has(chosen.name)) {
         return remoteTargets.envFor(chosen.name, target.conversationId);
@@ -703,7 +721,7 @@ async function main() {
   const server = httpWorker(
     turnService(harness, model, thinkingLevel, cfg.instructions, redact, runtimeExec, workSessions.extension, tasks.orchestrator, readSkillSection),
     workSessions, tasks, cfg.token, mcp,
-    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints, workSessionRules: WORK_PARENT_RULES, redact: capabilityRedact }),
+    () => readCapabilities({ workspaceDir: cfg.workspaceDir, registry, cfg, blueprints: taskBlueprints, profiles, workSessionRules: WORK_PARENT_RULES, redact: capabilityRedact }),
   );
   mcp.watch();
   const shutdown = () => {

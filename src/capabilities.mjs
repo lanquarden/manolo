@@ -287,7 +287,7 @@ const byteLength = value => Buffer.byteLength(JSON.stringify(value));
 // Keep the whole response under the stated cap without dropping the one field the owner explicitly reviews. Lists lose
 // their tail entries first; only if the agent text alone is too large does it get clipped further.
 function fitBudget(result) {
-  const sections = ['tools', 'skills', 'agentsFiles', 'blueprints'];
+  const sections = ['tools', 'skills', 'agentsFiles', 'blueprints', 'profiles'];
   let current = result;
   // Shrink the lists first: they are the bulk, and the two agent fields are what the owner came to read.
   while (byteLength(current) > MAX_JSON_BYTES) {
@@ -321,7 +321,7 @@ function fitBudget(result) {
   return current;
 }
 
-export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, workSessionRules, redact = text => text }) {
+export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, profiles, workSessionRules, redact = text => text }) {
   const workspace = resolve(workspaceDir);
   const skills = await discoverSkills(workspace);
   const safe = text => redact(String(text ?? ''));
@@ -332,7 +332,15 @@ export async function readCapabilities({ workspaceDir, registry, cfg, blueprints
     blueprints: [...(blueprints?.values?.() ?? [])].slice(0, 12).flatMap(blueprint => {
       const id = clip(blueprint?.id, 64);
       if (!id) return [];
-      return [{ id, description: clip(safe(blueprint?.description), MAX_SUMMARY) }];
+      return [{ id, description: clip(safe(blueprint?.description), MAX_SUMMARY),
+        ...(blueprint?.profile && { profile: clip(blueprint.profile.id, 64) }) }];
+    }),
+    profiles: [...(profiles?.values?.() ?? [])].slice(0, 16).flatMap(profile => {
+      const id = clip(profile?.id, 64);
+      if (!id) return [];
+      return [{ id, description: clip(safe(profile?.description), MAX_SUMMARY),
+        model: clip(`${profile.model.provider}/${profile.model.modelId}`, 128),
+        ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }) }];
     }),
     agentsFiles: await findAgentsFiles(workspace),
     // The panel shows a routing summary; the full description stays in the prompt section, where it belongs. Skill text

@@ -1,7 +1,8 @@
 # Task orchestration
 
-**Status:** the first durable slice ships in this checkout; the rest of the agreed direction is still design. See
-[What ships](#what-ships) and [Deferred](#deferred). The [checked models](#checked-models) describe the agreed
+**Status:** the durable Task slice ships with operator-owned Blueprint bundles, named model profiles, the explicit
+`finish` gate, and repository Task worktrees. The rest of the agreed direction is still design. See
+[What ships](#what-ships), [Blueprints and workspaces](blueprints.md), and [Deferred](#deferred). The [checked models](#checked-models) describe the agreed
 lifecycle; they are not a checked distributed implementation.
 
 See [Task tools](tools.md) for the Orchestrator and worker tool contract as implemented.
@@ -46,6 +47,8 @@ One durable path, end to end, for flagged web conversations. Everything below is
 | Scheduler loop and dispatch/resume delivery | [`src/relay.mjs`](../../src/relay.mjs#L1065) |
 | Internal worker API for executions, resumes, cancels, transcripts | [`src/worker.mjs`](../../src/worker.mjs#L513) |
 | Web API for tasks, task items, cancellation and notices | [`src/relay.mjs`](../../src/relay.mjs#L697) |
+| Blueprint bundles, snapshot pinning, profiles, finish gate, Task worktrees | [`src/work-blueprints.mjs`](../../src/work-blueprints.mjs), [`src/task-tools.mjs`](../../src/task-tools.mjs), [`src/task-git.mjs`](../../src/task-git.mjs), [design](blueprints.md) |
+| GitHub operating policy and structured handoff validation | [`src/github-policy.mjs`](../../src/github-policy.mjs), [policy](github-policy.md) |
 | Tasks view: active tree, history filters, detail, chat notices | [`src/web/app.js`](../../src/web/app.js#L1315), [`src/web/index.html`](../../src/web/index.html) |
 
 ### Flow, as implemented
@@ -58,8 +61,10 @@ One durable path, end to end, for flagged web conversations. Everything below is
    execution ID in the same transaction. It then calls the worker. A retry, including one after a relay restart, keeps
    both IDs, so the worker admits the same child submission rather than a second one; an acknowledged dispatch is never
    re-driven.
-3. The worker creates one ownerless child conversation, applies the pinned blueprint (refusing a revision it no longer
-   has), and admits the task input. The child has only `report_progress` and `post_inbox` on top of its normal pod tools.
+3. The worker creates one ownerless child conversation, applies the pinned Blueprint snapshot (explicit text, exact
+   tools, profile, repository; refusing an unavailable snapshot or tool), prepares the Task's own worktree or scratch
+   directory, and admits the task input. The child gets the manifest's exact tools with the lifecycle tools
+   `report_progress`, `post_inbox`, and `finish`; nothing is inherited from the parent.
 4. `post_inbox` writes the item and parks the Task in one relay transaction: the Task becomes `waiting`, its claim is
    released, and a durable notice is recorded. The tool then parks on a pi-durable signal and holds no process. The
    worker's yield guard refuses every other tool call in that execution, and the relay refuses progress, another item,
@@ -67,8 +72,8 @@ One durable path, end to end, for flagged web conversations. Everything below is
 5. A web Inbox response is the only transition out of `waiting`. One SQLite transaction closes the item, stores the
    response, and queues the **same Task** with `execution_kind='resume'`; an identical retry returns the recorded
    receipt, a conflicting one is refused, and no chat turn is inserted. The scheduler claims it and delivers the
-   response to the parked call by execution ID. The run continues in the same child conversation, and its final message
-   settles the Task.
+   response to the parked call by execution ID. The run continues in the same child conversation, and an accepted
+   `finish` followed by the end of the run settles the Task.
 6. If the parked call is definitively gone (the worker reports `no_parked_call` or `unknown_execution`), the relay does
    **not** launch a replacement child. The Task ends `failed` with a clear reason and the owner's response stays recorded
    on the item, so nothing is silently re-run. A delivery that is only ambiguous — a timeout, a 5xx, a missing or
@@ -127,6 +132,10 @@ Not implemented in this slice, and not implied by the UI:
   handling. There is deliberately no replacement child for Inbox input: a definitively lost execution fails the Task.
 - Declined-item policy beyond "the child is told the item was declined and continues".
 - Migrating legacy work sessions into Tasks.
+- Automated pull-request creation or merge/deployment actions. A review handoff names the exact Task branch commit; a PR
+  is created only when requested, and this slice does not perform or verify that live GitHub write.
+- Security isolation between Tasks. A worktree and a scratch directory are working arrangements; `bash` is not a
+  sandbox and can use the pod's binaries and credentials.
 
 ## Checked models
 

@@ -16,7 +16,7 @@ import { admittedRoom, roomBotUsername } from './telegram-room.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
 import { createWebSessions } from './web-session.mjs';
-import { BLUEPRINT_ID } from './work-blueprints.mjs';
+import { BLUEPRINT_ID, verifyBlueprintSnapshot, verifyProfileSnapshot } from './work-blueprints.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
@@ -45,6 +45,11 @@ for (const name of workSessionAgents) {
   if (name === runtimeAgent) throw new Error('A runtime agent cannot host work sessions');
 }
 const workSessionsEnabled = agentName => workSessionAgents.has(agentName);
+// Required by default. `legacy` exists only for a mixed-version rollout: an old worker that never calls finish can
+// still settle new Tasks while the worker is upgraded. New workers keep their own corrective/finish behavior either way.
+const taskFinishMode = process.env.MANOLO_TASK_FINISH ?? 'required';
+if (taskFinishMode !== 'required' && taskFinishMode !== 'legacy') throw new Error('MANOLO_TASK_FINISH must be required or legacy');
+const taskFinishRequired = taskFinishMode === 'required';
 const rooms = [...config.rooms.values()];
 const telegramMode = process.env.MANOLO_TELEGRAM_MODE;
 const useXmpp = telegramMode === 'xmpp';
@@ -828,7 +833,7 @@ async function internal(req, res, path) {
     return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
       name => config.owners.get(name)?.agent === agent));
   }
-  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|heartbeat))?)?$/.exec(path);
+  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat))?)?$/.exec(path);
   if (taskRoute) {
     if (!workSessionAgents.size) throw fail(404);
     if (!workSessionsEnabled(agent)) throw fail(403);
@@ -839,14 +844,26 @@ async function internal(req, res, path) {
       return key('task-operation', agent, idem[0]);
     };
     if (req.method === 'POST' && taskId === undefined) {
-      const body = await readJson(req);
+      // A pinned Blueprint snapshot travels with the Task. The extra budget is for explicit Markdown text, never files.
+      const body = await readJson(req, 64 * 1024);
+      let blueprintSnapshot;
+      let profile;
+      try {
+        if (body && Object.hasOwn(body, 'blueprint') && body.blueprint && Object.hasOwn(body.blueprint, 'snapshot')) {
+          blueprintSnapshot = verifyBlueprintSnapshot(body.blueprint.snapshot);
+        }
+        if (body && Object.hasOwn(body, 'profile')) profile = verifyProfileSnapshot(body.profile);
+      } catch {
+        throw fail(400);
+      }
       if (!body || typeof body !== 'object' || Array.isArray(body) ||
-          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'notBefore'].includes(field)) ||
+          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'profile', 'notBefore'].includes(field)) ||
           typeof body.turnId !== 'string' || !isTaskTitle(body.title) || !isTaskInput(body.task) ||
           (Object.hasOwn(body, 'blueprint') && (!body.blueprint || typeof body.blueprint !== 'object' ||
-            !ownFields(body.blueprint, 'id', 'revision') || typeof body.blueprint.id !== 'string' ||
+            !ownFields(body.blueprint, 'id', 'revision', ...(blueprintSnapshot ? ['snapshot'] : [])) || typeof body.blueprint.id !== 'string' ||
             !BLUEPRINT_ID.test(body.blueprint.id) || typeof body.blueprint.revision !== 'string' ||
-            !/^[0-9a-f]{64}$/.test(body.blueprint.revision))) ||
+            !/^[0-9a-f]{64}$/.test(body.blueprint.revision) ||
+            (blueprintSnapshot && (blueprintSnapshot.id !== body.blueprint.id || blueprintSnapshot.revision !== body.blueprint.revision)))) ||
           (Object.hasOwn(body, 'notBefore') && (!Number.isSafeInteger(body.notBefore) || body.notBefore < 0))) {
         throw fail(400);
       }
@@ -854,7 +871,7 @@ async function internal(req, res, path) {
       const { turn, scope } = taskTurnScope(body.turnId, agent);
       const task = store.tasks.create({
         owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
-        blueprint: body.blueprint, notBefore: body.notBefore ?? 0, key: operationKey,
+        blueprint: body.blueprint, blueprintSnapshot, profile, finishRequired: taskFinishRequired, notBefore: body.notBefore ?? 0, key: operationKey,
       });
       return respond(res, 200, task);
     }
@@ -903,6 +920,19 @@ async function internal(req, res, path) {
       if (!ownFields(body, 'executionId', 'note') || typeof body.executionId !== 'string' ||
           !TASK_ID.test(body.executionId) || !isTaskNote(body.note)) throw fail(400);
       return respond(res, 200, store.tasks.progress({ taskId, executionId: body.executionId, note: body.note, key: operationKey }));
+    }
+    if (req.method === 'POST' && action === 'finish') {
+      const operationKey = idempotencyKey();
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId', 'summary') && !ownFields(body, 'executionId', 'summary', 'evidence')) throw fail(400);
+      if (typeof body.executionId !== 'string' || !TASK_ID.test(body.executionId) || typeof body.summary !== 'string' ||
+          body.summary.length > 2500 ||
+          (body.evidence !== undefined && (typeof body.evidence !== 'object' || body.evidence === null ||
+            Object.keys(body.evidence).some(field => !['commit', 'branch', 'handoff'].includes(field)) ||
+            Object.values(body.evidence).some(value => typeof value !== 'string' || value.length > 2048)))) throw fail(400);
+      return respond(res, 200, store.tasks.acceptFinish({
+        taskId, executionId: body.executionId, summary: body.summary, evidence: body.evidence, key: operationKey,
+      }));
     }
     if (req.method === 'POST' && action === 'settle') {
       const operationKey = idempotencyKey();
@@ -1089,8 +1119,14 @@ const DEFINITIVE_START = new Map([
   ['unknown_blueprint', 'The pinned blueprint is no longer configured for this worker.'],
   ['another_execution_current', 'The worker already has a different execution for this Task.'],
   ['invalid_task', 'The worker refused the Task assignment as invalid.'],
+  ['invalid_blueprint', 'The pinned Blueprint snapshot is invalid.'],
+  ['profile_unavailable', 'The pinned model profile is not available on the worker.'],
+  ['unknown_tool', 'The pinned Blueprint names a tool the worker does not have.'],
+  ['invalid_repository', 'The pinned repository configuration is invalid.'],
+  ['worktree_missing', 'The Task worktree is missing or cannot be recovered automatically.'],
+  ['git_failed', 'The worker could not prepare the Task worktree.'],
 ]);
-const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
+const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call', 'worktree_missing']);
 // A start is acknowledged only by a parsed worker reply naming a state a worker reports for an admitted execution. A 200
 // with an empty or unfamiliar body does not prove the child was admitted, so the dispatch stays owed.
 const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled']);
@@ -1137,7 +1173,9 @@ async function runTask(task) {
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
       store.tasks.resumeUnavailable({
         taskId: task.id, executionId, itemId: item.id,
-        reason: 'The execution that asked for your input is no longer available. Your response is saved in the Task.',
+        reason: result.body.reason === 'worktree_missing'
+          ? 'The Task worktree is missing; its work cannot be recovered automatically. Your response is saved in the Task.'
+          : 'The execution that asked for your input is no longer available. Your response is saved in the Task.',
       });
       return;
     }
@@ -1153,7 +1191,13 @@ async function runTask(task) {
         task: {
           title: task.title, input: task.input,
           ...(task.context && { context: task.context }),
-          ...(task.blueprint_id && { blueprint: { id: task.blueprint_id, revision: task.blueprint_revision } }),
+          ...(task.blueprint_id && {
+            blueprint: {
+              id: task.blueprint_id, revision: task.blueprint_revision,
+              ...(task.blueprint_snapshot && { snapshot: JSON.parse(task.blueprint_snapshot) }),
+            },
+          }),
+          ...(task.profile_snapshot && { profile: JSON.parse(task.profile_snapshot) }),
         },
       },
     });

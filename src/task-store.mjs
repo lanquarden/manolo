@@ -43,6 +43,7 @@ export function taskView(row, now = Date.now()) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...(row.blueprint_id && { blueprint: { id: row.blueprint_id, revision: row.blueprint_revision } }),
+    ...(row.profile_snapshot && { profile: (() => { const profile = JSON.parse(row.profile_snapshot); return { id: profile.id, model: profile.model, ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }) }; })() }),
     originTurnId: row.origin_turn_id,
     ...(row.outcome && { outcome: row.outcome }),
     ...(row.failure && { failure: row.failure }),
@@ -88,7 +89,12 @@ export function openTaskStore(db) {
       input TEXT NOT NULL,
       blueprint_id TEXT,
       blueprint_revision TEXT,
+      blueprint_snapshot TEXT,
+      profile_snapshot TEXT,
       status TEXT NOT NULL CHECK(status IN ('queued','running','waiting','done','failed','cancelled')),
+      finish_required INTEGER NOT NULL DEFAULT 1,
+      finish_accepted_at TEXT,
+      finish_summary TEXT,
       not_before INTEGER NOT NULL DEFAULT 0,
       execution_id TEXT,
       execution_kind TEXT NOT NULL DEFAULT 'start' CHECK(execution_kind IN ('start','resume')),
@@ -156,11 +162,17 @@ export function openTaskStore(db) {
   db.exec('BEGIN IMMEDIATE');
   try {
     for (const [name, definition] of [
+      ['blueprint_snapshot', 'TEXT'],
+      ['profile_snapshot', 'TEXT'],
       ['dispatch_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_attempts', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_next_at', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_confirmed_at', 'TEXT'],
+      // Tasks created before the finish protocol are legacy rows: they may settle from a worker that never calls finish.
+      ['finish_required', 'INTEGER NOT NULL DEFAULT 0'],
+      ['finish_accepted_at', 'TEXT'],
+      ['finish_summary', 'TEXT'],
     ]) {
       if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
@@ -250,7 +262,7 @@ export function openTaskStore(db) {
   return {
     db,
 
-    create({ owner, agent, scope, originTurnId, title, input, blueprint, notBefore = 0, key, now = Date.now() }) {
+    create({ owner, agent, scope, originTurnId, title, input, blueprint, blueprintSnapshot, profile, finishRequired = true, notBefore = 0, key, now = Date.now() }) {
       return transaction(() => {
         if (key) {
           const stored = operation.get(key);
@@ -261,10 +273,13 @@ export function openTaskStore(db) {
         }
         const id = newId();
         const createdAt = iso(now);
-        db.prepare(`INSERT INTO tasks(id,scope,owner,agent,origin_turn_id,title,input,blueprint_id,blueprint_revision,status,
-          not_before,execution_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?, 'queued', ?, 'start', ?, ?)`)
+        db.prepare(`INSERT INTO tasks(id,scope,owner,agent,origin_turn_id,title,input,blueprint_id,blueprint_revision,
+          blueprint_snapshot,profile_snapshot,status,finish_required,not_before,execution_kind,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?, 'queued', ?, ?, 'start', ?, ?)`)
           .run(id, scope, owner, agent, originTurnId, plain(title, MAX_TITLE), plain(input, MAX_INPUT),
-            blueprint?.id ?? null, blueprint?.revision ?? null, notBefore, createdAt, createdAt);
+            blueprint?.id ?? null, blueprint?.revision ?? null,
+            blueprintSnapshot === undefined ? null : JSON.stringify(blueprintSnapshot),
+            profile === undefined ? null : JSON.stringify(profile), finishRequired ? 1 : 0, notBefore, createdAt, createdAt);
         const view = taskView(row.get(id), now);
         if (key) remember(key, id, 'create', view, now);
         return view;
@@ -426,6 +441,22 @@ export function openTaskStore(db) {
       return item.get(itemId);
     },
 
+    // The worker's explicit finish, recorded before it reports the outcome. Replaying the same finish returns the same
+    // receipt; a finish from an older or stale execution is refused. Acceptance does not settle the Task: the worker's
+    // final turn still has to end, and only `settle` records the terminal outcome.
+    acceptFinish({ taskId, executionId, summary, evidence, key, now = Date.now() }) {
+      return transaction(() => {
+        const previous = receipt(key, taskId, 'finish');
+        if (previous) return previous;
+        const task = fenced(taskId, executionId, { allowQueued: true });
+        if (task.status !== 'running') throw bad(409, 'Execution is not running');
+        if (task.finish_accepted_at) throw bad(409, 'Finish was already accepted for this Task');
+        db.prepare('UPDATE tasks SET finish_accepted_at=?, finish_summary=?, updated_at=? WHERE id=?')
+          .run(iso(now), plain(summary, MAX_SUMMARY), iso(now), taskId);
+        return remember(key, taskId, 'finish', { accepted: true, ...(evidence && { evidence }) }, now);
+      });
+    },
+
     settle({ taskId, executionId, outcome, summary, deliveredItems = [], key, now = Date.now() }) {
       return transaction(() => {
         const task = row.get(taskId);
@@ -442,6 +473,11 @@ export function openTaskStore(db) {
         if (previous) return previous;
         const fencedTask = fenced(taskId, executionId, { allowQueued: true });
         if (!['done', 'failed'].includes(outcome)) throw bad(400, 'Invalid outcome');
+        // A new Task may succeed only after the worker's explicit finish was accepted for this execution. Legacy rows
+        // keep the old protocol so a queued or in-flight Task from a previous deployment is not stranded.
+        if (outcome === 'done' && fencedTask.finish_required === 1 && !fencedTask.finish_accepted_at) {
+          throw bad(409, 'Finish is required before a Task can succeed');
+        }
         db.prepare(`UPDATE tasks SET status=?, outcome=?, failure=?, execution_kind='start', resume_item_id=NULL, context=NULL,
           claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
           .run(outcome, outcome === 'done' ? plain(summary, MAX_SUMMARY) : null,

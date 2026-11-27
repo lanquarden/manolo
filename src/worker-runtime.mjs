@@ -18,15 +18,21 @@ const PROVIDERS = new Map(Object.entries({
   xai: ['xaiProvider', 'XAI_API_KEY'],
 }));
 
-export async function createWorkerModels(cfg, env) {
+export async function createWorkerModels(cfg, env, profileModelIds = []) {
   if (cfg.mode === 'fixture') {
     const models = createModels();
-    const faux = fauxProvider({ provider: 'manolo-fixture', models: [{ id: 'fixture', input: ['text'] }] });
+    const modelIds = [...new Set(['fixture', ...profileModelIds])];
+    const faux = fauxProvider({ provider: 'manolo-fixture', models: modelIds.map(id => ({ id, name: id, reasoning: true, input: ['text'] })) });
     const inspectSetup = env.MANOLO_FIXTURE_INSPECT_SETUP === '1';
-    const answer = async ({ messages }, options) => {
+    // A Task child asks for an explicit finish. The fixture follows the same protocol so the durable finish gate is
+    // exercised instead of being bypassed by a bare final turn.
+    const answer = async ({ messages }, options, state, model) => {
       if (cfg.fixtureDelay) await sleep(cfg.fixtureDelay, undefined, { signal: options?.signal });
       const inputs = messages.filter(message => message.role === 'user').map(message => contentText(message.content));
       const text = inputs.at(-1) ?? '';
+      const directive = name => text.split('\n').some(line => line.trim() === name);
+      const systemInstructions = getCurrentSystemMessage(messages)?.sections?.instructions ?? '';
+      const taskChild = systemInstructions.includes('executing one durable Task');
       if (inspectSetup && text === 'fixture:setup') {
         const system = getCurrentSystemMessage(messages);
         // Inspect what arrived at the fixture provider, without echoing prompt text, env or auth options.
@@ -40,6 +46,21 @@ export async function createWorkerModels(cfg, env) {
         return fauxAssistantMessage((system?.sections?.instructions ?? '').slice(0, 4000));
       }
       if (text === 'fixture:history') return fauxAssistantMessage(JSON.stringify(inputs.slice(0, -1)));
+      // A corrective turn after a bare final: finish on the first corrective, so the one-corrective path can be tested.
+      if (taskChild && text.includes('ended this Task')) {
+        if (inputs.some(input => input.includes('fixture:bare-forever'))) return fauxAssistantMessage('Bare final without finish.');
+        if (messages.at(-1)?.role === 'toolResult') return fauxAssistantMessage('Fixture task finished');
+        return fauxAssistantMessage(fauxToolCall('finish', { summary: 'corrective finish' }), { stopReason: 'toolUse' });
+      }
+      if (directive('fixture:bare-forever')) return fauxAssistantMessage('Bare final without finish.');
+      if (directive('fixture:bare')) return fauxAssistantMessage('Bare final without finish.');
+      if (directive('fixture:model')) {
+        return fauxAssistantMessage(JSON.stringify({ model: model?.id ?? null, reasoning: options?.reasoning ?? null }));
+      }
+      if (directive('fixture:finish')) {
+        if (messages.at(-1)?.role === 'toolResult') return fauxAssistantMessage('Fixture task finished');
+        return fauxAssistantMessage(fauxToolCall('finish', { summary: `selected:${model?.id ?? 'none'}:${options?.reasoning ?? 'none'}` }), { stopReason: 'toolUse' });
+      }
       if (text === 'fixture:fail') {
         return fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'Fixture failure' });
       }
@@ -49,8 +70,24 @@ export async function createWorkerModels(cfg, env) {
           const line = text.split('\n').find(line => line.startsWith('fixture-tool:'));
           const { name, args } = JSON.parse(line.slice('fixture-tool:'.length));
           if (cfg.relay || WORK_TOOL_NAMES.includes(name)) {
-            if (messages.at(-1)?.role === 'toolResult') {
-              return fauxAssistantMessage(messages.at(-1).isError ? 'Fixture tool failed' : 'Fixture tool succeeded');
+            // Match the directive's call to its own result rather than trusting the last message's role: after a
+            // restart the harness can append a system message behind the result.
+            const turnStart = messages.findLastIndex(message => message.role === 'user');
+            const turn = messages.slice(turnStart);
+            const lastCall = [...turn].reverse().find(message => message.role === 'assistant' &&
+              (message.content ?? []).some(block => block.type === 'toolCall' && block.name === name));
+            const callId = lastCall?.content.find(block => block.type === 'toolCall' && block.name === name)?.id;
+            const toolResult = callId === undefined ? undefined
+              : [...turn].reverse().find(message => message.role === 'toolResult' && message.toolCallId === callId);
+            if (toolResult) {
+              const result = toolResult.isError ? 'Fixture tool failed' : 'Fixture tool succeeded';
+              // Inside a Task execution, a tool result is followed by the mandatory finish call rather than bare prose.
+              const calledFinish = turn.some(message => message.role === 'assistant' &&
+                (message.content ?? []).some(block => block.type === 'toolCall' && block.name === 'finish'));
+              if (taskChild && !calledFinish) {
+                return fauxAssistantMessage(fauxToolCall('finish', { summary: result }), { stopReason: 'toolUse' });
+              }
+              return fauxAssistantMessage(result);
             }
             return fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
           }
@@ -73,7 +110,7 @@ export async function createWorkerModels(cfg, env) {
   }
   const providerId = env.MANOLO_PROVIDER;
   const modelId = env.MANOLO_MODEL;
-  if (providerId === 'model-proxy') return createProxyModels(modelId, env);
+  if (providerId === 'model-proxy') return createProxyModels(modelId, env, profileModelIds);
   const [factory, keyName] = PROVIDERS.get(providerId) ?? [];
   const apiKey = factory && env[keyName]?.trim();
   if (!apiKey || !modelId) throw new Error('Provider configuration missing');
@@ -93,7 +130,7 @@ export async function createWorkerModels(cfg, env) {
   return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey, credentialEnv: keyName };
 }
 
-async function createProxyModels(modelId, env) {
+async function createProxyModels(modelId, env, profileModelIds = []) {
   const credentialEnv = 'MANOLO_MODEL_PROXY_KEY';
   const apiKey = env[credentialEnv]?.trim();
   const url = URL.parse(env.MANOLO_MODEL_PROXY_URL ?? '');
@@ -104,13 +141,14 @@ async function createProxyModels(modelId, env) {
   const transport = openrouterProvider();
   const provider = 'model-proxy';
   const thinkingLevel = env.MANOLO_THINKING_LEVEL;
-  const catalogModel = {
-    id: modelId, name: modelId, provider, baseUrl: url.href, api: 'openai-completions',
-    input: ['text'], reasoning: Boolean(thinkingLevel), contextWindow: 128_000, maxTokens: 8192,
+  const catalogModelFor = id => ({
+    id, name: id, provider, baseUrl: url.href, api: 'openai-completions',
+    input: ['text'], reasoning: true, contextWindow: 128_000, maxTokens: 8192,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: Boolean(thinkingLevel) },
-  };
-  if (thinkingLevel && !getSupportedThinkingLevels(catalogModel).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
+    compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: true },
+  });
+  const catalogModels = [...new Set([modelId, ...profileModelIds])].map(catalogModelFor);
+  if (thinkingLevel && !getSupportedThinkingLevels(catalogModels[0]).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
   // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.
   const optionsFor = opts => ({ ...opts, headers: { ...opts?.headers, 'user-agent': 'Manolo/1.0',
     ...(opts?.sessionId && { 'x-opencode-session': opts.sessionId }) } });
@@ -118,7 +156,7 @@ async function createProxyModels(modelId, env) {
   models.setProvider({
     id: provider, name: 'Model proxy', baseUrl: url.href,
     auth: { apiKey: { name: 'Model proxy key', resolve: async () => ({ auth: { apiKey }, source: credentialEnv }) } },
-    getModels: () => [catalogModel],
+    getModels: () => catalogModels,
     stream: (model, transcript, options) => transport.stream(model, transcript, optionsFor(options)),
     streamSimple: (model, transcript, options) => transport.streamSimple(model, transcript, optionsFor(options)),
   });
@@ -288,4 +326,24 @@ export function installRelayTools(registry, { relay, agentId, token }) {
         }),
     ],
   }));
+}
+
+// Profiles are named model/reasoning selections resolved against the models this worker can actually reach. A profile
+// that names another provider, an unknown model, or an unsupported thinking level is not resolved, so it is not
+// discoverable and a Task pinned to it is refused rather than silently downgraded.
+export function resolveProfiles({ models, model, thinkingLevel, profiles = new Map() }) {
+  const resolved = new Map();
+  for (const profile of profiles.values()) {
+    const provider = profile.provider ?? model.provider;
+    const catalog = models.getModel(provider, profile.model);
+    if (!catalog) continue;
+    if (profile.thinkingLevel !== undefined && !getSupportedThinkingLevels(catalog).includes(profile.thinkingLevel)) continue;
+    resolved.set(profile.id, {
+      id: profile.id,
+      description: profile.description,
+      model: { provider, modelId: profile.model },
+      thinkingLevel: profile.thinkingLevel,
+    });
+  }
+  return resolved;
 }

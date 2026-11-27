@@ -17,6 +17,13 @@ const addr = port => `http://127.0.0.1:${port}`;
 const basic = (user, pw) => ({ authorization: `Basic ${Buffer.from(`${user}:${pw}`).toString('base64')}` });
 const mutation = { 'x-manolo-request': '1' };
 const fixtureTool = (name, args) => `fixture-tool:${JSON.stringify({ name, args })}`;
+// A modern worker records an explicit finish before its settle. The relay refuses a success that skipped it.
+const finishAndSettle = async (relayCall, taskId, body, key) => {
+  const [finishStatus] = await relayCall(`/v1/tasks/${taskId}/finish`,
+    { executionId: body.executionId, summary: body.summary }, `finish-${taskId}-${body.executionId}`);
+  if (finishStatus !== 200) return [finishStatus, {}];
+  return relayCall(`/v1/tasks/${taskId}/settle`, body, key);
+};
 const request = (url, path, auth, method = 'GET', body, extra = {}) => fetch(`${url}${path}`, {
   method, headers: { ...auth, ...(body && { 'content-type': 'application/json' }), ...extra },
   body: body && JSON.stringify(body), signal: AbortSignal.timeout(5000),
@@ -373,6 +380,10 @@ test('a Task ledger refuses stale executions, keeps retries stable, and fences c
     assert.equal(resumed.execution_kind, 'resume');
     assert.equal(store.resumeDelivered({ taskId: task.id, executionId, itemId: parked.itemId }), true);
     assert.equal(store.inboxItem(parked.itemId).delivered_at !== null, true);
+    assert.throws(() => store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Bare prose', key: 's-0' }), { statusCode: 409 });
+    assert.deepEqual(store.acceptFinish({ taskId: task.id, executionId, summary: 'Done', key: 'f-1' }), { accepted: true });
+    assert.deepEqual(store.acceptFinish({ taskId: task.id, executionId, summary: 'Done', key: 'f-1' }), { accepted: true }, 'finish replay is a receipt');
+    assert.throws(() => store.acceptFinish({ taskId: task.id, executionId, summary: 'Again', key: 'f-2' }), { statusCode: 409 });
     assert.deepEqual(store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Done', key: 's-1' }), { status: 'done' });
     assert.deepEqual(store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Done', key: 's-1' }), { status: 'done' });
     assert.equal(store.get(scope, task.id).status, 'done');
@@ -531,7 +542,7 @@ test('a lost dispatch acknowledgement retries the same execution and accepts a f
       calls.dispatch.push({ taskId: dispatch[1], ...body });
       if (calls.dispatch.length === 1) {
         // The child finishes immediately, then the relay's read of the acknowledgement fails.
-        const [status, settled] = await relayCall(`/v1/tasks/${dispatch[1]}/settle`,
+        const [status, settled] = await finishAndSettle(relayCall, dispatch[1],
           { executionId: body.executionId, outcome: 'done', summary: 'Finished once.' }, 'settle-ack-1');
         calls.settle.push({ status, settled });
         res.writeHead(502).end();
@@ -594,7 +605,7 @@ test('a lost resume acknowledgement is retried under the same IDs and is never r
       calls.resume.push(body);
       if (calls.resume.length === 1) {
         // The child consumes the response and finishes, then the acknowledgement is lost.
-        const [status] = await relayCall(`/v1/tasks/${dispatch1TaskId()}/settle`,
+        const [status] = await finishAndSettle(relayCall, dispatch1TaskId(),
           { executionId: body.executionId, outcome: 'done', summary: 'Resumed once.' }, 'settle-resume-1');
         calls.settle.push(status);
         res.writeHead(502).end();
@@ -663,7 +674,7 @@ test('a settle that carries the worker receipt records the delivery when the res
       if (calls.resume.length === 1) {
         // The child consumed the response and finished before the relay read the acknowledgement. The settle carries the
         // worker's own receipt for the item, which is the positive evidence a delivery needs.
-        const [status] = await relayCall(`/v1/tasks/${resume[1]}/settle`,
+        const [status] = await finishAndSettle(relayCall, resume[1],
           { executionId: body.executionId, outcome: 'done', summary: 'Resumed once.', deliveredItems: [body.itemId] }, 'settle-receipt-1');
         calls.settle.push(status);
         res.writeHead(502).end();
@@ -732,7 +743,7 @@ test('an ambiguous resume acknowledgement is retried with the same IDs and answe
       assert.equal(body.executionId, calls.resume[0].executionId);
       assert.equal(body.itemId, calls.resume[0].itemId);
       // Answered from the worker's durable receipt: the child already consumed this item.
-      const [status] = await relayCall(`/v1/tasks/${resume[1]}/settle`,
+      const [status] = await finishAndSettle(relayCall, resume[1],
         { executionId: body.executionId, outcome: 'done', summary: 'Delivered once.' }, 'settle-resume-retry');
       assert.equal(status, 200);
       return json({ delivered: true, replay: true });
@@ -792,7 +803,7 @@ test('a relay restart between claim and dispatch re-drives the same execution id
         return;
       }
       await ready;
-      const [status] = await relayCall(`/v1/tasks/${dispatch[1]}/settle`,
+      const [status] = await finishAndSettle(relayCall, dispatch[1],
         { executionId: body.executionId, outcome: 'done', summary: 'After restart.' }, 'settle-restart-1');
       assert.equal(status, 200);
       return json({ status: 'running' });
@@ -901,6 +912,7 @@ test('the detail names the newest open item, and History pages and filters witho
     // Finish the paused Task so the terminal-traffic part below starts from a clean queue.
     const resumedAgain = store.claim(clock + 5_000);
     assert.equal(resumedAgain.id, task.id);
+    store.acceptFinish({ taskId: task.id, executionId, summary: 'Multi done', key: 'finish-multi' });
     store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Multi done', key: 'settle-multi' });
 
     // Terminal traffic: 30 finished Tasks, one active Task, and a filtered History.
@@ -911,6 +923,7 @@ test('the detail names the newest open item, and History pages and filters witho
       });
       const claim = store.claim(clock + 10_000 + index);
       assert.equal(claim.id, done.id);
+      store.acceptFinish({ taskId: done.id, executionId: claim.execution_id, summary: `Outcome ${index}`, key: `finish-${index}` });
       store.settle({ taskId: done.id, executionId: claim.execution_id, outcome: 'done', summary: `Outcome ${index}`, key: `settle-${index}` });
     }
     const activeTask = store.create({ ...base, title: 'Still active', input: 'Running work.', key: 'create-active' });
