@@ -74,6 +74,7 @@ function showTab(selected) {
   }
   if (selected.id === 'chat-tab') scrollChatToEnd();
   if (selected.id === 'sessions-tab') void refreshSessions();
+  if (selected.id === 'tasks-tab') void refreshTasks();
   if (selected.id === 'inbox-tab') void refreshInbox();
   if (selected.id === 'browser-tab') openDesktop();
   if (selected.id === 'capabilities-tab') void refreshCapabilities();
@@ -308,7 +309,7 @@ async function refreshInbox() {
   setInboxBusy(true);
   inboxStatus.textContent = 'Loading inbox…';
   try {
-    const { messages, questions } = await api('/api/inbox');
+    const { messages, questions, taskItems } = await api('/api/inbox');
     const nextQuestions = questions?.map(inboxQuestion);
     const entries = messages.map(({ from, text, createdAt }) => {
       const item = document.createElement('li');
@@ -321,6 +322,7 @@ async function refreshInbox() {
     byId('inbox').replaceChildren(...entries);
     byId('inbox-messages-empty').hidden = Boolean(entries.length);
     renderInboxQuestions(nextQuestions);
+    renderInboxTaskItems((taskItems ?? []).map(inboxTaskItem));
     inboxStatus.textContent = verifyInboxBeforeResponding ? 'Inbox refreshed. Check the question’s current status before retrying.' : '';
     verifyInboxBeforeResponding = false;
   } catch (error) {
@@ -896,6 +898,7 @@ async function refreshHistory() {
     renderHistory();
     if (pendingTurn()) sessionsPollUntil = performance.now() + POLL_WINDOW_MS;
     void refreshSessions({ afterCurrent: true });
+    void refreshTaskNotices();
     chatStatus.textContent = notSaved
       ? 'The last submission was not found in history. Review before retrying. ' + idleChatStatus()
       : idleChatStatus();
@@ -1199,7 +1202,461 @@ mcpForm.addEventListener('submit', async (event) => {
   }
 });
 
+// --- Tasks: the durable queue, grouped by state and blueprint ----------------------------------------------
+
+const TASKS_PATH = '/api/tasks';
+const TASK_STATUS_LABEL = new Map([
+  ['queued', 'Queued'], ['running', 'Running'], ['waiting', 'Waiting for input'],
+  ['done', 'Done'], ['failed', 'Failed'], ['cancelled', 'Cancelled'],
+]);
+const TASK_GROUPS = [['scheduled', 'Scheduled'], ['queued', 'Queued'], ['running', 'Running'], ['waiting', 'Waiting for input']];
+const TASK_ID = /^[0-9a-f]{32}$/;
+const TASK_TERMINAL = new Set(['done', 'failed', 'cancelled']);
+const tasksTab = byId('tasks-tab');
+const tasksPanel = byId('tasks-panel');
+const tasksListView = byId('tasks-list-view');
+const taskTree = byId('task-tree');
+const taskHistory = byId('task-history');
+const tasksStatus = byId('tasks-status');
+const taskHistoryEmpty = byId('task-history-empty');
+const taskFilterStatus = byId('task-filter-status');
+const taskFilterBlueprint = byId('task-filter-blueprint');
+const taskFilterText = byId('task-filter-text');
+const taskDetail = byId('task-detail');
+const taskDetailTitle = byId('task-detail-title');
+const taskDetailMeta = byId('task-detail-meta');
+const taskDetailStatus = byId('task-detail-status');
+const taskDetailInbox = byId('task-detail-inbox');
+const taskDetailInboxBody = byId('task-detail-inbox-body');
+const taskDetailInboxForm = byId('task-detail-inbox-form');
+const taskProgressList = byId('task-progress');
+const taskTranscriptList = byId('task-transcript');
+const taskOutcome = byId('task-outcome');
+const cancelTaskButton = byId('cancel-task');
+let tasks;
+let selectedTask;
+let tasksError = '';
+let tasksBlocked = false;
+let tasksRefreshTimer;
+let renderedTreeKey;
+
+function validTaskId(value) {
+  return typeof value === 'string' && TASK_ID.test(value);
+}
+
+function taskSummary(raw) {
+  if (!raw || typeof raw !== 'object' || !validTaskId(raw.id)) throw new Error('Unexpected task');
+  if (!TASK_STATUS_LABEL.has(raw.status)) throw new Error('Unexpected task status');
+  const blueprint = raw.blueprint && typeof raw.blueprint.id === 'string' && raw.blueprint.id
+    ? { id: raw.blueprint.id, revision: typeof raw.blueprint.revision === 'string' ? raw.blueprint.revision : undefined }
+    : undefined;
+  const inboxItem = raw.inboxItem && validTaskId(raw.inboxItem.id)
+    ? { id: raw.inboxItem.id, kind: raw.inboxItem.kind, status: raw.inboxItem.status, prompt: raw.inboxItem.prompt }
+    : undefined;
+  return {
+    id: raw.id,
+    title: typeof raw.title === 'string' && raw.title.trim() ? raw.title : 'Untitled task',
+    status: raw.status,
+    scheduled: raw.scheduled === true,
+    notBefore: typeof raw.notBefore === 'string' ? raw.notBefore : undefined,
+    createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : undefined,
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : undefined,
+    blueprint,
+    originTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+    outcome: typeof raw.outcome === 'string' ? raw.outcome : undefined,
+    failure: typeof raw.failure === 'string' ? raw.failure : undefined,
+    progress: typeof raw.progress === 'string' ? raw.progress : undefined,
+    inboxItem,
+  };
+}
+
+// A queued Task with a future not-before is Scheduled; it is one row, not a second state.
+function taskGroup(task) {
+  if (task.status === 'queued') return task.scheduled ? 'scheduled' : 'queued';
+  if (task.status === 'running' || task.status === 'waiting') return task.status;
+  return undefined;
+}
+
+function blueprintLabel(task) {
+  return task.blueprint?.id ?? 'No blueprint';
+}
+
+function taskMeta(task) {
+  return [
+    textNode('span', `Status: ${TASK_STATUS_LABEL.get(task.status) ?? 'Unknown'}`),
+    textNode('span', `Blueprint: ${blueprintLabel(task)}`, 'plain-text'),
+    ...(task.scheduled && task.notBefore ? [textNode('span', `Scheduled for ${new Date(task.notBefore).toLocaleString()}`)] : []),
+    ...(task.progress ? [textNode('span', `Latest: ${task.progress}`, 'plain-text')] : []),
+    ...(task.status === 'waiting' && task.inboxItem?.status === 'open'
+      ? [textNode('span', task.inboxItem.kind === 'question' ? 'Waiting for your answer' : 'Waiting for your review', 'plain-text')]
+      : []),
+    ...(task.outcome ? [textNode('span', `Outcome: ${task.outcome}`, 'plain-text')] : []),
+    ...(task.failure ? [textNode('span', `Failed: ${task.failure}`, 'plain-text')] : []),
+  ];
+}
+
+function taskButton(task, className) {
+  const button = textNode('button', task.title, className);
+  button.type = 'button';
+  button.dataset.taskId = task.id;
+  button.addEventListener('click', () => void openTaskById(task.id));
+  return button;
+}
+
+function taskRow(task) {
+  const row = document.createElement('li');
+  const meta = document.createElement('div');
+  meta.className = 'session-meta';
+  meta.append(...taskMeta(task));
+  row.append(taskButton(task, 'task-link'), meta);
+  return row;
+}
+
+function renderTaskTree() {
+  const groups = new Map(TASK_GROUPS.map(([id, label]) => [id, { label, byBlueprint: new Map() }]));
+  for (const task of tasks ?? []) {
+    const group = taskGroup(task);
+    if (!group) continue;
+    const entry = groups.get(group);
+    const blueprint = blueprintLabel(task);
+    if (!entry.byBlueprint.has(blueprint)) entry.byBlueprint.set(blueprint, []);
+    entry.byBlueprint.get(blueprint).push(task);
+  }
+  const key = JSON.stringify([...groups].map(([id, entry]) => [id, [...entry.byBlueprint].map(([name, rows]) => [name, rows.map(row => row.id)])]));
+  if (key === renderedTreeKey) return;
+  renderedTreeKey = key;
+  const focused = taskTree.contains(document.activeElement) ? document.activeElement.dataset.taskId : undefined;
+  const sections = [];
+  for (const [id, entry] of groups) {
+    if (entry.byBlueprint.size === 0) continue;
+    const section = document.createElement('section');
+    section.className = 'task-group';
+    section.dataset.group = id;
+    const count = [...entry.byBlueprint.values()].reduce((total, rows) => total + rows.length, 0);
+    const heading = document.createElement('h2');
+    heading.append(textNode('span', entry.label), textNode('span', String(count), 'badge'));
+    section.append(heading);
+    for (const [blueprint, rows] of [...entry.byBlueprint].sort(([left], [right]) => left.localeCompare(right))) {
+      const block = document.createElement('div');
+      block.className = 'task-blueprint';
+      block.append(textNode('h3', blueprint));
+      const list = document.createElement('ul');
+      list.append(...rows.map(taskRow));
+      block.append(list);
+      section.append(block);
+    }
+    sections.push(section);
+  }
+  taskTree.replaceChildren(...sections);
+  if (focused) {
+    const button = [...taskTree.querySelectorAll('button')].find(row => row.dataset.taskId === focused);
+    button?.focus();
+  }
+  if (sections.length === 0 && tasks) {
+    taskTree.append(textNode('p', 'No active tasks.', 'status'));
+  }
+}
+
+function taskMatches(task) {
+  const status = taskFilterStatus.value;
+  if (status === 'history' ? !TASK_TERMINAL.has(task.status) : status !== 'all' && task.status !== status) return false;
+  const blueprint = taskFilterBlueprint.value;
+  if (blueprint && blueprintLabel(task) !== blueprint) return false;
+  const text = taskFilterText.value.trim().toLowerCase();
+  if (text && !`${task.title} ${task.progress ?? ''} ${task.outcome ?? ''}`.toLowerCase().includes(text)) return false;
+  return true;
+}
+
+function renderTaskHistory() {
+  const history = (tasks ?? []).filter(task => (TASK_TERMINAL.has(task.status) || taskFilterStatus.value === 'all') && taskMatches(task));
+  taskHistory.replaceChildren(...history.map(taskRow));
+  taskHistoryEmpty.hidden = history.length > 0 || !tasks;
+}
+
+function renderTaskFilters() {
+  const blueprints = [...new Set((tasks ?? []).map(blueprintLabel))].sort();
+  const current = taskFilterBlueprint.value;
+  const options = [new Option('All', '')];
+  for (const blueprint of blueprints) options.push(new Option(blueprint, blueprint));
+  taskFilterBlueprint.replaceChildren(...options);
+  taskFilterBlueprint.value = blueprints.includes(current) ? current : '';
+}
+
+function renderTasks() {
+  renderTaskTree();
+  renderTaskFilters();
+  renderTaskHistory();
+  const message = tasksError || (!tasks ? 'Loading tasks…' : '');
+  if (tasksStatus.textContent !== message) tasksStatus.textContent = message;
+}
+
+function scheduleTasksRefresh() {
+  clearTimeout(tasksRefreshTimer);
+  if (tasksBlocked || tasksPanel.hidden) return;
+  const active = (tasks ?? []).some(task => !TASK_TERMINAL.has(task.status));
+  if (!active) return;
+  tasksRefreshTimer = setTimeout(() => {
+    if (!tasksPanel.hidden) void refreshTasks();
+  }, 4000);
+}
+
+async function refreshTasks() {
+  try {
+    const result = await api(TASKS_PATH);
+    if (!Array.isArray(result.tasks)) throw new Error('Unexpected task list');
+    tasks = result.tasks.map(taskSummary);
+    tasksBlocked = false;
+    tasksError = '';
+    renderTasks();
+    if (selectedTask) void refreshTaskDetail();
+    scheduleTasksRefresh();
+  } catch (error) {
+    const unavailable = [404, 405, 501].includes(error.status);
+    const denied = error.status === 401 || error.status === 403;
+    tasksBlocked = unavailable || denied;
+    tasksError = unavailable ? 'Tasks are not available on this relay.'
+      : denied ? 'Sign in as an owner and try again.'
+      : `${failure(error)} Use “Refresh” to try again.`;
+    if (tasksBlocked) {
+      tasks = undefined;
+      renderedTreeKey = undefined;
+      if (selectedTask) clearTaskDetail(tasksError);
+    }
+    renderTasks();
+  }
+}
+
+function clearTaskDetail(message) {
+  selectedTask = undefined;
+  taskDetailTitle.textContent = 'Task';
+  taskDetailMeta.replaceChildren();
+  taskDetailInbox.hidden = true;
+  taskDetailInboxForm.replaceChildren();
+  taskProgressList.replaceChildren();
+  taskTranscriptList.replaceChildren();
+  taskOutcome.textContent = '';
+  cancelTaskButton.hidden = true;
+  taskDetailStatus.textContent = message;
+}
+
+async function refreshTaskDetail() {
+  const id = selectedTask;
+  // Keep a confirmation that is already showing; only an empty status turns into a loading hint.
+  if (!taskDetailStatus.textContent) taskDetailStatus.textContent = 'Loading task…';
+  try {
+    const { task: raw, transcript } = await api(`${TASKS_PATH}/${encodeURIComponent(id)}`);
+    if (selectedTask !== id) return;
+    const task = taskSummary(raw);
+    taskDetailTitle.textContent = task.title;
+    taskDetailMeta.replaceChildren(...taskMeta(task));
+    const items = Array.isArray(raw.items) ? raw.items : [];
+    const latest = items.at(-1);
+    if (latest && validTaskId(latest.id)) {
+      taskDetailInbox.hidden = false;
+      taskDetailInboxBody.textContent = `${latest.kind === 'question' ? 'Question' : 'Report'} · ${latest.status}: ${latest.prompt}`;
+      taskDetailInboxForm.replaceChildren();
+      if (latest.status === 'open') {
+        taskDetailInboxForm.append(taskItemForm({ id: latest.id, taskId: task.id, taskTitle: task.title, kind: latest.kind, prompt: latest.prompt },
+          message => { taskDetailStatus.textContent = message; }));
+      } else if (typeof latest.response === 'string') {
+        taskDetailInboxForm.append(textNode('p', `Your response: ${latest.response}`, 'plain-text'));
+      }
+    } else {
+      taskDetailInbox.hidden = true;
+      taskDetailInboxForm.replaceChildren();
+    }
+    const notes = Array.isArray(raw.progress) ? raw.progress : [];
+    taskProgressList.replaceChildren(...notes.map(note => {
+      const row = document.createElement('li');
+      const time = new Date(note.at);
+      row.append(textNode('time', Number.isNaN(time.getTime()) ? '' : time.toLocaleString()), textNode('span', note.note, 'plain-text'));
+      if (!Number.isNaN(time.getTime())) row.querySelector('time').dateTime = time.toISOString();
+      return row;
+    }));
+    if (notes.length === 0) taskProgressList.append(textNode('li', 'No progress notes yet.'));
+    const entries = Array.isArray(transcript) ? transcript : [];
+    taskTranscriptList.replaceChildren(...entries.map(entry => {
+      const row = document.createElement('li');
+      row.append(textNode('strong', entry.role === 'assistant' ? 'Manolo' : 'Task', 'plain-text'), textNode('div', entry.text, 'plain-text'));
+      return row;
+    }));
+    if (entries.length === 0) taskTranscriptList.append(textNode('li', 'No execution transcript yet.'));
+    taskOutcome.textContent = task.outcome ?? task.failure ?? '';
+    cancelTaskButton.hidden = TASK_TERMINAL.has(task.status);
+    cancelTaskButton.disabled = false;
+    if (taskDetailStatus.textContent === 'Loading task…') taskDetailStatus.textContent = '';
+  } catch (error) {
+    if (selectedTask !== id) return;
+    taskDetailStatus.textContent = error.status === 404
+      ? 'This task is no longer available.'
+      : `${failure(error)} Use “Refresh” to try again.`;
+  }
+}
+
+async function openTaskById(id) {
+  if (!tasks) await refreshTasks();
+  const task = (tasks ?? []).find(entry => entry.id === id);
+  if (tasksPanel.hidden) showTab(tasksTab);
+  if (!task) {
+    tasksStatus.textContent = 'That task is not in recent history.';
+    return;
+  }
+  selectedTask = task.id;
+  tasksListView.hidden = true;
+  taskDetail.hidden = false;
+  taskDetailTitle.textContent = task.title;
+  taskDetailTitle.focus();
+  await refreshTaskDetail();
+}
+
+byId('back-to-tasks').addEventListener('click', () => {
+  selectedTask = undefined;
+  clearTaskDetail('');
+  taskDetail.hidden = true;
+  tasksListView.hidden = false;
+  byId('refresh-tasks').focus();
+});
+byId('refresh-tasks').addEventListener('click', () => {
+  tasksError = '';
+  void refreshTasks();
+});
+taskFilterStatus.addEventListener('change', renderTaskHistory);
+taskFilterBlueprint.addEventListener('change', renderTaskHistory);
+taskFilterText.addEventListener('input', renderTaskHistory);
+cancelTaskButton.addEventListener('click', async () => {
+  const id = selectedTask;
+  if (!id || cancelTaskButton.disabled) return;
+  // No modal: the button is the confirmation, and the status says what cancellation does not undo.
+  cancelTaskButton.disabled = true;
+  taskDetailStatus.textContent = 'Cancelling…';
+  try {
+    await api(`${TASKS_PATH}/${encodeURIComponent(id)}/cancel`, 'POST', {});
+    taskDetailStatus.textContent = 'Task cancelled.';
+    await refreshTasks();
+    if (selectedTask === id) await refreshTaskDetail();
+    void refreshTaskNotices();
+  } catch (error) {
+    cancelTaskButton.disabled = false;
+    taskDetailStatus.textContent = `${failure(error)} Use “Refresh” to check the current state.`;
+  }
+});
+
+// Inbox items a Task opened. Answering one resumes that Task; it never starts a chat turn.
+function inboxTaskItem(raw) {
+  if (!raw || typeof raw !== 'object' || !validTaskId(raw.id) || !validTaskId(raw.taskId) ||
+      !['question', 'report'].includes(raw.kind) || typeof raw.prompt !== 'string' || raw.prompt.length === 0) {
+    throw new Error('Unexpected task item');
+  }
+  return {
+    id: raw.id, taskId: raw.taskId, kind: raw.kind, prompt: raw.prompt,
+    taskTitle: typeof raw.taskTitle === 'string' ? raw.taskTitle : 'Task',
+  };
+}
+
+function taskItemForm(item, report) {
+  const form = document.createElement('form');
+  const label = textNode('label', item.kind === 'question' ? 'Your answer' : 'Review note');
+  const answer = document.createElement('textarea');
+  answer.rows = 2;
+  answer.maxLength = 4000;
+  answer.required = item.kind === 'question';
+  label.append(answer);
+  const actions = document.createElement('div');
+  actions.className = 'question-actions';
+  const send = textNode('button', item.kind === 'question' ? 'Send answer' : 'Send review', 'primary-button');
+  send.type = 'submit';
+  const decline = textNode('button', 'Decline');
+  decline.type = 'button';
+  const controls = [send, decline, answer];
+  const setBusy = busy => { for (const control of controls) control.disabled = busy; };
+  const submit = async body => {
+    setBusy(true);
+    report(body.decline ? 'Declining…' : 'Sending…');
+    try {
+      const receipt = await api(`${TASKS_PATH}/${encodeURIComponent(item.taskId)}/inbox/${encodeURIComponent(item.id)}/respond`, 'POST', body);
+      if (receipt?.itemId !== item.id || !['answered', 'declined'].includes(receipt.status)) throw new Error('Unexpected task receipt');
+      report(body.decline ? 'Declined. The Task is queued to continue.' : 'Answer sent. The Task is queued to resume.');
+      void refreshInbox();
+      void refreshTasks();
+      void refreshTaskNotices();
+      if (selectedTask === item.taskId) void refreshTaskDetail();
+    } catch (error) {
+      // A lost or conflicting response may already have resumed the Task: re-read before another attempt.
+      report(`${failure(error)} Refresh to check the Task before retrying.`);
+      void refreshInbox();
+      void refreshTasks();
+    } finally {
+      setBusy(false);
+    }
+  };
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const text = answer.value.trim();
+    if (!text && item.kind === 'question') {
+      report('Enter an answer before sending.');
+      return;
+    }
+    void submit(text ? { answer: text } : { decline: true });
+  });
+  decline.addEventListener('click', () => void submit({ decline: true }));
+  actions.append(send, decline);
+  form.append(label, actions);
+  return form;
+}
+
+const inboxTasksSection = byId('inbox-tasks-section');
+const inboxTasksList = byId('inbox-tasks');
+const inboxTasksEmpty = byId('inbox-tasks-empty');
+let renderedInboxTasks;
+
+function renderInboxTaskItems(items) {
+  inboxTasksSection.hidden = items === undefined;
+  const key = JSON.stringify(items ?? []);
+  if (key === renderedInboxTasks) return;
+  renderedInboxTasks = key;
+  const rows = (items ?? []).map(item => {
+    const row = document.createElement('li');
+    row.className = 'inbox-question';
+    row.append(textNode('p', `${item.taskTitle} · ${item.kind === 'question' ? 'question' : 'report'}`, 'question-state'),
+      textNode('p', item.prompt, 'plain-text'));
+    const status = textNode('p', '', 'question-state');
+    status.setAttribute('role', 'status');
+    row.append(taskItemForm(item, message => { status.textContent = message; }), status);
+    return row;
+  });
+  inboxTasksList.replaceChildren(...rows);
+  inboxTasksEmpty.hidden = rows.length > 0 || items === undefined;
+}
+
+// Durable Task notices in the originating conversation: recorded events, never a synthetic chat turn.
+async function refreshTaskNotices() {
+  const list = byId('task-notices');
+  try {
+    const { events } = await api(`${TASKS_PATH}/events`);
+    if (!Array.isArray(events)) throw new Error('Unexpected task events');
+    const rows = events.slice(-10).map(event => {
+      if (!validTaskId(event.taskId) || typeof event.text !== 'string') return undefined;
+      const row = document.createElement('li');
+      row.className = 'task-notice';
+      const time = new Date(event.createdAt);
+      const stamp = textNode('time', Number.isNaN(time.getTime()) ? '' : time.toLocaleString());
+      if (!Number.isNaN(time.getTime())) stamp.dateTime = time.toISOString();
+      const view = textNode('button', 'View task');
+      view.type = 'button';
+      view.addEventListener('click', () => void openTaskById(event.taskId));
+      row.append(stamp, textNode('span', event.text, 'plain-text'), view);
+      return row;
+    }).filter(Boolean);
+    list.replaceChildren(...rows);
+  } catch {
+    // An older relay has no task notices; the chat stays as it is.
+    list.replaceChildren();
+  }
+}
+
 void refreshInbox();
 void refreshHistory();
+void refreshTasks();
+void refreshTaskNotices();
 void refreshRuntimes();
 void refreshMcp();

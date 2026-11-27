@@ -95,7 +95,7 @@ test('relay persists scoped inbox questions, responds exactly once, and dispatch
   const prompt = '  Which date?\n(Use local time.)  ';
   const question = { turnId: parent, prompt };
   assert.equal((await request(first.web, inbox))[0], 401);
-  assert.deepEqual(await request(first.web, inbox, owner), [200, { messages: [], questions: [] }]);
+  assert.deepEqual(await request(first.web, inbox, owner), [200, { messages: [], questions: [], taskItems: [] }]);
   assert.deepEqual(await request(first.web, inbox, tester), [200, { messages: [] }]);
   assert.equal((await request(first.internal, '/v1/inbox', other, { to: 'canary', text: 'Existing message' }))[0], 200);
   assert.equal((await request(first.web, '/api/turns', owner, { id: 'origin', text: 'Start here' }, mutation))[0], 200);

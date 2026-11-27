@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { validTranscript, validVoiceFileId } from './speech.mjs';
 import { key, routeKey, SNOWFLAKE } from './relay-config.mjs';
 import { admittedRoom, ROOM_BACKLOG_LIMIT } from './telegram-room.mjs';
+import { openTaskStore } from './task-store.mjs';
 
 const active = "('submit','wait','send')";
 const conflict = () => Object.assign(new Error('Turn ID was already used'), { statusCode: 409 });
@@ -139,8 +140,10 @@ export function openRelayStore(path) {
   const toolImage = db.prepare('SELECT mime, data FROM web_tool_images WHERE turn_seq=? AND idx=?');
   const webSession = (owner, agent) => key('web-session', owner, agent);
   const webId = (owner, agent, id) => key('web', owner, agent, id);
+  const tasks = openTaskStore(db);
   return {
     db,
+    tasks,
     cursor,
     bindBot(bot) {
       if (!/^[1-9][0-9]*$/.test(bot ?? '')) throw new Error('Expected a Telegram bot token with a numeric bot ID');
@@ -249,6 +252,11 @@ export function openRelayStore(path) {
       }));
     },
     webSession,
+    // Internal task routes derive the conversation scope from the originating turn, never from a caller-supplied owner.
+    webTurnRow(turnId) {
+      const row = webLookup.get(turnId);
+      return row && { id: row.id, owner: row.owner, agent: row.agent, sessionId: row.session_id };
+    },
     webClientTurnId(owner, agent, turnId) {
       const row = webLookup.get(turnId);
       return row?.owner === owner && row.agent === agent ? row.id : undefined;

@@ -64,11 +64,17 @@ async function openBrowser(t) {
 }
 
 async function waitFor(run, expression) {
+  let last;
   for (let attempt = 0; attempt < 200; attempt++) {
-    if (await run(expression)) return;
+    try {
+      if (await run(expression)) return;
+    } catch (error) {
+      // A reload replaces the document; an evaluation can land before the new one exists. Retry it.
+      last = error;
+    }
     await sleep(50);
   }
-  assert.fail(`Browser did not reach: ${expression}`);
+  assert.fail(`Browser did not reach: ${expression}${last ? ` (last error: ${last.message})` : ''}`);
 }
 
 const MARKDOWN = [

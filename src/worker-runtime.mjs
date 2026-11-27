@@ -43,9 +43,11 @@ export async function createWorkerModels(cfg, env) {
       if (text === 'fixture:fail') {
         return fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'Fixture failure' });
       }
-      if (text.startsWith('fixture-tool:')) {
+      if (text.startsWith('fixture-tool:') || text.includes('\nfixture-tool:')) {
         try {
-          const { name, args } = JSON.parse(text.slice('fixture-tool:'.length));
+          // A Task execution prefixes its own framing, so the directive may sit on a later line of the same message.
+          const line = text.split('\n').find(line => line.startsWith('fixture-tool:'));
+          const { name, args } = JSON.parse(line.slice('fixture-tool:'.length));
           if (cfg.relay || WORK_TOOL_NAMES.includes(name)) {
             if (messages.at(-1)?.role === 'toolResult') {
               return fauxAssistantMessage(messages.at(-1).isError ? 'Fixture tool failed' : 'Fixture tool succeeded');

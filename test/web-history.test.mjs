@@ -257,6 +257,10 @@ test('browser history renders, recovers pending turns, and refreshes across tabs
   assert.ok(await run(`${visible('sessions')} && document.activeElement.id === 'sessions-tab'`));
   await waitFor(run, `document.querySelector('#sessions-status').textContent.includes('not available on this relay')`);
   await run(press('sessions', 'ArrowDown'));
+  // The Tasks tab sits between Sessions and Dashboard; an older relay answers it with 404 and an inline notice.
+  assert.ok(await run(`${visible('tasks')} && document.activeElement.id === 'tasks-tab'`));
+  await waitFor(run, `document.querySelector('#tasks-status').textContent.includes('not available on this relay')`);
+  await run(press('tasks', 'ArrowDown'));
   assert.ok(await run(`${visible('dashboard')} && document.activeElement.id === 'dashboard-tab'`));
   await run(click('inbox-tab'));
   assert.ok(await run(visible('inbox')));

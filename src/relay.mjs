@@ -173,7 +173,43 @@ const equal = (a, b) => timingSafeEqual(digest(a), digest(b));
 const isText = value => typeof value === 'string' && value.length > 0 && value.length <= 4000 && value.trim().length > 0;
 // Reserve room for the IDs and the owner's answer in the worker's 4000-unit input.
 const isInboxPrompt = value => isText(value) && value.length <= 2000 && JSON.stringify(value).length <= 2500;
-const ownFields = (obj, ...fields) => fields.length === Object.keys(obj).length && fields.every(field => Object.hasOwn(obj, field));
+const ownFields = (obj, ...fields) => obj !== null && typeof obj === 'object' && !Array.isArray(obj) &&
+  fields.length === Object.keys(obj).length && fields.every(field => Object.hasOwn(obj, field));
+const TASK_ID = /^[0-9a-f]{32}$/;
+const MAX_TASK_TITLE = 120;
+const MAX_TASK_INPUT = 4000;
+const MAX_TASK_NOTE = 500;
+const MAX_TASK_PROMPT = 2000;
+const isTaskTitle = value => typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TASK_TITLE;
+const isTaskInput = value => typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TASK_INPUT;
+const isTaskNote = value => typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TASK_NOTE;
+const isTaskPrompt = value => typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TASK_PROMPT;
+
+// A Task operation is scoped by the originating browser turn, never by an owner or scope the caller names.
+function taskTurnScope(turnId, agent) {
+  if (typeof turnId !== 'string' || !ID.test(turnId)) throw fail(400);
+  const turn = store.webTurnRow(turnId);
+  if (!turn || turn.agent !== agent || turn.owner.startsWith('device:')) throw fail(404);
+  if (config.owners.get(turn.owner)?.agent !== agent) throw fail(404);
+  return { turn, scope: store.webSession(turn.owner, agent) };
+}
+
+async function workerTaskRequest(agent, path, { method = 'GET', body, timeout = 15_000 } = {}) {
+  const { url, token } = config.agents.get(agent);
+  const response = await fetch(`${url}${path}`, {
+    method, redirect: 'error', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(timeout)]),
+    headers: { authorization: `Bearer ${token}`, ...(body !== undefined && { 'content-type': 'application/json' }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let payload;
+  try {
+    payload = JSON.parse((await readBounded(response, 512 * 1024, AbortSignal.timeout(timeout))).toString('utf8'));
+  } catch {
+    payload = undefined;
+  }
+  return { ok: response.ok, status: response.status, body: payload };
+}
+
 
 function respond(res, status, body, additional) {
   res.writeHead(status, { 'content-type': 'application/json', ...additional });
@@ -655,7 +691,31 @@ async function web(req, res, path, search = '') {
   if (req.method === 'GET' && path === '/api/inbox') return respond(res, 200, {
     messages: store.messages(owner.agent),
     ...(workSessionsEnabled(owner.agent) && { questions: store.inboxQuestions(owner.name, owner.agent) }),
+    ...(workSessionsEnabled(owner.agent) && { taskItems: store.tasks.openItems(store.webSession(owner.name, owner.agent)) }),
   });
+  // Tasks are scoped to the signed-in owner's own conversation; the relay never takes an owner from the request.
+  if (req.method === 'GET' && path === '/api/tasks/events') {
+    if (!workSessionsEnabled(owner.agent)) throw fail(404);
+    return respond(res, 200, { events: store.tasks.notices(store.webSession(owner.name, owner.agent)) });
+  }
+  if (req.method === 'GET' && path === '/api/tasks') {
+    if (!workSessionsEnabled(owner.agent)) throw fail(404);
+    return respond(res, 200, { tasks: store.tasks.list(store.webSession(owner.name, owner.agent), {}) });
+  }
+  const taskDetail = /^\/api\/tasks\/([0-9a-f]{32})$/.exec(path);
+  if (req.method === 'GET' && taskDetail) {
+    if (!workSessionsEnabled(owner.agent)) throw fail(404);
+    const task = store.tasks.get(store.webSession(owner.name, owner.agent), taskDetail[1]);
+    if (!task) throw fail(404);
+    let transcript;
+    try {
+      const execution = await workerTaskRequest(owner.agent, `/v1/tasks/${taskDetail[1]}/transcript`, { timeout: 5000 });
+      if (execution.ok && Array.isArray(execution.body?.transcript)) transcript = execution.body.transcript;
+    } catch {
+      // The Task detail is still useful without the child transcript.
+    }
+    return respond(res, 200, { task, ...(transcript && { transcript }) });
+  }
   const session = /^\/api\/sessions(?:\/([A-Za-z0-9_-]{1,128}))?$/.exec(path);
   if (req.method === 'GET' && session) return respond(res, 200, await workerWorkSessions(owner, session[1]));
   if (req.method === 'GET' && path === '/api/turns') {
@@ -685,6 +745,26 @@ async function web(req, res, path, search = '') {
   }
   if (req.method === 'POST' || req.method === 'PUT') {
     if (req.headers['x-manolo-request'] !== '1') throw fail(403);
+    const taskCancel = /^\/api\/tasks\/([0-9a-f]{32})\/cancel$/.exec(path);
+    if (req.method === 'POST' && taskCancel) {
+      if (!workSessionsEnabled(owner.agent)) throw fail(404);
+      const result = store.tasks.cancel(store.webSession(owner.name, owner.agent), taskCancel[1]);
+      if (result.executionId) {
+        void workerTaskRequest(owner.agent, `/v1/tasks/${taskCancel[1]}/cancel`, {
+          method: 'POST', body: { executionId: result.executionId },
+        }).catch(() => {});
+      }
+      return respond(res, 200, result.task);
+    }
+    const taskRespond = /^\/api\/tasks\/([0-9a-f]{32})\/inbox\/([0-9a-f]{32})\/respond$/.exec(path);
+    if (req.method === 'POST' && taskRespond) {
+      if (!workSessionsEnabled(owner.agent)) throw fail(404);
+      const body = await readJson(req);
+      const answer = body && ownFields(body, 'answer') && isTaskInput(body.answer) ? body.answer
+        : body && ownFields(body, 'decline') && body.decline === true ? null : undefined;
+      if (answer === undefined) throw fail(400);
+      return respond(res, 200, store.tasks.respond(store.webSession(owner.name, owner.agent), taskRespond[2], answer));
+    }
     const question = /^\/api\/inbox\/questions\/([0-9a-f]{64})\/respond$/.exec(path);
     if (req.method === 'POST' && question) {
       if (!workSessionsEnabled(owner.agent)) throw fail(404);
@@ -731,6 +811,101 @@ async function internal(req, res, path) {
         !isInboxPrompt(body.prompt)) throw fail(400);
     return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
       name => config.owners.get(name)?.agent === agent));
+  }
+  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|heartbeat))?)?$/.exec(path);
+  if (taskRoute) {
+    if (!workSessionAgents.size) throw fail(404);
+    if (!workSessionsEnabled(agent)) throw fail(403);
+    const [, taskId, action] = taskRoute;
+    const idem = req.headersDistinct['idempotency-key'];
+    const idempotencyKey = () => {
+      if (idem?.length !== 1 || !ID.test(idem[0])) throw fail(400);
+      return key('task-operation', agent, idem[0]);
+    };
+    if (req.method === 'POST' && taskId === undefined) {
+      const body = await readJson(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body) ||
+          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'notBefore'].includes(field)) ||
+          typeof body.turnId !== 'string' || !isTaskTitle(body.title) || !isTaskInput(body.task) ||
+          (Object.hasOwn(body, 'blueprint') && (!body.blueprint || typeof body.blueprint !== 'object' ||
+            !ownFields(body.blueprint, 'id', 'revision') || typeof body.blueprint.id !== 'string' ||
+            !BLUEPRINT_ID.test(body.blueprint.id) || typeof body.blueprint.revision !== 'string' ||
+            !/^[0-9a-f]{64}$/.test(body.blueprint.revision))) ||
+          (Object.hasOwn(body, 'notBefore') && (!Number.isSafeInteger(body.notBefore) || body.notBefore < 0))) {
+        throw fail(400);
+      }
+      const operationKey = idempotencyKey();
+      const { turn, scope } = taskTurnScope(body.turnId, agent);
+      const task = store.tasks.create({
+        owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
+        blueprint: body.blueprint, notBefore: body.notBefore ?? 0, key: operationKey,
+      });
+      return respond(res, 200, task);
+    }
+    if (req.method === 'GET' && taskId === undefined) {
+      const query = new URLSearchParams(new URL(req.url, 'http://local.invalid').search);
+      const { scope } = taskTurnScope(query.get('turnId'), agent);
+      const blueprint = query.get('blueprint') ?? undefined;
+      if (blueprint !== undefined && !BLUEPRINT_ID.test(blueprint)) throw fail(400);
+      return respond(res, 200, {
+        tasks: store.tasks.list(scope, {
+          status: query.get('status') ?? undefined, blueprint,
+          text: query.get('text')?.slice(0, 120) || undefined,
+        }),
+      });
+    }
+    if (req.method === 'GET' && action === undefined) {
+      const query = new URLSearchParams(new URL(req.url, 'http://local.invalid').search);
+      const { scope } = taskTurnScope(query.get('turnId'), agent);
+      const task = store.tasks.get(scope, taskId);
+      if (!task) throw fail(404);
+      return respond(res, 200, task);
+    }
+    if (req.method === 'POST' && action === 'cancel') {
+      const body = await readJson(req);
+      if (!ownFields(body, 'turnId')) throw fail(400);
+      const { scope } = taskTurnScope(body.turnId, agent);
+      const result = store.tasks.cancel(scope, taskId);
+      if (result.executionId) {
+        void workerTaskRequest(agent, `/v1/tasks/${taskId}/cancel`, {
+          method: 'POST', body: { executionId: result.executionId },
+        }).catch(() => {});
+      }
+      return respond(res, 200, result.task);
+    }
+    // The worker's own calls: the execution ID it was given fences every one of them.
+    const meta = taskId && store.tasks.meta(taskId);
+    if (taskId !== undefined && action !== undefined && action !== 'cancel' && (!meta || meta.agent !== agent)) throw fail(404);
+    if (req.method === 'POST' && action === 'inbox') {
+      const operationKey = idempotencyKey();
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId', 'kind', 'prompt') || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !['question', 'report'].includes(body.kind) || !isTaskPrompt(body.prompt)) throw fail(400);
+      return respond(res, 200, store.tasks.park({ taskId, executionId: body.executionId, kind: body.kind, prompt: body.prompt, key: operationKey }));
+    }
+    if (req.method === 'POST' && action === 'progress') {
+      const operationKey = idempotencyKey();
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId', 'note') || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !isTaskNote(body.note)) throw fail(400);
+      return respond(res, 200, store.tasks.progress({ taskId, executionId: body.executionId, note: body.note, key: operationKey }));
+    }
+    if (req.method === 'POST' && action === 'settle') {
+      const operationKey = idempotencyKey();
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId', 'outcome', 'summary') || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !['done', 'failed'].includes(body.outcome) ||
+          typeof body.summary !== 'string' || body.summary.length > MAX_TASK_INPUT) throw fail(400);
+      return respond(res, 200, store.tasks.settle({
+        taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary, key: operationKey,
+      }));
+    }
+    if (req.method === 'POST' && action === 'heartbeat') {
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId') || typeof body.executionId !== 'string' || !TASK_ID.test(body.executionId)) throw fail(400);
+      return respond(res, 200, { ok: store.tasks.heartbeat({ taskId, executionId: body.executionId }) });
+    }
+    throw fail(404);
   }
   if (req.method === 'POST' && path === '/v1/inbox') {
     const body = await readJson(req);
@@ -856,12 +1031,18 @@ async function runWebTurn(job) {
     liveTurns.delete(job.turn_id);
     return advance('failed');
   }
+  // Undelivered Task notices ride along with the next orchestrator turn, so the model does not have to poll. They are
+  // recorded as delivered only once the worker accepted this admission, and the same event never becomes a chat turn.
+  const notices = job.state === 'submit' && !job.owner.startsWith('device:')
+    ? store.tasks.pendingNotices(store.webSession(job.owner, job.agent)) : [];
   try {
     const turn = await worker(job.agent, job.turn_id, job.state === 'submit' ? {
       sessionId: job.session_id, text: job.input,
       ...(workSessionsEnabled(job.agent) && !job.owner.startsWith('device:') && { workSessions: true }),
+      ...(notices.length > 0 && { taskNotices: notices.map(note => note.text) }),
       ...(runtimes && job.agent === runtimeAgent && runtimeOwner(job.owner) && { runtimes: runtimes.targets() }),
     } : undefined);
+    if (notices.length > 0) store.tasks.markNoticesDelivered(notices.map(note => note.seq), job.turn_id);
     if (turn.status === 'pending') {
       if (turn.live) setLive(job.turn_id, turn.live);
       else liveTurns.delete(job.turn_id);
@@ -876,6 +1057,72 @@ async function runWebTurn(job) {
       return advance('failed');
     }
     advance(job.state, { next: retryAt(job.attempts + 1), attempts: job.attempts + 1 });
+  }
+}
+
+// One scheduler pass per Task: a claimed row is either a fresh execution or the delivery of an Inbox response to the
+// parked one. Nothing here starts a second execution while the previous one can still be live.
+async function runTask(task) {
+  const executionId = task.execution_id;
+  let result;
+  try {
+    if (task.execution_kind === 'resume') {
+      const item = store.tasks.inboxItem(task.resume_item_id);
+      if (!item) {
+        store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: task.resume_item_id, delivered: false });
+        return;
+      }
+      result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/resume`, {
+        method: 'POST',
+        body: { executionId, itemId: item.id, status: item.status, response: item.response ?? '' },
+      });
+      if (result.ok && result.body?.delivered === true) {
+        store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: item.id, delivered: true });
+        return;
+      }
+      if (!result.ok && ![400, 404, 409].includes(result.status)) {
+        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the resume.');
+        return;
+      }
+      // The parked execution is gone. The answer is not lost: a fresh execution carries it in its input.
+      store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: item.id, delivered: false });
+      return;
+    }
+    result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/executions`, {
+      method: 'POST',
+      body: {
+        executionId,
+        task: {
+          title: task.title, input: task.input,
+          ...(task.context && { context: task.context }),
+          ...(task.blueprint_id && { blueprint: { id: task.blueprint_id, revision: task.blueprint_revision } }),
+        },
+      },
+    });
+  } catch {
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
+    return;
+  }
+  if (result.ok) return;
+  if ([400, 404, 409].includes(result.status)) {
+    const reason = result.body?.reason === 'blueprint_revision_unavailable'
+      ? 'The pinned blueprint revision is no longer available.' : `The worker refused this execution (${result.status}).`;
+    store.tasks.failExecution(task.id, executionId, reason);
+    return;
+  }
+  store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.');
+}
+
+async function runTasks() {
+  while (!stop.signal.aborted) {
+    const claimed = [];
+    for (let slot = 0; slot < 4; slot++) {
+      const task = store.tasks.claim(Date.now());
+      if (!task) break;
+      claimed.push(task);
+    }
+    await Promise.all(claimed.map(task => runTask(task)));
+    await sleep(300, undefined, { signal: stop.signal });
   }
 }
 
@@ -915,7 +1162,7 @@ const listeners = [
 ];
 if (device) listeners.push(serve(device, Number(process.env.MANOLO_DEVICE_PORT ?? 8083), deviceHost));
 if (runtimes) listeners.push(serve(runtimes.device, Number(process.env.MANOLO_RUNTIME_PORT ?? 8084), runtimeHost));
-const loops = [drain(store.webReady, runWebTurn)];
+const loops = [drain(store.webReady, runWebTurn), runTasks()];
 if (telegram) loops.push(pollTelegram(), drain(store.due, job => runMessage('telegram', telegram, job)));
 if (discordScope) loops.push(runDiscord(), drain(now => discordClient ? store.discordReady(now, discordScope) : [], job => runMessage('discord', discordClient, job)));
 for (const loop of loops) loop.catch(() => { if (!stop.signal.aborted) { console.error('Relay loop stopped unexpectedly'); process.exit(1); } });

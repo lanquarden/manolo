@@ -105,6 +105,14 @@ For an enabled browser turn, the agent can ask a question with `request_human_in
 
 This slice runs work in the pod; it does not add group routing, cross-channel conversation linking, or remote work-session targets.
 
+### Durable Tasks
+
+The same `workSessionAgent` list also enables Tasks. On a flagged browser turn the agent can call `create_task` with a title, task text, an optional blueprint, and an optional not-before time; the relay stores a durable Task row and the scheduler runs it as one child execution in its own conversation. Open **Tasks** for the active tree grouped by state (Scheduled, Queued, Running, Waiting for input) and blueprint, and for **History** with status, blueprint, and text filters. Task details show progress notes, the Inbox item, the execution transcript, and the outcome.
+
+A Task can pause with `post_inbox`: a **question** asks for an answer, a **report** asks for a review. The Task appears in **Inbox**, its execution slot is released, and the child execution holds no process. Answering queues the same Task, which resumes the same child conversation; it never inserts another turn into the original chat. A Task that is finished, failed, or cancelled is terminal, and cancelling closes its pending item and refuses late execution updates without undoing work already done outside Manolo. Task events also appear as durable notices in the chat, and the next orchestrator turn receives undelivered notices once.
+
+The ledger lives in the relay's SQLite database and is created on startup, so no chart change is required. Remove the agent from `workSessionAgent` to hide the Task surfaces; drain or cancel queued Tasks before deleting the `task*` tables, because that loses them. Messaging notifications, triggers, dependencies, and follow-up proposals are not part of this slice; see [Task orchestration](docs/tasks/README.md).
+
 
 ### Debugging inside a pod
 
