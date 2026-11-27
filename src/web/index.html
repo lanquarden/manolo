@@ -165,6 +165,7 @@
                   <input id="task-filter-text" type="search" maxlength="120" placeholder="Title or task text">
                 </label>
               </div>
+              <p class="view-description">These filters narrow History only. The Blueprints and model profiles a new Task can pin are listed in Capabilities.</p>
               <p id="task-history-empty" class="status" hidden>No tasks match these filters.</p>
               <ul id="task-history" aria-labelledby="task-history-heading"></ul>
               <button id="task-history-more" type="button" hidden>Load more</button>
@@ -337,8 +338,14 @@
               <ul id="capability-tools" class="revision-list"></ul>
             </section>
             <section class="panel-card" aria-labelledby="capability-blueprints-heading">
-              <h2 id="capability-blueprints-heading">Blueprints</h2>
+              <h2 id="capability-blueprints-heading">Task Blueprints</h2>
+              <p class="capability-note">The catalog <code>create_task</code> can pin. Each Task keeps the revision it was given.</p>
               <ul id="capability-blueprints" class="revision-list"></ul>
+            </section>
+            <section class="panel-card" aria-labelledby="capability-profiles-heading">
+              <h2 id="capability-profiles-heading">Model profiles</h2>
+              <p class="capability-note">Named model and reasoning selections a Task can pin instead of the worker default.</p>
+              <ul id="capability-profiles" class="revision-list"></ul>
             </section>
             <section class="panel-card" aria-labelledby="capability-skills-heading">
               <h2 id="capability-skills-heading">Skills</h2>

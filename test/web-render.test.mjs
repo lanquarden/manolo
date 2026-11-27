@@ -155,7 +155,8 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
       return json({
         agent: { id: 'primary', instructions: 'You are Manolo, a private assistant.' },
         tools: [{ name: 'bash', description: 'Run a shell command', source: 'coding-tools' }],
-        blueprints: [{ id: 'review', description: 'Review short project notes' }],
+        blueprints: [{ id: 'review', description: 'Review short project notes', profile: 'fast' }],
+        profiles: [{ id: 'fast', description: 'Fast alias', model: 'manolo-fixture/fixture-fast', thinkingLevel: 'low' }],
         agentsFiles: [{ path: 'AGENTS.md', bytes: 42 }],
         skills: [{ name: 'statechart', description: 'Draw a system as a Mermaid statechart', path: '.agents/skills/statechart/SKILL.md', source: '.agents' }],
       });
@@ -218,6 +219,12 @@ test('model markdown, Mermaid, the theme picker and the capabilities review rend
   assert.equal(await run(`document.getElementById('capabilities-panel').hidden`), false);
   assert.equal(await run(`document.getElementById('capability-tools').textContent.includes('bash')`), true);
   assert.equal(await run(`document.getElementById('capability-blueprints').textContent.includes('review')`), true);
+  // The creation catalog (Blueprint plus the profile it pins) is its own surface, with the model and reasoning level.
+  assert.equal(await run(`document.getElementById('capability-profiles').textContent.includes('fast')`), true);
+  assert.equal(await run(`document.getElementById('capability-profiles').textContent.includes('manolo-fixture/fixture-fast')`), true);
+  assert.equal(await run(`document.getElementById('capability-profiles').textContent.includes('low')`), true);
+  // The Tasks view says plainly that its Blueprint selector filters History rather than listing the creation catalog.
+  assert.equal(await run(`document.body.textContent.includes('These filters narrow History only')`), true);
   assert.equal(await run(`document.getElementById('capability-skills').textContent.includes('.agents/skills/statechart/SKILL.md')`), true);
   assert.equal(await run(`document.getElementById('capability-agents-files').textContent.includes('AGENTS.md')`), true);
 });

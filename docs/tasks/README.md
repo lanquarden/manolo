@@ -1,7 +1,8 @@
 # Task orchestration
 
-**Status:** the first durable slice ships in this checkout; the rest of the agreed direction is still design. See
-[What ships](#what-ships) and [Deferred](#deferred). The [checked models](#checked-models) describe the agreed
+**Status:** the durable Task slice ships with operator-owned Blueprint bundles, named model profiles, the explicit
+`finish` gate, and repository Task worktrees. The rest of the agreed direction is still design. See
+[What ships](#what-ships), [Blueprints and workspaces](blueprints.md), and [Deferred](#deferred). The [checked models](#checked-models) describe the agreed
 lifecycle; they are not a checked distributed implementation.
 
 See [Task tools](tools.md) for the Orchestrator and worker tool contract as implemented.
@@ -46,6 +47,8 @@ One durable path, end to end, for flagged web conversations. Everything below is
 | Scheduler loop and dispatch/resume delivery | [`src/relay.mjs`](../../src/relay.mjs#L1065) |
 | Internal worker API for executions, resumes, cancels, transcripts | [`src/worker.mjs`](../../src/worker.mjs#L513) |
 | Web API for tasks, task items, cancellation and notices | [`src/relay.mjs`](../../src/relay.mjs#L697) |
+| Blueprint bundles, snapshot pinning, profiles, finish gate, Task worktrees | [`src/work-blueprints.mjs`](../../src/work-blueprints.mjs), [`src/task-tools.mjs`](../../src/task-tools.mjs), [`src/task-git.mjs`](../../src/task-git.mjs), [design](blueprints.md) |
+| GitHub operating policy and structured handoff validation | [`src/github-policy.mjs`](../../src/github-policy.mjs), [policy](github-policy.md) |
 | Tasks view: active tree, history filters, detail, chat notices | [`src/web/app.js`](../../src/web/app.js#L1315), [`src/web/index.html`](../../src/web/index.html) |
 
 ### Flow, as implemented
@@ -58,8 +61,10 @@ One durable path, end to end, for flagged web conversations. Everything below is
    execution ID in the same transaction. It then calls the worker. A retry, including one after a relay restart, keeps
    both IDs, so the worker admits the same child submission rather than a second one; an acknowledged dispatch is never
    re-driven.
-3. The worker creates one ownerless child conversation, applies the pinned blueprint (refusing a revision it no longer
-   has), and admits the task input. The child has only `report_progress` and `post_inbox` on top of its normal pod tools.
+3. The worker creates one ownerless child conversation, applies the pinned Blueprint snapshot (explicit text, exact
+   tools, profile, repository; refusing an unavailable snapshot or tool), prepares the Task's own worktree or scratch
+   directory, and admits the task input. The child gets the manifest's exact tools with the lifecycle tools
+   `report_progress`, `post_inbox`, and `finish`; nothing is inherited from the parent.
 4. `post_inbox` writes the item and parks the Task in one relay transaction: the Task becomes `waiting`, its claim is
    released, and a durable notice is recorded. The tool then parks on a pi-durable signal and holds no process. The
    worker's yield guard refuses every other tool call in that execution, and the relay refuses progress, another item,
@@ -67,8 +72,8 @@ One durable path, end to end, for flagged web conversations. Everything below is
 5. A web Inbox response is the only transition out of `waiting`. One SQLite transaction closes the item, stores the
    response, and queues the **same Task** with `execution_kind='resume'`; an identical retry returns the recorded
    receipt, a conflicting one is refused, and no chat turn is inserted. The scheduler claims it and delivers the
-   response to the parked call by execution ID. The run continues in the same child conversation, and its final message
-   settles the Task.
+   response to the parked call by execution ID. The run continues in the same child conversation, and an accepted
+   `finish` followed by the end of the run settles the Task.
 6. If the parked call is definitively gone (the worker reports `no_parked_call` or `unknown_execution`), the relay does
    **not** launch a replacement child. The Task ends `failed` with a clear reason and the owner's response stays recorded
    on the item, so nothing is silently re-run. A delivery that is only ambiguous — a timeout, a 5xx, a missing or
@@ -87,13 +92,37 @@ One durable path, end to end, for flagged web conversations. Everything below is
   claimed twice, a dispatch retry cannot mint a second execution, and a claim committed just before a crash is re-driven
   after a restart with the same IDs.
 - **Park:** item insert, `waiting` transition, claim release, pending-dispatch clear, and notice in one transaction. A
-  replayed park returns the same item; a second open item is refused.
+  replayed park returns the same item; a second open item is refused, and once the execution has negotiated the admission
+  contract a park that names no admission, or names a withdrawn one, is refused so a stale park cannot suspend live work.
 - **Response:** item close, stored response, `queued` resume transition, and notice in one transaction. Retries are
   receipts; conflicts are refused.
 - **Resume delivery:** the item's `delivered_at` is the durable receipt, written with the delivery acknowledgement; a
   settle after a resume also records it. The worker keeps its own receipt in the execution record.
-- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID. A valid finish that
-  lands while a dispatch or resume acknowledgement is still owed is accepted instead of being rejected.
+- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID and by the worker's
+  admission run. The initial admission of an execution is run 1 and every new child submission of the same execution (a
+  corrective turn, a continuation after a recoverable block) is one higher. The run travels with `finish`, `park`,
+  `block`, and `settle`, and the ledger records the lowest admission that may still write as `run_fence`; the fence only
+  ever moves forward. The acknowledgement of a dispatch or resume records the admission the worker made current, so a
+  settlement that was already in flight for a replaced admission is refused instead of ending live work, and a late
+  acknowledgement that repeats an older admission can never reopen one a takeover already withdrew.
+- **Observation or retirement:** a `block` says which of the two it is. A retirement (`withdrawn: true`) comes from a
+  submission that has ended: it withdraws that admission (`fence = run + 1`), and only a newer admission may write
+  afterwards. An observation reports a temporary condition on a submission that is still live — a dispatch retry that
+  cannot reach the workspace while the child is still running: it is visible and it schedules the retry, it records that
+  admission as current, and it never withdraws it, so restoring the condition lets the very same run settle instead of
+  stranding it behind a fence that no later admission will ever move.
+- **Admission contract:** negotiated, never assumed. The relay offers the contract it speaks (`admission: 2`) on every
+  dispatch and resume; a worker that was not offered it keeps the older runless reports, so an older relay is never fed a
+  field it rejects and a fenced mutation is never retried in a weaker legacy shape. The ledger records the contract on the
+  row from the first versioned report — before that report is applied, so a finish that lands before its dispatch
+  acknowledgement, or whose acknowledgement was lost, still marks it. Once the row is versioned, a `finish`, `settle`, or
+  `park` that names no admission is refused (409): after a takeover the ledger cannot tell it apart from the admission a
+  takeover replaced, and applying it would end or suspend the live work. A row that never negotiated keeps the runless
+  contract, so a pre-upgrade execution and a pre-upgrade worker still complete; an accepted finish remains authoritative
+  for its own admission, a valid finish that lands while a dispatch or resume acknowledgement is still owed is accepted,
+  and cancellation remains a separate decision. A `block` is the one route that a runless report may still use: it is a
+  condition report, it never names an outcome, and at worst it schedules a retry for an admission that is not current.
+  `progress` is a note on a running Task and carries no terminal or takeover authority.
 - **Cancellation:** the ledger transition and the worker stop are separate facts. `stop_pending` is retried with a
   backoff and `stop_confirmed_at` records the confirmation; until then the Task reports the stop as unconfirmed. A
   pending dispatch is cleared, so a dispatch that has not been sent is never sent, and the worker writes a cancelled
@@ -106,7 +135,34 @@ the next-turn notice exposure. Delivery is not exactly-once transport.
 ### Rollout and reversal
 
 - The ledger lives in the relay's existing SQLite database. Tables are created on startup with `CREATE TABLE IF NOT
-  EXISTS`, so an older database gains them in place and an older relay ignores them.
+  EXISTS`, and the later columns (`run_fence`, `admission_contract`, …) are added in place, so an older database gains
+  them and an older relay ignores them.
+- The admission contract is forwarded compatible and rolls out relay first. The relay offers it on every dispatch and
+  resume; an older worker ignores the offer and keeps writing the runless reports this ledger still accepts for a row it
+  never negotiated, and a newer worker only starts naming admissions after it was offered the contract. Deploy the relay
+  before the worker. Rolling the worker back while a negotiated execution is in flight is refused rather than
+  downgraded: the ledger answers 409 to its runless results and the worker leaves the execution visibly running, so let
+  those Tasks finish or cancel them before rolling the worker back, and roll the relay back last.
+- `MANOLO_TASK_FINISH=legacy` is the relay-wide companion for the relay-first window. A new relay normally marks a new
+  Task `finish_required=1`, and a structured Task (pinned snapshot, profile, review binding, or required pull request)
+  always needs the v2 worker route. An old worker has neither the route nor a `finish` tool, so while it still serves new
+  *unstructured* Tasks the relay must run with `MANOLO_TASK_FINISH=legacy`: that marks them `finish_required=0` so the
+  worker's bare final can settle them, and the ledger still refuses a bare success for any structured row. Without the
+  flag the relay holds such a Task at dispatch with "The worker does not support the Task protocol…" instead of running
+  it under a contract the worker cannot honour. Set the flag only for this mixed window and unset it once no pre-finish
+  worker serves Tasks: with it on, an unstructured bare final succeeds without `finish` even on a new worker.
+- Rollback and restore: stop the newer relay, restore the previous relay ref, and keep the existing data directory and
+  ledger. An older relay ignores the newer columns, but a negotiated execution still names its admission, and an older
+  relay does not accept that shape, so drain or cancel those Tasks before rolling the relay back (the worker-side
+  rollback is refused the same way). Restore the worker from its previous ref only after those executions are terminal.
+  Isolated compatibility checkouts and data directories are disposable; the durable ledger and Task worktrees are not.
+- Mixed-version check: `node scripts/task-compat.mjs --old e93ec28 --candidate HEAD` extracts both refs with `git
+  archive` into temporary checkouts, refuses to reuse `node_modules` unless both refs pin the installed package-lock,
+  and runs the real relay and worker processes over loopback for candidate relay + old worker (with
+  `MANOLO_TASK_FINISH=legacy`), old relay + new worker, and the new relay's default refusal without the flag. It prints
+  the one plain dispatch route, the runless settlement shape, and each terminal outcome, and touches neither the working
+  tree nor any network beyond loopback. Use `--candidate <ref>` to name the candidate explicitly and `--keep` to keep the
+  temporary checkouts for inspection.
 - The slice is gated by the existing `MANOLO_WORK_SESSION_AGENT` list: without it, `/api/tasks` is 404, the internal
   task routes are 404, and no turn is flagged for orchestration tools. No chart change is required.
 - Reversal: drop `MANOLO_WORK_SESSION_AGENT` (or the agent from it) and the Task surfaces disappear while existing rows
@@ -127,6 +183,10 @@ Not implemented in this slice, and not implied by the UI:
   handling. There is deliberately no replacement child for Inbox input: a definitively lost execution fails the Task.
 - Declined-item policy beyond "the child is told the item was declined and continues".
 - Migrating legacy work sessions into Tasks.
+- Automated pull-request creation, merge, or deployment. A requested pull request needs structured URL/commit evidence;
+  this slice does not publish or live-verify the GitHub write. Review Tasks bind the exact handed-off commit and base.
+- Security isolation between Tasks. A worktree and a scratch directory are working arrangements; `bash` is not a
+  sandbox and can use the pod's binaries and credentials.
 
 ## Checked models
 

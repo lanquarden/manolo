@@ -202,8 +202,19 @@ test('the relay forwards capabilities for the owner and reports a stopped worker
   const root = await temp(t, 'manolo-capabilities-relay-');
   const token = randomBytes(24).toString('hex');
   const password = randomBytes(24).toString('hex');
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    profiles: { fast: { description: 'Fast alias', model: 'fixture-fast', thinkingLevel: 'low' } },
+    blueprints: {
+      general: { description: 'Generic Task', role: 'task', profile: 'fast', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  }));
   const worker = startProcess(t, process.execPath, [workerPath], {
     MANOLO_DATA_DIR: join(root, 'data'), MANOLO_MODE: 'fixture', MANOLO_AGENT_ID: 'primary', MANOLO_AGENT_TOKEN: token, PORT: '0',
+    MANOLO_BLUEPRINTS_DIR: bundles,
   });
   const workerPort = await worker.listen(/Manolo worker listening on (\d+)/);
   const configPath = join(root, 'relay.json');
@@ -227,6 +238,16 @@ test('the relay forwards capabilities for the owner and reports a stopped worker
   assert.equal(body.agent.id, 'primary');
   assert.ok(Array.isArray(body.tools) && body.tools.some(tool => tool.name === 'read' && tool.source === 'coding-tools'));
   assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 8192);
+  // The owner route forwards the same catalog and profiles the worker itself reports: the projection neither drops the
+  // profile list nor substitutes the Tasks view's history filter for it.
+  const workerInventory = await (await fetch(`http://127.0.0.1:${workerPort}/v1/capabilities`, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000),
+  })).json();
+  assert.deepEqual(body.profiles, workerInventory.profiles);
+  assert.deepEqual(body.blueprints, workerInventory.blueprints);
+  assert.deepEqual(body.profiles.map(profile => [profile.id, profile.model, profile.thinkingLevel]),
+    [['fast', 'manolo-fixture/fixture-fast', 'low']]);
+  assert.deepEqual(body.blueprints.map(blueprint => [blueprint.id, blueprint.profile]), [['general', 'fast']]);
   // The route is read-only, like the capability view itself.
   const post = await fetch(`${url}/api/capabilities`, {
     method: 'POST', headers: { ...basic, 'x-manolo-request': '1' }, signal: AbortSignal.timeout(5000),
@@ -356,4 +377,101 @@ test('instructions keep their line breaks and the whole response stays bounded',
   assert.ok(Buffer.byteLength(JSON.stringify(huge)) <= 8 * 1024);
   assert.equal(huge.agent.instructions, 'instr');
   assert.equal(huge.agent.workSessionRules, undefined);
+});
+
+test('the owner API and inspect advertise the complete configured Task catalog, legacy list separate', { timeout: 90_000 }, async t => {
+  const root = await temp(t, 'manolo-capabilities-catalog-');
+  const token = randomBytes(24).toString('hex');
+  const password = randomBytes(24).toString('hex');
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  // More Task Blueprints than the old per-surface slices: thirteen bundles plus two legacy texts reach fifteen.
+  const bundlesConfigured = Array.from({ length: 13 }, (_, index) => `bundle-${String(index + 1).padStart(2, '0')}`);
+  const legacyConfigured = ['legacy-one', 'legacy-two'];
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    blueprints: Object.fromEntries(bundlesConfigured.map((id, index) => [id, {
+      description: `Bundle Task ${index + 1}`, role: 'task', files: ['IDENTITY.md'],
+      tools: ['report_progress', 'post_inbox', 'finish'],
+    }])),
+  }));
+  const legacy = Object.fromEntries(legacyConfigured.map((id, index) => [id, {
+    description: `Legacy Task ${index + 1}`, instructions: 'Work short.',
+  }]));
+  const worker = startProcess(t, process.execPath, [workerPath], {
+    MANOLO_DATA_DIR: join(root, 'data'), MANOLO_MODE: 'fixture', MANOLO_AGENT_ID: 'primary', MANOLO_AGENT_TOKEN: token,
+    MANOLO_BLUEPRINTS_DIR: bundles, MANOLO_WORK_BLUEPRINTS: JSON.stringify(legacy), MANOLO_FIXTURE_TOOLS: '1',
+    MANOLO_RELAY_URL: 'http://127.0.0.1:1', PORT: '0',
+  });
+  const workerPort = await worker.listen(/Manolo worker listening on (\d+)/);
+  const configPath = join(root, 'relay.json');
+  await writeFile(configPath, JSON.stringify({
+    agents: { primary: { url: `http://127.0.0.1:${workerPort}`, tokenEnv: 'PRIMARY_TOKEN' } },
+    owners: { owner: { agent: 'primary', passwordEnv: 'OWNER_PASSWORD' } },
+    routes: [], inbox: [],
+  }));
+  const relay = startProcess(t, process.execPath, ['src/relay.mjs'], {
+    MANOLO_DATA_DIR: join(root, 'relay-data'), MANOLO_RELAY_CONFIG: configPath,
+    PORT: '0', MANOLO_INTERNAL_PORT: '0', PRIMARY_TOKEN: token, OWNER_PASSWORD: password,
+  });
+  const url = `http://127.0.0.1:${await relay.listen(/web listening on [^\s:]+:(\d+)/)}`;
+  const basic = { authorization: `Basic ${Buffer.from(`owner:${password}`).toString('base64')}` };
+
+  // Independently derived from what the test configured: legacy texts first, then manifest order.
+  const expected = [...legacyConfigured, ...bundlesConfigured];
+  const fromOwner = await fetch(`${url}/api/capabilities`, { headers: basic, signal: AbortSignal.timeout(10_000) });
+  assert.equal(fromOwner.status, 200);
+  const ownerBody = await fromOwner.json();
+  assert.deepEqual(ownerBody.blueprints.map(blueprint => blueprint.id), expected);
+  assert.equal(ownerBody.blueprints.at(-1).id, bundlesConfigured.at(-1), 'the last configured Task is visible by id');
+  assert.ok(Buffer.byteLength(JSON.stringify(ownerBody)) <= 8192, 'the complete catalog still fits the payload budget');
+
+  // The worker itself advertises the same complete list, not a truncated prefix of it.
+  const workerBody = await (await fetch(`http://127.0.0.1:${workerPort}/v1/capabilities`, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000),
+  })).json();
+  assert.deepEqual(workerBody.blueprints.map(blueprint => blueprint.id), expected);
+
+  // inspect_manolo is the model-facing catalog: it reports every configured Task id and keeps the delegate list apart.
+  const turn = await fetch(`http://127.0.0.1:${workerPort}/v1/turns/inspect-catalog`, {
+    method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: 'catalog', text: `fixture-tool:${JSON.stringify({ name: 'inspect_manolo', args: {} })}`, workSessions: true }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(turn.status, 202);
+  const inspected = await (async () => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const response = await fetch(`http://127.0.0.1:${workerPort}/v1/turns/inspect-catalog`, {
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5_000),
+      });
+      const body = await response.json();
+      if (body.status !== 'pending') return body;
+      await sleep(25);
+    }
+    assert.fail('inspect turn did not finish');
+  })();
+  const tool = inspected.tools.find(entry => entry.name === 'inspect_manolo');
+  assert.equal(tool.status, 'ok', JSON.stringify(inspected));
+  const inventory = JSON.parse(tool.output);
+  assert.deepEqual(inventory.tasks.blueprints.map(blueprint => blueprint.id), expected);
+  assert.deepEqual((inventory.blueprints ?? []).map(blueprint => blueprint.id), legacyConfigured,
+    'the delegate list stays the legacy texts only');
+});
+
+test('the byte budget shrinks catalog descriptions instead of hiding a configured Task or profile id', async () => {
+  const blueprintIds = Array.from({ length: 36 }, (_, index) => `task-${String(index).padStart(2, '0')}`);
+  const profileIds = Array.from({ length: 16 }, (_, index) => `prof-${String(index).padStart(2, '0')}`);
+  const result = await readCapabilities({
+    workspaceDir: await mkdtemp(join(tmpdir(), 'manolo-capabilities-catalog-budget-')),
+    registry: fakeRegistry(Array.from({ length: 128 }, (_, index) => ({ name: `tool-${index}`, description: 't'.repeat(160) }))),
+    cfg: { agentId: 'primary', instructions: 'i'.repeat(4000) },
+    blueprints: new Map(blueprintIds.map(id => [id, { id, description: 'd'.repeat(160), profile: 'p'.repeat(32) }])),
+    profiles: new Map(profileIds.map(id => [id, {
+      id, description: 'p'.repeat(160), model: { provider: 'fixture', modelId: 'm'.repeat(120) },
+    }])),
+  });
+  assert.deepEqual(result.blueprints.map(blueprint => blueprint.id), blueprintIds);
+  assert.deepEqual(result.profiles.map(profile => profile.id), profileIds);
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8192);
 });

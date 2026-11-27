@@ -6,12 +6,12 @@ const load = value => loadWorkBlueprints(JSON.stringify(value));
 const review = { description: 'Review notes', instructions: 'Write a short summary.' };
 
 test('work blueprints are optional and their revisions are content-addressed', () => {
-  assert.equal(loadWorkBlueprints(undefined).size, 0);
-  const a = load({ review }).get('review');
-  const b = load({ review: { instructions: `${review.instructions}\r\n`, description: review.description } }).get('review');
+  assert.equal(loadWorkBlueprints(undefined).blueprints.size, 0);
+  const a = load({ review }).blueprints.get('review');
+  const b = load({ review: { instructions: `${review.instructions}\r\n`, description: review.description } }).blueprints.get('review');
   assert.deepEqual(a, b);
   assert.match(a.revision, /^[a-f0-9]{64}$/);
-  assert.notEqual(load({ review: { ...review, instructions: 'Write two paragraphs.' } }).get('review').revision, a.revision);
+  assert.notEqual(load({ review: { ...review, instructions: 'Write two paragraphs.' } }).blueprints.get('review').revision, a.revision);
 });
 
 test('invalid blueprint sets fail closed without echoing input', () => {

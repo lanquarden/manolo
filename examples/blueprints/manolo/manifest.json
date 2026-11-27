@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "profiles": {
+    "standard": {
+      "description": "Default Task profile: the operator's configured worker model with medium reasoning.",
+      "provider": "model-proxy",
+      "model": "manolo-default",
+      "thinkingLevel": "medium"
+    }
+  },
+  "repositories": {
+    "manolo": {
+      "remote": "https://github.com/lanquarden/manolo.git",
+      "base": "main",
+      "handoff": "git@github.com:manolo-mistalibio/manolo.git"
+    }
+  },
+  "blueprints": {
+    "conversation": {
+      "description": "Main Manolo conversation context. Never a delegation target.",
+      "role": "conversation",
+      "files": ["CONVERSATION.md"],
+      "tools": null
+    },
+    "general": {
+      "description": "Generic Task with the pod coding tools and no repository binding.",
+      "role": "task",
+      "profile": "standard",
+      "files": ["IDENTITY.md", "AGENTS.md"],
+      "tools": ["read", "write", "edit", "bash", "report_progress", "post_inbox", "finish"]
+    },
+    "manolo-repo": {
+      "description": "Task in a fresh worktree of the Manolo repository, handing off from its own Task branch.",
+      "role": "task",
+      "profile": "standard",
+      "repository": "manolo",
+      "files": ["IDENTITY.md", "MANOLO.md", "AGENTS.md"],
+      "tools": ["read", "write", "edit", "bash", "report_progress", "post_inbox", "finish"]
+    }
+  }
+}

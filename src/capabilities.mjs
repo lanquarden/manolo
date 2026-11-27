@@ -1,6 +1,7 @@
 import { constants } from 'node:fs';
 import { open, readdir, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { TASK_CATALOG_LIMIT, TASK_PROFILE_LIMIT } from './work-blueprints.mjs';
 
 // Everything this module returns is owner-visible and rendered verbatim, so it holds only names, descriptions, relative
 // paths and byte counts: never file contents, environment values, credentials, or absolute paths.
@@ -284,16 +285,19 @@ function agentInfo(cfg, workSessionRules, safe) {
 
 const byteLength = value => Buffer.byteLength(JSON.stringify(value));
 
-// Keep the whole response under the stated cap without dropping the one field the owner explicitly reviews. Lists lose
-// their tail entries first; only if the agent text alone is too large does it get clipped further.
+// Keep the whole response under the stated cap without dropping the one field the owner explicitly reviews. Informational
+// lists lose their tail entries first, a selectable catalog row keeps its id and loses description text, and the agent
+// text is clipped only after that.
 function fitBudget(result) {
-  const sections = ['tools', 'skills', 'agentsFiles', 'blueprints'];
+  // A tool or skill row is informational; a Blueprint or profile row is selectable by id. Only the informational lists
+  // lose their tail, so the advertised catalog stays exactly what a Task can be created with at the configured limits.
+  const shrinkable = ['tools', 'skills', 'agentsFiles'];
   let current = result;
-  // Shrink the lists first: they are the bulk, and the two agent fields are what the owner came to read.
+  // Shrink the informational lists first: they are the bulk, and the two agent fields are what the owner came to read.
   while (byteLength(current) > MAX_JSON_BYTES) {
     let largest;
     let largestSize = -1;
-    for (const name of sections) {
+    for (const name of shrinkable) {
       if (!current[name]?.length) continue;
       const size = byteLength(current[name]);
       if (size > largestSize) {
@@ -303,6 +307,31 @@ function fitBudget(result) {
     }
     if (largest === undefined) break;
     current = { ...current, [largest]: current[largest].slice(0, -1) };
+  }
+  // The catalog itself is never truncated: every configured Blueprint and profile stays visible by id, and only its
+  // description shrinks to meet the budget. A hidden row would be an omission that is still selectable.
+  if (byteLength(current) > MAX_JSON_BYTES) {
+    const rows = (list, limit) => Array.isArray(list)
+      ? list.map(row => ({ ...row, description: clipBytes(row.description ?? '', limit) })) : list;
+    const withDescriptions = limit => ({
+      ...current, blueprints: rows(current.blueprints, limit), profiles: rows(current.profiles, limit),
+    });
+    let best = withDescriptions(0);
+    if (byteLength(best) <= MAX_JSON_BYTES) {
+      let low = 0;
+      let high = MAX_SUMMARY;
+      while (low <= high) {
+        const limit = Math.floor((low + high) / 2);
+        const candidate = withDescriptions(limit);
+        if (byteLength(candidate) <= MAX_JSON_BYTES) {
+          best = candidate;
+          low = limit + 1;
+        } else {
+          high = limit - 1;
+        }
+      }
+    }
+    current = best;
   }
   // The work-session rules are a runtime constant; drop them before touching the operator's instructions.
   if (byteLength(current) > MAX_JSON_BYTES && current.agent.workSessionRules !== undefined) {
@@ -321,7 +350,7 @@ function fitBudget(result) {
   return current;
 }
 
-export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, workSessionRules, redact = text => text }) {
+export async function readCapabilities({ workspaceDir, registry, cfg, blueprints, profiles, workSessionRules, redact = text => text }) {
   const workspace = resolve(workspaceDir);
   const skills = await discoverSkills(workspace);
   const safe = text => redact(String(text ?? ''));
@@ -329,10 +358,18 @@ export async function readCapabilities({ workspaceDir, registry, cfg, blueprints
     // Instructions are operator text, but a blueprint or an environment reference can still carry a token.
     agent: agentInfo(cfg, workSessionRules, safe),
     tools: toolList(registry, safe),
-    blueprints: [...(blueprints?.values?.() ?? [])].slice(0, 12).flatMap(blueprint => {
+    blueprints: [...(blueprints?.values?.() ?? [])].slice(0, TASK_CATALOG_LIMIT).flatMap(blueprint => {
       const id = clip(blueprint?.id, 64);
       if (!id) return [];
-      return [{ id, description: clip(safe(blueprint?.description), MAX_SUMMARY) }];
+      return [{ id, description: clip(safe(blueprint?.description), MAX_SUMMARY),
+        ...(blueprint?.profile && { profile: clip(blueprint.profile.id, 64) }) }];
+    }),
+    profiles: [...(profiles?.values?.() ?? [])].slice(0, TASK_PROFILE_LIMIT).flatMap(profile => {
+      const id = clip(profile?.id, 64);
+      if (!id) return [];
+      return [{ id, description: clip(safe(profile?.description), MAX_SUMMARY),
+        model: clip(`${profile.model.provider}/${profile.model.modelId}`, 128),
+        ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }) }];
     }),
     agentsFiles: await findAgentsFiles(workspace),
     // The panel shows a routing summary; the full description stays in the prompt section, where it belongs. Skill text

@@ -77,7 +77,7 @@ const active = [
     createdAt: '2026-01-01T09:00:00.000Z', originTurnId: 'turn-2' },
   { id: '3'.repeat(32), title: 'Draft the lease summary', status: 'running', scheduled: false,
     createdAt: '2026-01-01T10:00:00.000Z', blueprint: { id: 'review', revision }, originTurnId: 'turn-3',
-    progress: 'Read three of five pages' },
+    progress: 'Read three of five pages', blocked: 'The Task worktree is missing. Restore it; the Task will resume.' },
   { id: '4'.repeat(32), title: 'Pick a moving date', status: 'waiting', scheduled: false,
     createdAt: '2026-01-01T11:00:00.000Z', blueprint: { id: 'moving', revision }, originTurnId: 'turn-4',
     inboxItem: { id: 'b'.repeat(32), kind: 'question', prompt: 'Which weekday suits you?', status: 'open' } },
@@ -227,6 +227,8 @@ test('the Tasks view groups active work, filters and pages history, answers the 
     ['waiting', ['moving'], ['Pick a moving date']],
   ]);
   assert.ok(await run(`document.querySelector('.task-group[data-group="running"] .task-link').closest('li').textContent.includes('Read three of five pages')`));
+  // A recoverable block is visible in the active list, not only in an event transcript.
+  assert.ok(await run(`document.querySelector('.task-group[data-group="running"] .task-link').closest('li').textContent.includes('Blocked: The Task worktree is missing. Restore it; the Task will resume.')`));
   assert.ok(await run(`document.querySelector('.task-group[data-group="waiting"] .task-link').closest('li').textContent.includes('Waiting for your answer')`));
 
   // 3. History is the first terminal page and pages server-side.
@@ -295,6 +297,8 @@ test('the Tasks view groups active work, filters and pages history, answers the 
   await waitFor(run, `document.getElementById('cancel-task').hidden === false`);
   await run(`document.getElementById('cancel-task').click()`);
   await waitFor(run, `document.getElementById('task-detail-status').textContent.includes('worker stop is not confirmed')`);
+  assert.ok(await run(`document.getElementById('task-detail-meta').textContent.includes('Blocked: The Task worktree is missing. Restore it; the Task will resume.')`),
+    'the Task detail repeats the recoverable block reason');
   assert.deepEqual(cancellations.map(entry => entry.taskId), ['3'.repeat(32)]);
   assert.equal(cancellations[0].headers['x-manolo-request'], '1');
   await waitFor(run, `document.getElementById('task-detail-meta').textContent.includes('Worker stop not confirmed yet')`);

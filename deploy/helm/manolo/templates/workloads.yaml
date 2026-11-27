@@ -59,6 +59,32 @@
 {{- if not (hasKey $entries $trimmed) -}}{{ fail (printf "workSessionAgent %q is not configured in agents" $trimmed) }}{{- end -}}
 {{- end -}}
 {{- end -}}
+{{- $taskFinish := .Values.taskFinish | default "" -}}
+{{- if not (kindIs "string" $taskFinish) -}}{{ fail "taskFinish must be a string" }}{{- end -}}
+{{- if and $taskFinish (not (has $taskFinish (list "required" "legacy"))) -}}
+{{- fail "taskFinish must be required or legacy" -}}
+{{- end -}}
+{{- if and (eq $taskFinish "legacy") (not $workSessionAgent) -}}
+{{- fail "taskFinish=legacy is only meaningful with workSessionAgent enabled" -}}
+{{- end -}}
+{{- /* Optional operator Blueprint bundle: one source per agent, never both, and a valid mount name. */ -}}
+{{- range $id, $agent := .Values.agents -}}
+{{- $dir := $agent.blueprintsDir | default "" -}}
+{{- if not (kindIs "string" $dir) -}}{{ fail (printf "agents.%s.blueprintsDir must be a string" $id) }}{{- end -}}
+{{- if $dir -}}
+{{- if not (hasPrefix "/" $dir) -}}{{ fail (printf "agents.%s.blueprintsDir must be an absolute container path" $id) }}{{- end -}}
+{{- end -}}
+{{- $mount := $agent.blueprintsMount | default dict -}}
+{{- if not (kindIs "map" $mount) -}}{{ fail (printf "agents.%s.blueprintsMount must be a mapping" $id) }}{{- end -}}
+{{- range $field, $value := $mount -}}
+{{- if not (has $field (list "configMap" "secret")) -}}{{ fail (printf "agents.%s.blueprintsMount.%s is not a supported source" $id $field) }}{{- end -}}
+{{- if not (and (kindIs "string" $value) (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" $value)) -}}
+{{- fail (printf "agents.%s.blueprintsMount.%s must be a Kubernetes object name" $id $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (hasKey $mount "configMap") (hasKey $mount "secret") -}}{{ fail (printf "agents.%s.blueprintsMount needs one source, not both" $id) }}{{- end -}}
+{{- if and $dir $mount -}}{{ fail (printf "agents.%s sets both blueprintsDir and blueprintsMount" $id) }}{{- end -}}
+{{- end -}}
 {{- $runtimeAgent := .Values.runtimeAgent -}}
 {{- if not (kindIs "string" $runtimeAgent) -}}{{ fail "runtimeAgent must be a string" }}{{- end -}}
 {{- if not (kindIs "slice" .Values.relayConfig.rooms) -}}{{ fail "relayConfig.rooms must be a list" }}{{- end -}}
@@ -224,6 +250,9 @@ spec:
             {{- if $workSessionAgent }}
             - {name: MANOLO_WORK_SESSION_AGENT, value: {{ $workSessionAgent | quote }}}
             {{- end }}
+            {{- with $.Values.taskFinish }}
+            - {name: MANOLO_TASK_FINISH, value: {{ . | quote }}}
+            {{- end }}
             - {name: MANOLO_INTERNAL_HOST, value: "0.0.0.0"}
             {{- with $.Values.webProxyAuthHeader }}
             - {name: MANOLO_PROXY_AUTH_HEADER, value: {{ . | quote }}}
@@ -278,6 +307,12 @@ spec:
             - {name: MANOLO_WORK_BLUEPRINTS, value: {{ $w.workBlueprints | mustToJson | quote }}}
             {{- end }}
             {{- end }}
+            {{- $blueprintMount := $w.blueprintsMount | default dict }}
+            {{- if $w.blueprintsDir }}
+            - {name: MANOLO_BLUEPRINTS_DIR, value: {{ $w.blueprintsDir | quote }}}
+            {{- else if or $blueprintMount.configMap $blueprintMount.secret }}
+            - {name: MANOLO_BLUEPRINTS_DIR, value: "/blueprints"}
+            {{- end }}
             {{- with $w.bashEnv }}
             - {name: MANOLO_BASH_ENV, value: {{ join "," . | quote }}}
             {{- end }}
@@ -313,6 +348,9 @@ spec:
             - {name: home, mountPath: /home/node}
             {{- if eq $w.kind "relay" }}
             - {name: config, mountPath: /config, readOnly: true}
+            {{- end }}
+            {{- if or ($w.blueprintsMount | default dict).configMap ($w.blueprintsMount | default dict).secret }}
+            - {name: blueprints, mountPath: /blueprints, readOnly: true}
             {{- end }}
         {{- with $browser }}
         # Root is required by the image init; Chromium itself runs as UID/GID 1000.
@@ -380,6 +418,13 @@ spec:
         {{- if eq $w.kind "relay" }}
         - name: config
           configMap: {name: manolo-relay}
+        {{- end }}
+        {{- if ($w.blueprintsMount | default dict).configMap }}
+        - name: blueprints
+          configMap: {name: {{ ($w.blueprintsMount | default dict).configMap | quote }}}
+        {{- else if ($w.blueprintsMount | default dict).secret }}
+        - name: blueprints
+          secret: {secretName: {{ ($w.blueprintsMount | default dict).secret | quote }}}
         {{- end }}
         {{- with $browser }}
         - name: browser

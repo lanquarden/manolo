@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { sealBlueprintSnapshot } from '../src/work-blueprints.mjs';
 
 const workerPath = fileURLToPath(new URL('../src/worker.mjs', import.meta.url));
 const token = 'fixture-private-bearer-long-enough';
@@ -202,6 +203,7 @@ test('a work session inherits pod tools but cannot start more work or use paired
     version: JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version,
     identity: { id: 'test-manolo', name: 'Manolo' },
     capabilities: { podCodingTools: true, relayTools: true, workSessions: { target: 'pod', childTools: [...codingTools, 'send_inbox', 'write_dashboard_draft', 'runtime_exec'] } },
+    tasks: { blueprints: [], profiles: [] },
   });
   const shell = fixtureTool('bash', { command: 'printf from-child > child.txt' });
   expectPending(await put(url, 'background', scope, fixtureTool('delegate_work', { title: 'Shell', task: shell, wait: false }), workEnabled));
@@ -760,6 +762,11 @@ test('an idle fixture worker can rebind to a proxy without losing history', { ti
 
   const requests = [];
   const proxy = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'opencode-go/deepseek-v4.1-flash' }] }));
+      return;
+    }
     let data = '';
     for await (const chunk of req) data += chunk;
     requests.push({ url: req.url, headers: req.headers, body: JSON.parse(data) });
@@ -932,4 +939,198 @@ test('the worker exposes a bounded, read-only capabilities inventory behind its 
 
   const post = await request(url, '/v1/capabilities', { method: 'POST', headers: auth });
   assert.equal(post.code, 405);
+});
+
+test('the model proxy catalog is authoritative: unserved aliases and their Blueprints are not advertised', { timeout: 30_000 }, async t => {
+  const dir = await dataDir(t);
+  const bundles = join(dir, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  const manifest = {
+    version: 1,
+    profiles: {
+      served: { description: 'Served alias', model: 'served-model', thinkingLevel: 'high' },
+      absent: { description: 'Not in the proxy catalog', model: 'absent-model' },
+    },
+    blueprints: {
+      general: { description: 'Served Task', role: 'task', profile: 'served', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+      missing: { description: 'Absent Task', role: 'task', profile: 'absent', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  };
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  const catalogRequests = [];
+  const proxy = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      catalogRequests.push(req.headers.authorization);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'served-model' }] }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const chunk = (delta, finish_reason) => `data: ${JSON.stringify({ id: 'chunk', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(chunk({ role: 'assistant', content: 'Proxy reply' }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+  const settings = {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'served-model',
+    MANOLO_MODEL_PROXY_URL: `http://127.0.0.1:${proxy.address().port}/v1`, MANOLO_MODEL_PROXY_KEY: 'synthetic-proxy-key',
+    MANOLO_BLUEPRINTS_DIR: bundles,
+  };
+  const worker = launch(t, dir, settings);
+  const url = await worker.start();
+  assert.equal(catalogRequests[0], 'Bearer synthetic-proxy-key');
+  const capabilities = (await request(url, '/v1/capabilities', { headers: auth })).body;
+  assert.deepEqual(capabilities.profiles.map(profile => profile.id), ['served']);
+  assert.deepEqual(capabilities.blueprints.map(blueprint => blueprint.id), ['general']);
+  assert.equal(capabilities.blueprints[0].profile, 'served');
+  await worker.stop();
+
+  // A configured default the proxy does not serve fails startup instead of advertising a dead model.
+  const refused = launch(t, await dataDir(t), { ...settings, MANOLO_MODEL: 'not-served' });
+  assert.deepEqual(await refused.closed, [1, null]);
+  assert.match(refused.logs(), /does not serve the configured model/);
+});
+
+test('a configured Blueprint bundle without a readable manifest fails startup instead of running silently unconfigured', { timeout: 15_000 }, async t => {
+  const empty = await dataDir(t);
+  const noManifest = launch(t, await dataDir(t), { MANOLO_BLUEPRINTS_DIR: empty });
+  assert.deepEqual(await noManifest.closed, [1, null]);
+  assert.match(noManifest.logs(), /no manifest\.json/);
+  const broken = await dataDir(t);
+  await writeFile(join(broken, 'manifest.json'), '{"version":1,"blueprints":{');
+  const invalid = launch(t, await dataDir(t), { MANOLO_BLUEPRINTS_DIR: broken });
+  assert.deepEqual(await invalid.closed, [1, null]);
+  assert.match(invalid.logs(), /not valid JSON/);
+});
+
+test('a pinned model profile keeps resolving from the trusted proxy catalog after its bundle is removed', { timeout: 60_000 }, async t => {
+  const dir = await dataDir(t);
+  const bundles = join(dir, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    profiles: { fast: { description: 'Fast alias', model: 'z-alt-model', thinkingLevel: 'low' } },
+    blueprints: {
+      general: { description: 'Fast Task', role: 'task', profile: 'fast', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  }));
+  // A catalog larger than any earlier registry cap. The pinned alias sorts last, so a prefix of the trusted list could
+  // never contain it: membership must be the whole served set, not the first N entries of it.
+  const catalog = [...Array.from({ length: 128 }, (_, index) => `filler-${String(index).padStart(3, '0')}`), 'served-model', 'z-alt-model'];
+  const requests = [];
+  const proxy = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: catalog.map(id => ({ id })) }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    try { requests.push(JSON.parse(body)); } catch { requests.push({}); }
+    const chunk = (delta, finish_reason) => `data: ${JSON.stringify({ id: 'chunk', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(chunk({ role: 'assistant', content: 'Proxy reply' }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+
+  // Task RPCs go to this stub relay; bookkeeping is not under test here.
+  const relay = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const json = value => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+    if (req.method === 'GET' && req.url.includes('/state')) return json({ status: 'running', finishAccepted: false });
+    if (req.url.endsWith('/settle')) return json({ status: 'failed' });
+    return json({ ok: true, accepted: true, status: 'running' });
+  });
+  relay.listen(0, '127.0.0.1');
+  await once(relay, 'listening');
+  t.after(() => { relay.closeAllConnections(); relay.close(); });
+
+  const pinned = sealBlueprintSnapshot({
+    id: 'general', role: 'task', description: 'Fast Task', instructions: 'Work.', files: [],
+    tools: ['report_progress', 'post_inbox', 'finish'],
+    profile: { id: 'fast', description: 'Fast alias', provider: 'model-proxy', model: 'z-alt-model', thinkingLevel: 'low' },
+  });
+  const settings = {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'served-model',
+    MANOLO_MODEL_PROXY_URL: `http://127.0.0.1:${proxy.address().port}/v1`, MANOLO_MODEL_PROXY_KEY: 'synthetic-proxy-key',
+    MANOLO_RELAY_URL: `http://127.0.0.1:${relay.address().port}`, MANOLO_CODING_TOOLS: '0',
+    MANOLO_BLUEPRINTS_DIR: bundles,
+  };
+  const dispatch = (url, execution) => request(url, `/v1/tasks/${randomBytes(16).toString('hex')}/executions/v2`, {
+    method: 'POST', headers: { ...auth, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      executionId: execution,
+      admission: 2,
+      task: {
+        protocol: 2, finishRequired: true, title: 'Pinned', input: 'Do the work.',
+        blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned },
+      },
+    }),
+  });
+  assert.ok(catalog.length > 128, `${catalog.length} served models`);
+  const assertPinnedRequest = body => {
+    assert.equal(body.model, 'z-alt-model');
+    assert.equal(body.reasoning_effort, 'low');
+  };
+
+  const first = launch(t, dir, settings);
+  const firstUrl = await first.start();
+  const accepted = await dispatch(firstUrl, randomBytes(16).toString('hex'));
+  assert.equal(accepted.code, 200, JSON.stringify(accepted.body));
+  await until(() => requests.length > 0, 'the first Task reaches the proxy');
+  assertPinnedRequest(requests[0]);
+  await first.stop();
+
+  // The same data directory restarts with no Blueprint directory at all: the manifest profile that introduced the alias is
+  // gone, and the pinned snapshot must still run on the exact served model with its exact reasoning level.
+  const restarted = launch(t, dir, { ...settings, MANOLO_BLUEPRINTS_DIR: '' });
+  const restartedUrl = await restarted.start();
+  const before = requests.length;
+  const again = await dispatch(restartedUrl, randomBytes(16).toString('hex'));
+  assert.equal(again.code, 200, JSON.stringify(again.body));
+  // The dispatch acknowledgement also names the admission that is current, so the relay can fence a settlement from an
+  // admission a recovery has replaced.
+  assert.deepEqual(again.body, { status: 'running', run: 1 });
+  await until(() => requests.length > before, 'the pinned Task still reaches the proxy after the bundle is removed');
+  assertPinnedRequest(requests.at(-1));
+  // Discovery stays restricted to the current manifest: no bundle means no advertised catalog or profile.
+  const capabilities = (await request(restartedUrl, '/v1/capabilities', { headers: auth })).body;
+  assert.deepEqual(capabilities.blueprints, []);
+  assert.deepEqual(capabilities.profiles, []);
+});
+
+test('inspect_manolo reports the Task catalog and profiles separately from delegate targets', { timeout: 20_000 }, async t => {
+  const dir = await dataDir(t);
+  const bundles = join(dir, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    profiles: { fast: { description: 'Fast alias', model: 'fixture-fast', thinkingLevel: 'low' } },
+    blueprints: {
+      general: { description: 'Generic Task', role: 'task', profile: 'fast', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  }));
+  const url = await launch(t, dir, {
+    MANOLO_FIXTURE_TOOLS: '1', MANOLO_RELAY_URL: 'http://127.0.0.1:1', MANOLO_FIXTURE_DELAY_MS: '50',
+    MANOLO_BLUEPRINTS_DIR: bundles,
+  }).start();
+  expectPending(await put(url, 'catalog', 'web', fixtureTool('inspect_manolo', {}), workEnabled));
+  const { tool } = await toolTurn(url, 'catalog', 'inspect_manolo');
+  assert.equal(tool.status, 'ok', JSON.stringify(tool));
+  const output = JSON.parse(tool.output);
+  assert.deepEqual(output.tasks, {
+    blueprints: [{ id: 'general', description: 'Generic Task', profile: 'fast' }],
+    profiles: [{ id: 'fast', description: 'Fast alias', model: 'manolo-fixture/fixture-fast', thinkingLevel: 'low' }],
+  });
+  // A configured bundle Task is a catalog entry with its own pinned policy, never an ungoverned delegate_work recipe.
+  assert.equal(output.blueprints, undefined);
 });

@@ -16,7 +16,7 @@ import { admittedRoom, roomBotUsername } from './telegram-room.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
 import { createWebSessions } from './web-session.mjs';
-import { BLUEPRINT_ID } from './work-blueprints.mjs';
+import { BLUEPRINT_ID, TASK_CATALOG_LIMIT, TASK_PROFILE_LIMIT, verifyBlueprintSnapshot, verifyProfileSnapshot } from './work-blueprints.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
@@ -45,6 +45,11 @@ for (const name of workSessionAgents) {
   if (name === runtimeAgent) throw new Error('A runtime agent cannot host work sessions');
 }
 const workSessionsEnabled = agentName => workSessionAgents.has(agentName);
+// Required by default. `legacy` exists only for a mixed-version rollout: an old worker that never calls finish can
+// still settle new Tasks while the worker is upgraded. New workers keep their own corrective/finish behavior either way.
+const taskFinishMode = process.env.MANOLO_TASK_FINISH ?? 'required';
+if (taskFinishMode !== 'required' && taskFinishMode !== 'legacy') throw new Error('MANOLO_TASK_FINISH must be required or legacy');
+const taskFinishRequired = taskFinishMode === 'required';
 const rooms = [...config.rooms.values()];
 const telegramMode = process.env.MANOLO_TELEGRAM_MODE;
 const useXmpp = telegramMode === 'xmpp';
@@ -192,6 +197,34 @@ function taskTurnScope(turnId, agent) {
   if (!turn || turn.agent !== agent || turn.owner.startsWith('device:')) throw fail(404);
   if (config.owners.get(turn.owner)?.agent !== agent) throw fail(404);
   return { turn, scope: store.webSession(turn.owner, agent) };
+}
+
+// A new-style Task carries a pinned snapshot/profile, review binding, or the finish protocol. The relay asks the worker
+// for its protocol before sending those fields. A worker with no route is old and is never fed a newer assignment that
+// it might silently run with substituted defaults.
+const workerProtocols = new Map();
+async function workerTaskProtocol(agent) {
+  const cached = workerProtocols.get(agent);
+  // A negative result is short-lived so a worker upgrade is noticed without a relay restart.
+  if (cached && Date.now() - cached.at < (cached.version === 2 ? 30_000 : 2_000)) return cached.version;
+  let version = 0;
+  try {
+    const { url, token } = config.agents.get(agent);
+    const response = await fetch(`${url}/v1/task-protocol`, {
+      redirect: 'error', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(3000)]),
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (response.ok) {
+      const body = JSON.parse((await readBounded(response, 8192, AbortSignal.timeout(3000))).toString('utf8'));
+      if (body?.version === 2) version = 2;
+    } else {
+      await response.body?.cancel().catch(() => {});
+    }
+  } catch {
+    version = 0;
+  }
+  workerProtocols.set(agent, { version, at: Date.now() });
+  return version;
 }
 
 async function workerTaskRequest(agent, path, { method = 'GET', body, timeout = 15_000 } = {}) {
@@ -543,6 +576,11 @@ function capabilityInventory(value) {
     if (!Array.isArray(list)) throw fail(503);
     return list.slice(0, limit).map(project).filter(Boolean);
   };
+  // A worker that predates a section returns no field at all; that is an empty inventory, not a broken response.
+  const optionalRows = (key, project, limit) => {
+    const list = value[key];
+    return Array.isArray(list) ? list.slice(0, limit).map(project).filter(Boolean) : [];
+  };
   return {
     agent: {
       id: agent.id.slice(0, 128),
@@ -554,10 +592,20 @@ function capabilityInventory(value) {
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'source', 64) !== undefined && { source: text(item, 'source', 64) }),
     }, 128),
+    // The catalog for creating work, forwarded exactly as the worker filtered it. The limit is the validated configured
+    // maximum for both Blueprint formats, so this projection can never hide a row that create_task still accepts.
     blueprints: rows('blueprints', item => typeof item?.id === 'string' && {
       id: item.id.slice(0, 64),
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
-    }, 16),
+      ...(text(item, 'profile', 64) !== undefined && { profile: text(item, 'profile', 64) }),
+    }, TASK_CATALOG_LIMIT),
+    profiles: optionalRows('profiles', item => typeof item?.id === 'string' && {
+      id: item.id.slice(0, 64),
+      ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+      ...(text(item, 'model', 128) !== undefined && { model: text(item, 'model', 128) }),
+      ...(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(item?.thinkingLevel) &&
+        { thinkingLevel: item.thinkingLevel }),
+    }, TASK_PROFILE_LIMIT),
     agentsFiles: rows('agentsFiles', item => typeof item?.path === 'string' && {
       path: item.path.slice(0, 1024),
       bytes: Number.isSafeInteger(item.bytes) && item.bytes >= 0 ? item.bytes : 0,
@@ -828,7 +876,7 @@ async function internal(req, res, path) {
     return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
       name => config.owners.get(name)?.agent === agent));
   }
-  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|heartbeat))?)?$/.exec(path);
+  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat|state|block))?)?$/.exec(path);
   if (taskRoute) {
     if (!workSessionAgents.size) throw fail(404);
     if (!workSessionsEnabled(agent)) throw fail(403);
@@ -839,22 +887,60 @@ async function internal(req, res, path) {
       return key('task-operation', agent, idem[0]);
     };
     if (req.method === 'POST' && taskId === undefined) {
-      const body = await readJson(req);
+      // A pinned Blueprint snapshot travels with the Task. The extra budget is for explicit Markdown text, never files.
+      const body = await readJson(req, 64 * 1024);
+      let blueprintSnapshot;
+      let profile;
+      let review;
+      try {
+        if (body && Object.hasOwn(body, 'blueprint') && body.blueprint && Object.hasOwn(body.blueprint, 'snapshot')) {
+          blueprintSnapshot = verifyBlueprintSnapshot(body.blueprint.snapshot);
+        }
+        if (body && Object.hasOwn(body, 'profile')) profile = verifyProfileSnapshot(body.profile);
+      } catch {
+        throw fail(400);
+      }
+      if (body && Object.hasOwn(body, 'reviewOf') &&
+          (typeof body.reviewOf !== 'string' || !TASK_ID.test(body.reviewOf))) throw fail(400);
+      if (body && Object.hasOwn(body, 'requiresPullRequest') && typeof body.requiresPullRequest !== 'boolean') throw fail(400);
       if (!body || typeof body !== 'object' || Array.isArray(body) ||
-          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'notBefore'].includes(field)) ||
+          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'profile', 'reviewOf', 'requiresPullRequest', 'notBefore'].includes(field)) ||
           typeof body.turnId !== 'string' || !isTaskTitle(body.title) || !isTaskInput(body.task) ||
           (Object.hasOwn(body, 'blueprint') && (!body.blueprint || typeof body.blueprint !== 'object' ||
-            !ownFields(body.blueprint, 'id', 'revision') || typeof body.blueprint.id !== 'string' ||
+            !ownFields(body.blueprint, 'id', 'revision', ...(blueprintSnapshot ? ['snapshot'] : [])) || typeof body.blueprint.id !== 'string' ||
             !BLUEPRINT_ID.test(body.blueprint.id) || typeof body.blueprint.revision !== 'string' ||
-            !/^[0-9a-f]{64}$/.test(body.blueprint.revision))) ||
+            !/^[0-9a-f]{64}$/.test(body.blueprint.revision) ||
+            (blueprintSnapshot && (blueprintSnapshot.id !== body.blueprint.id || blueprintSnapshot.revision !== body.blueprint.revision)))) ||
           (Object.hasOwn(body, 'notBefore') && (!Number.isSafeInteger(body.notBefore) || body.notBefore < 0))) {
         throw fail(400);
       }
       const operationKey = idempotencyKey();
       const { turn, scope } = taskTurnScope(body.turnId, agent);
+      if (body.reviewOf) {
+        const source = store.tasks.get(scope, body.reviewOf);
+        if (!source || source.status !== 'done') throw fail(409);
+        if (!source.handoff?.commit || !/^[0-9a-f]{40,64}$/.test(source.handoff.commit) ||
+            !/^[0-9a-f]{40,64}$/.test(source.handoff.base ?? '')) throw fail(409);
+        if (!blueprintSnapshot?.repository) throw fail(409);
+        if (!source.handoff.handoff || source.handoff.handoff !== blueprintSnapshot.repository.handoff) throw fail(409);
+        review = {
+          sourceTaskId: source.id, commit: source.handoff.commit, baseSha: source.handoff.base,
+          ...(source.handoff.branch && { branch: source.handoff.branch }),
+          ...(source.handoff.handoff && { handoff: source.handoff.handoff }),
+        };
+      }
+      // A structured new-style Task pins a snapshot, profile, review binding, or required evidence. It always needs the
+      // finish protocol, even during a mixed-version rollout. `MANOLO_TASK_FINISH=legacy` is an explicit, relay-wide
+      // override for a worker that predates `finish`: it marks a new *unstructured* Task `finish_required=0` so an old
+      // worker can still settle its bare final. The override is narrow by construction and enforced in the ledger, not
+      // here: `settle` accepts a bare success only for a row that records no snapshot, no profile, no review binding, and
+      // no pull-request requirement, so structured evidence can never be bypassed by the rollout mode or a migrated row.
+      const structured = Boolean(blueprintSnapshot || profile || review || body.requiresPullRequest === true);
       const task = store.tasks.create({
         owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
-        blueprint: body.blueprint, notBefore: body.notBefore ?? 0, key: operationKey,
+        blueprint: body.blueprint, blueprintSnapshot, profile, review,
+        requiresPr: body.requiresPullRequest === true,
+        finishRequired: taskFinishRequired || structured, notBefore: body.notBefore ?? 0, key: operationKey,
       });
       return respond(res, 200, task);
     }
@@ -877,6 +963,17 @@ async function internal(req, res, path) {
       if (!task) throw fail(404);
       return respond(res, 200, task);
     }
+    if (req.method === 'GET' && action === 'state') {
+      const meta = store.tasks.meta(taskId);
+      if (!meta || meta.agent !== agent) throw fail(404);
+      const query = new URLSearchParams(new URL(req.url, 'http://local.invalid').search);
+      const executionId = query.get('executionId');
+      if (executionId !== null && (!TASK_ID.test(executionId) || meta.executionId !== executionId)) throw fail(409);
+      return respond(res, 200, {
+        status: meta.status, executionId: meta.executionId, finishAccepted: meta.finishAccepted,
+        finishSummary: meta.finishSummary, evidence: meta.handoff, blocked: meta.blocked,
+      });
+    }
     if (req.method === 'POST' && action === 'cancel') {
       const body = await readJson(req);
       if (!ownFields(body, 'turnId')) throw fail(400);
@@ -893,9 +990,13 @@ async function internal(req, res, path) {
     if (req.method === 'POST' && action === 'inbox') {
       const operationKey = idempotencyKey();
       const body = await readJson(req);
-      if (!ownFields(body, 'executionId', 'kind', 'prompt') || typeof body.executionId !== 'string' ||
-          !TASK_ID.test(body.executionId) || !['question', 'report'].includes(body.kind) || !isTaskPrompt(body.prompt)) throw fail(400);
-      return respond(res, 200, store.tasks.park({ taskId, executionId: body.executionId, kind: body.kind, prompt: body.prompt, key: operationKey }));
+      const inboxFields = ['executionId', 'kind', 'prompt', ...(body?.run === undefined ? [] : ['run'])];
+      if (!ownFields(body, ...inboxFields) || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !['question', 'report'].includes(body.kind) || !isTaskPrompt(body.prompt) ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1))) throw fail(400);
+      return respond(res, 200, store.tasks.park({
+        taskId, executionId: body.executionId, kind: body.kind, prompt: body.prompt, key: operationKey, run: body.run,
+      }));
     }
     if (req.method === 'POST' && action === 'progress') {
       const operationKey = idempotencyKey();
@@ -904,23 +1005,66 @@ async function internal(req, res, path) {
           !TASK_ID.test(body.executionId) || !isTaskNote(body.note)) throw fail(400);
       return respond(res, 200, store.tasks.progress({ taskId, executionId: body.executionId, note: body.note, key: operationKey }));
     }
+    if (req.method === 'POST' && action === 'finish') {
+      const operationKey = idempotencyKey();
+      const body = await readJson(req);
+      const finishFields = ['executionId', 'summary',
+        ...(body?.evidence === undefined ? [] : ['evidence']), ...(body?.run === undefined ? [] : ['run'])];
+      if (!ownFields(body, ...finishFields)) throw fail(400);
+      if (typeof body.executionId !== 'string' || !TASK_ID.test(body.executionId) || typeof body.summary !== 'string' ||
+          body.summary.length > 2500 ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
+          (body.evidence !== undefined && (typeof body.evidence !== 'object' || body.evidence === null ||
+            Object.keys(body.evidence).some(field => !['commit', 'base', 'branch', 'handoff', 'review', 'pullRequest'].includes(field)) ||
+            ['commit', 'branch', 'handoff'].some(field => body.evidence[field] !== undefined &&
+              (typeof body.evidence[field] !== 'string' || body.evidence[field].length > 2048)) ||
+            (body.evidence.commit !== undefined && !/^[0-9a-f]{40,64}$/.test(body.evidence.commit)) ||
+            (body.evidence.base !== undefined && body.evidence.base !== null && !/^[0-9a-f]{40,64}$/.test(body.evidence.base)) ||
+            (body.evidence.review !== undefined && (typeof body.evidence.review !== 'object' || body.evidence.review === null)) ||
+            (body.evidence.pullRequest !== undefined && (!body.evidence.pullRequest ||
+              typeof body.evidence.pullRequest.url !== 'string' || !/^https:\/\/github\.com\//.test(body.evidence.pullRequest.url) ||
+              typeof body.evidence.pullRequest.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.evidence.pullRequest.commit)))))) throw fail(400);
+      return respond(res, 200, store.tasks.acceptFinish({
+        taskId, executionId: body.executionId, summary: body.summary, evidence: body.evidence, key: operationKey, run: body.run,
+      }));
+    }
     if (req.method === 'POST' && action === 'settle') {
       const operationKey = idempotencyKey();
       const body = await readJson(req);
       // The worker's own delivery receipts ride along with the outcome. They are the only evidence that an Inbox answer
       // reached the child; the ledger never infers a delivery from the settle itself.
       const delivered = body?.deliveredItems ?? [];
-      const fields = body?.deliveredItems === undefined
-        ? ['executionId', 'outcome', 'summary'] : ['executionId', 'outcome', 'summary', 'deliveredItems'];
+      // The settlement names the admission it belongs to. The ledger refuses one for a submission a recovery has already
+      // replaced, so an outcome that was in flight when the relay opened a block or a continuation landed cannot end the
+      // live work that replaced it. The field is optional, so a worker that predates it keeps the unversioned contract.
+      const fields = ['executionId', 'outcome', 'summary',
+        ...(body?.deliveredItems === undefined ? [] : ['deliveredItems']), ...(body?.run === undefined ? [] : ['run'])];
       if (!ownFields(body, ...fields) || typeof body.executionId !== 'string' ||
           !TASK_ID.test(body.executionId) || !['done', 'failed'].includes(body.outcome) ||
           typeof body.summary !== 'string' || body.summary.length > MAX_TASK_INPUT ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
           !Array.isArray(delivered) || delivered.length > 10 ||
           !delivered.every(id => typeof id === 'string' && TASK_ID.test(id))) throw fail(400);
       return respond(res, 200, store.tasks.settle({
         taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary,
-        deliveredItems: delivered, key: operationKey,
+        deliveredItems: delivered, key: operationKey, run: body.run,
       }));
+    }
+    // The child reports a recoverable workspace loss mid-run instead of spending a corrective turn or failing the Task.
+    // It names its admission when the versioned contract is negotiated, and it says whether that admission is retired: a
+    // dispatch retry that only observes an unavailable workspace for a submission that is still live must not fence the
+    // run out, or the child could never finish it once the workspace came back.
+    if (req.method === 'POST' && action === 'block') {
+      const body = await readJson(req);
+      const blockFields = ['executionId', 'reason',
+        ...(body?.run === undefined ? [] : ['run']), ...(body?.withdrawn === undefined ? [] : ['withdrawn'])];
+      if (!ownFields(body, ...blockFields) || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !isTaskNote(body.reason) ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
+          (body.withdrawn !== undefined && typeof body.withdrawn !== 'boolean')) throw fail(400);
+      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason, Date.now(), 60_000, {
+        run: body.run, withdraw: body.withdrawn === true,
+      }) });
     }
     if (req.method === 'POST' && action === 'heartbeat') {
       const body = await readJson(req);
@@ -1089,8 +1233,26 @@ const DEFINITIVE_START = new Map([
   ['unknown_blueprint', 'The pinned blueprint is no longer configured for this worker.'],
   ['another_execution_current', 'The worker already has a different execution for this Task.'],
   ['invalid_task', 'The worker refused the Task assignment as invalid.'],
+  ['invalid_blueprint', 'The pinned Blueprint snapshot is invalid.'],
+]);
+// These are recoverable by restoring the worker/profile/tool/workspace, not by substituting another selection. The Task
+// stays running and blocked, with the same execution identity, and dispatch is retried.
+const BLOCKING_START = new Map([
+  ['profile_unavailable', 'The pinned model profile is temporarily unavailable on the worker. Restore it; the same assignment will resume.'],
+  ['unknown_tool', 'A tool pinned by the Blueprint is not installed on the worker. Install it; the same assignment will resume.'],
+  ['invalid_repository', 'The pinned repository configuration is invalid for this worker.'],
+  ['worktree_missing', 'The Task worktree is missing or was replaced. Restore it; the Task will resume.'],
+  ['git_failed', 'The worker could not prepare the Task worktree.'],
+  ['invalid_review', 'The review binding needs a repository Blueprint and exact commit.'],
+  ['review_commit_missing', 'The exact review commit is not available from the configured handoff remote.'],
+  ['worker_protocol', 'The worker does not support this Task protocol. Upgrade it; the Task will resume.'],
 ]);
 const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
+// The versioned admission contract this relay speaks. It is offered in every dispatch and resume request, so a worker can
+// negotiate it before it writes anything under it: a worker that is not told this relay speaks it keeps the older
+// unversioned reports, which an older relay accepts and which this ledger still accepts for a row that never negotiated.
+// The offer is additive on the request, so an older worker ignores it and keeps working exactly as before.
+const TASK_ADMISSION = 2;
 // A start is acknowledged only by a parsed worker reply naming a state a worker reports for an admitted execution. A 200
 // with an empty or unfamiliar body does not prove the child was admitted, so the dispatch stays owed.
 const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled']);
@@ -1099,6 +1261,10 @@ const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled'
 // parked one. Nothing here starts a second execution while the previous one can still be live.
 async function runTask(task) {
   const executionId = task.execution_id;
+  // The exact dispatch obligation this pass is driving. A late answer or report from an earlier one (an RPC that was in
+  // flight when the worker reported a block, a newer response, or an accepted finish) carries a stale epoch and can
+  // neither clear the newer recovery nor reset its backoff.
+  const epoch = task.dispatch_epoch;
   if (task.execution_kind === 'resume') {
     const item = store.tasks.inboxItem(task.resume_item_id);
     if (!item) {
@@ -1110,30 +1276,47 @@ async function runTask(task) {
     }
     // The item's delivery time is the durable resume receipt. A retried delivery reads it instead of calling again.
     if (item.delivered_at !== null) {
-      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch });
       return;
     }
     let result;
     try {
       result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/resume`, {
         method: 'POST',
-        body: { executionId, itemId: item.id, status: item.status, response: item.response ?? '' },
+        body: {
+          executionId, itemId: item.id, status: item.status, response: item.response ?? '',
+          // A resume can admit a continuation of the same execution; the offer lets the worker report which admission it
+          // made current, so a settlement from the admission it replaced is fenced out.
+          admission: TASK_ADMISSION,
+        },
       });
     } catch {
-      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.');
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.', { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === true) {
-      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch, run: result.body.run });
       return;
     }
     if (result.ok && result.body?.delivered === false && result.body.reason === 'not_yet_parked') {
       // The execution is live but had not stored its park marker when the answer arrived, so the answer may still reach
       // it. That is ambiguous, not a lost call: retry the same delivery under the same IDs.
-      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.');
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.', { epoch });
+      return;
+    }
+    if (result.ok && result.body?.delivered === false && result.body.reason === 'worktree_missing') {
+      // A lost or replaced worktree is recoverable. Keep the answered item and block; restoring the workspace retries
+      // the same resume instead of terminally failing the Task.
+      store.tasks.block(task.id, executionId, result.body.message ?? 'The Task worktree is missing; restore it and the response will resume.', Date.now(), 60_000, { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
+      // An accepted finish is the durable boundary even when the execution that accepted it has ended before the answer
+      // was delivered. Settle from the receipt instead of failing a finished Task.
+      if (store.tasks.meta(task.id)?.finishAccepted) {
+        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The accepted finish was reconciled after the execution ended.', { epoch });
+        return;
+      }
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
       store.tasks.resumeUnavailable({
         taskId: task.id, executionId, itemId: item.id,
@@ -1141,16 +1324,48 @@ async function runTask(task) {
       });
       return;
     }
-    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.');
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.', { epoch });
     return;
   }
+  // A new-style assignment must not reach a worker that would ignore its snapshot/profile/review fields or its finish
+  // protocol. Version 2 is required for those fields; a legacy Task (no snapshot/profile/review and no finish protocol)
+  // may still use the old path.
+  const requiresV2 = Boolean(task.blueprint_snapshot || task.profile_snapshot || task.review_snapshot ||
+    task.requires_pr === 1 || task.finish_required === 1);
+  if (requiresV2 && await workerTaskProtocol(task.agent) < 2) {
+    store.tasks.block(task.id, executionId, 'The worker does not support the Task protocol needed by this assignment. Upgrade it; the same assignment will resume.', Date.now(), 60_000, { epoch });
+    return;
+  }
+  // The versioned path is the contract. If the probe said v2 but the worker was replaced in between, the v2 POST is
+  // refused or missing; the assignment is then held (blocked) and is never downgraded onto the old path.
+  const dispatchPath = requiresV2 ? `/v1/tasks/${task.id}/executions/v2` : `/v1/tasks/${task.id}/executions`;
   let result;
   try {
-    result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/executions`, {
+    result = await workerTaskRequest(task.agent, dispatchPath, {
       method: 'POST',
       body: {
         executionId,
-        task: {
+        // The versioned admission contract is offered on both routes: it is about how a result names the submission that
+        // wrote it, not about the shape of the assignment. A worker that is not offered it keeps the older reports.
+        admission: TASK_ADMISSION,
+        // The two routes carry two contracts. The versioned route carries the explicit protocol, pinned snapshot,
+        // profile, review binding, and finish/PR requirements; the plain route carries only the legacy shape, so a worker
+        // holding either contract cannot misread the other.
+        task: requiresV2 ? {
+          protocol: 2,
+          finishRequired: true,
+          title: task.title, input: task.input,
+          ...(task.context && { context: task.context }),
+          ...(task.blueprint_id && {
+            blueprint: {
+              id: task.blueprint_id, revision: task.blueprint_revision,
+              ...(task.blueprint_snapshot && { snapshot: JSON.parse(task.blueprint_snapshot) }),
+            },
+          }),
+          ...(task.profile_snapshot && { profile: JSON.parse(task.profile_snapshot) }),
+          ...(task.review_snapshot && { review: JSON.parse(task.review_snapshot) }),
+          ...(task.requires_pr === 1 && { requiresPullRequest: true }),
+        } : {
           title: task.title, input: task.input,
           ...(task.context && { context: task.context }),
           ...(task.blueprint_id && { blueprint: { id: task.blueprint_id, revision: task.blueprint_revision } }),
@@ -1158,18 +1373,35 @@ async function runTask(task) {
       },
     });
   } catch {
-    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.', { epoch });
+    return;
+  }
+  if (requiresV2 && !result.ok && [404, 405, 415, 422].includes(result.status)) {
+    // A worker that no longer has the v2 route is not fed the same assignment through the old path.
+    store.tasks.block(task.id, executionId, BLOCKING_START.get('worker_protocol'), Date.now(), 60_000, { epoch });
+    return;
+  }
+  if (result.ok && result.body?.status === 'blocked') {
+    // A blocked answer names the admission that reported it and whether that admission is retired. Only a withdrawal
+    // fences the run out; an observation of a temporarily unavailable workspace on a submission that is still live keeps
+    // the run's authority so it can finish once the workspace is back. A worker that reports neither keeps the older
+    // execution-ID-only behaviour.
+    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, {
+      epoch, run: result.body.run, withdraw: result.body.withdrawn === true,
+    });
     return;
   }
   if (result.ok && START_ACK.has(result.body?.status)) {
     // Only a parsed acknowledgement naming a state the worker reports: the child is admitted, and a later restart must
-    // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity.
-    store.tasks.ackDispatch(task.id, executionId);
+    // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity. The worker
+    // also returns the admission run it made current, so a continuation it admitted while handling this RPC fences out a
+    // settlement from the admission it replaced.
+    store.tasks.ackDispatch(task.id, executionId, epoch, Date.now(), result.body.run);
     return;
   }
   if (result.body?.reason === 'task_cancelled') {
     // The Task was cancelled while the dispatch was in flight; the ledger already decided.
-    store.tasks.ackDispatch(task.id, executionId);
+    store.tasks.ackDispatch(task.id, executionId, epoch);
     return;
   }
   const definitive = DEFINITIVE_START.get(result.body?.reason);
@@ -1177,7 +1409,12 @@ async function runTask(task) {
     store.tasks.failExecution(task.id, executionId, definitive);
     return;
   }
-  store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.');
+  const blocking = BLOCKING_START.get(result.body?.reason);
+  if (blocking) {
+    store.tasks.block(task.id, executionId, blocking, Date.now(), 60_000, { epoch, run: result.body?.run });
+    return;
+  }
+  store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.', { epoch });
 }
 
 // Cancelling is a ledger decision; this is the separate, retried step that asks the worker to stop. A dispatch that was
