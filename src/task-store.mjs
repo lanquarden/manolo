@@ -426,23 +426,28 @@ export function openTaskStore(db) {
       return item.get(itemId);
     },
 
-    settle({ taskId, executionId, outcome, summary, key, now = Date.now() }) {
+    settle({ taskId, executionId, outcome, summary, deliveredItems = [], key, now = Date.now() }) {
       return transaction(() => {
-        const previous = receipt(key, taskId, 'settle');
-        if (previous) return previous;
-        const task = fenced(taskId, executionId, { allowQueued: true });
-        if (!['done', 'failed'].includes(outcome)) throw bad(400, 'Invalid outcome');
-        // A settle after a resume proves the child consumed the response, even when the resume acknowledgement was lost.
-        if (task.resume_item_id) {
+        const task = row.get(taskId);
+        // Delivery is recorded only from the worker's own receipt for that item. A settle can land while the answer is
+        // still queued, or while the resume RPC is in flight, so the settle alone proves nothing about delivery; the
+        // outcome is recorded below either way, and the two facts never collapse into one.
+        if (task && task.execution_id === executionId && task.resume_item_id && deliveredItems.includes(task.resume_item_id)) {
           db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`)
             .run(iso(now), task.resume_item_id);
         }
+        // Stamping is idempotent and stays ahead of the receipt, so evidence that arrives with a retried settle is still
+        // recorded when the first attempt's receipt answers the call.
+        const previous = receipt(key, taskId, 'settle');
+        if (previous) return previous;
+        const fencedTask = fenced(taskId, executionId, { allowQueued: true });
+        if (!['done', 'failed'].includes(outcome)) throw bad(400, 'Invalid outcome');
         db.prepare(`UPDATE tasks SET status=?, outcome=?, failure=?, execution_kind='start', resume_item_id=NULL, context=NULL,
           claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
           .run(outcome, outcome === 'done' ? plain(summary, MAX_SUMMARY) : null,
             outcome === 'failed' ? plain(summary, MAX_SUMMARY) : null, iso(now), taskId);
-        addEvent.run(taskId, task.scope, 'outcome',
-          outcome === 'done' ? `Task “${task.title}” finished.` : `Task “${task.title}” failed.`, iso(now));
+        addEvent.run(taskId, fencedTask.scope, 'outcome',
+          outcome === 'done' ? `Task “${fencedTask.title}” finished.` : `Task “${fencedTask.title}” failed.`, iso(now));
         return remember(key, taskId, 'settle', { status: outcome }, now);
       });
     },

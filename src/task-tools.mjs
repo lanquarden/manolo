@@ -308,10 +308,22 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
     return boundedPlain(redact(message.content.filter(block => block.type === 'text').map(block => block.text).join('')), MAX_RESULT);
   }
 
+  // The child's own durable receipts are the only proof that an Inbox answer reached it: the delivery recorded by
+  // `resume`, and the marker the woken tool call writes when it consumes the signal. The relay stamps delivery from
+  // this evidence and from nothing else.
+  async function deliveryEvidence(taskId, executionId) {
+    const execution = await harness.snapshot(TaskExecution, taskId, context);
+    if (!execution || execution.executionId !== executionId) return [];
+    const run = execution.conversationId ? await harness.snapshot(TaskRun, execution.conversationId, context) : undefined;
+    const items = [...(execution.deliveredItems ?? []), ...(run?.resumedItem ? [run.resumedItem] : [])];
+    return [...new Set(items.filter(itemId => ID.test(itemId)))].slice(-10);
+  }
+
   async function settle(taskId, executionId, outcome, summary) {
     const key = idempotency('settle', taskId, executionId, outcome);
+    const deliveredItems = await deliveryEvidence(taskId, executionId).catch(() => []);
     for (let attempt = 0; ; attempt++) {
-      const result = await relay(`/v1/tasks/${taskId}/settle`, { key, body: { executionId, outcome, summary } });
+      const result = await relay(`/v1/tasks/${taskId}/settle`, { key, body: { executionId, outcome, summary, deliveredItems } });
       if (result.ok || result.status === 409) return;
       if (attempt >= SETTLE_RETRY_MS.length) return;
       await sleep(SETTLE_RETRY_MS[attempt]).catch(() => {});
@@ -329,7 +341,8 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
       const conversationId = execution.conversationId;
       if (conversationId) {
         const run = await tx.doc(TaskRun, conversationId, null);
-        if (run.executionId === executionId) run.state = state;
+        // A cancelled run is a tombstone too: a late finish must not relabel the stop the owner was told about.
+        if (run.executionId === executionId && run.state !== 'cancelled') run.state = state;
       }
     }, context);
   }
@@ -385,6 +398,8 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
       if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
       return { status: existing.state ?? 'running' };
     }
+    // These two checks are repeated inside the admission commit below. Here they only avoid creating a conversation for
+    // a dispatch that is already known to be refused.
     if (existing?.state === 'cancelled') {
       // The relay cancelled this Task before this dispatch arrived. Never start work for it.
       throw Object.assign(new Error('Task is cancelled'), { status: 409, reason: 'task_cancelled' });
@@ -412,8 +427,20 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
     const conversation = await harness.conversation(conversationId, context);
     if (!conversation) throw Object.assign(new Error('Task conversation unavailable'), { status: 503 });
     const text = executionText({ title: boundedPlain(redact(task.title), MAX_TITLE), input: boundedPlain(redact(task.input), MAX_TASK), context: task.context });
-    const submissionId = await harness.commit(async tx => {
+    // Admission is one commit, and the tombstone and the current identity are read inside it. A cancellation that
+    // commits before this point is seen here and the work is refused; one that commits after it stops what this commit
+    // admitted. No ordering leaves acknowledged work behind a confirmed stop.
+    const admission = await harness.commit(async tx => {
       const execution = await tx.doc(TaskExecution, taskId, null);
+      if (execution.state === 'cancelled') return { refused: 'task_cancelled' };
+      if (execution.executionId === executionId && execution.submissionId) {
+        // A competing admission of this same dispatch already committed: it is the same child submission, not a second.
+        return { submissionId: execution.submissionId };
+      }
+      if (execution.executionId !== undefined && execution.executionId !== executionId) {
+        // A different identity never overwrites the current execution, which may already be running or parked.
+        return { refused: 'another_execution_current' };
+      }
       const run = await tx.doc(TaskRun, conversationId, null);
       const index = await tx.doc(TaskIndex, 'all', null);
       // Admit before the commit's first table write, as the harness requires; then record the identity it returns.
@@ -428,9 +455,15 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
       delete run.itemId;
       Object.assign(run, { taskId, executionId, state: 'running' });
       index.ids = [taskId, ...(index.ids ?? []).filter(id => id !== taskId)].slice(0, MAX_IDS);
-      return admitted;
+      return { submissionId: admitted };
     }, context);
-    watch(taskId, executionId, submissionId);
+    if (admission.refused) {
+      throw Object.assign(
+        new Error(admission.refused === 'task_cancelled' ? 'Task is cancelled' : 'Another execution is current'),
+        { status: 409, reason: admission.refused },
+      );
+    }
+    watch(taskId, executionId, admission.submissionId);
     return { status: 'running' };
   }
 
@@ -463,7 +496,11 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
       return { delivered: true, replay: true };
     }
     const toolTaskId = run.yielded;
-    if (!toolTaskId || run.itemId !== itemId) return { delivered: false, reason: 'no_parked_call' };
+    // The relay only learns about an item from this execution's own park RPC, and the park marker is stored after that
+    // RPC returns. An answer can therefore arrive while the execution is still live but has not parked yet. That call is
+    // not lost, so the relay retries instead of declaring the answer undeliverable.
+    if (toolTaskId === undefined) return { delivered: false, reason: 'not_yet_parked' };
+    if (run.itemId !== itemId) return { delivered: false, reason: 'no_parked_call' };
     const value = status === 'declined' ? { status: 'declined' } : { status: 'answered', response: boundedPlain(String(response ?? ''), MAX_TASK) };
     let result;
     try {
@@ -486,20 +523,33 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
   }
 
   async function cancel({ taskId, executionId }) {
-    const execution = await harness.snapshot(TaskExecution, taskId, context);
-    if (execution && executionId && execution.executionId !== executionId) return { ok: true };
-    const conversation = execution?.conversationId && await harness.conversation(execution.conversationId, context);
-    // Stop the run and any parked call: a cancelled Task must not keep working on its own.
-    await conversation?.abort(context).catch(() => {});
-    await harness.commit(async tx => {
+    // One atomic decision: the tombstone and the conversation to stop come out of the same commit. A dispatch whose
+    // admission commits before this one is stopped below; one that commits after it reads the tombstone and is refused,
+    // so work can never be admitted behind a stop the relay records as confirmed.
+    const decision = await harness.commit(async tx => {
       const record = await tx.doc(TaskExecution, taskId, null);
-      // Also a tombstone when the dispatch never arrived: a dispatch that lands after this stop is refused.
+      if (executionId && record.executionId !== undefined && record.executionId !== executionId) return { stale: true };
+      const conversationId = record.conversationId;
       record.state = 'cancelled';
-      if (execution?.conversationId) {
-        const run = await tx.doc(TaskRun, execution.conversationId, null);
-        if (run.executionId === execution.executionId) run.state = 'cancelled';
+      if (conversationId) {
+        const run = await tx.doc(TaskRun, conversationId, null);
+        if (run.executionId === record.executionId) run.state = 'cancelled';
       }
+      return { conversationId };
     }, context);
+    if (decision.stale) return { ok: true };
+    // Nothing was admitted, so the tombstone is the whole stop.
+    if (!decision.conversationId) return { ok: true };
+    const conversation = await harness.conversation(decision.conversationId, context);
+    // A conversation this harness does not hold cannot be running here either.
+    if (!conversation) return { ok: true };
+    try {
+      // Stop the run and any parked call: a cancelled Task must not keep working on its own.
+      await conversation.abort(context);
+    } catch {
+      // No confirmed stop. The relay retries this same cancellation rather than recording one that did not happen.
+      throw Object.assign(new Error('Stop outcome unknown'), { status: 503 });
+    }
     return { ok: true };
   }
 

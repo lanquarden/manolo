@@ -235,6 +235,12 @@ test('the Tasks view groups active work, filters and pages history, answers the 
   await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 30`);
   assert.equal(await run(`document.querySelector('#task-history-more').hidden`), true);
   assert.equal(listRequests.at(-1).cursor, '25', 'the next page is requested by cursor');
+  const beforePoll = listRequests.length;
+  active.find(row => row.status === 'running').progress = 'New milestone from background refresh';
+  await waitFor(run, `document.querySelector('#task-tree').textContent.includes('New milestone from background refresh')`);
+  assert.ok(listRequests.length > beforePoll);
+  assert.equal(await run(`document.querySelectorAll('#task-history .task-link').length`), 30, 'an active poll keeps loaded History pages');
+  assert.equal(await run(`document.querySelector('#task-history-more').hidden`), true);
 
   // 4. Filters are applied by the relay, not by hiding rows in the browser.
   await run(`document.querySelector('#task-filter-status').value = 'failed'; document.querySelector('#task-filter-status').dispatchEvent(new Event('change'))`);

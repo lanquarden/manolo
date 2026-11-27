@@ -65,6 +65,7 @@ test('a durable Task queues, parks on Inbox, survives relay and worker restart, 
   const configPath = join(root, 'relay.json');
   // The worker reaches the relay's internal listener through a stable address that survives relay restarts.
   const paths = [];
+  let gateNextPark;
   let internal = 'http://127.0.0.1:1';
   const proxy = createServer(async (req, res) => {
     paths.push(req.url);
@@ -77,8 +78,14 @@ test('a durable Task queues, parks on Inbox, survives relay and worker restart, 
           .filter(([name]) => ['authorization', 'content-type', 'idempotency-key'].includes(name))),
         body: Buffer.concat(chunks),
       });
+      const body = await response.text();
+      if (gateNextPark && req.url.endsWith('/inbox') && response.ok) {
+        const gate = gateNextPark;
+        gateNextPark = undefined;
+        await gate;
+      }
       res.writeHead(response.status, { 'content-type': 'application/json' });
-      res.end(await response.text());
+      res.end(body);
     } catch {
       res.writeHead(503).end();
     }
@@ -287,6 +294,26 @@ test('a durable Task queues, parks on Inbox, survives relay and worker restart, 
   assert.equal((await request(relay.web, `/api/tasks/${cancellable.id}/inbox/${cancelledDetail.task.items[0].id}/respond`,
     auth, 'POST', { answer: 'Too late' }, mutation)).status, 409);
   assert.equal((await tasksOf(relay.web)).find(row => row.id === cancellable.id).status, 'cancelled');
+
+  // The relay exposes the item before the worker receives its park receipt. Answer during that window.
+  let allowPark;
+  gateNextPark = new Promise(resolve => { allowPark = resolve; });
+  try {
+    await createTask(relay.web, 'delegate-early', { title: 'Early answer', task: childInput });
+    const earlyItem = await until(async () => (await inboxOf(relay.web)).taskItems.find(entry => entry.taskTitle === 'Early answer'), 'visible Inbox item before worker park');
+    const earlyExecution = ledger(earlyItem.taskId).execution_id;
+    assert.equal((await request(relay.web, `/api/tasks/${earlyItem.taskId}/inbox/${earlyItem.id}/respond`,
+      auth, 'POST', { answer: 'Friday' }, mutation)).status, 200);
+    await until(() => ledger(earlyItem.taskId).dispatch_attempts > 0, 'early answer is retried while park receipt is held');
+    assert.equal(ledger(earlyItem.taskId).status, 'running');
+    allowPark();
+    await until(() => ledger(earlyItem.taskId).status === 'done', 'same execution consumes early answer');
+    assert.equal(ledger(earlyItem.taskId).execution_id, earlyExecution);
+    const detail = await (await request(relay.web, `/api/tasks/${earlyItem.taskId}`, auth)).json();
+    assert.ok(detail.task.items[0].deliveredAt);
+  } finally {
+    allowPark();
+  }
 
   // 7. Owner isolation: another signed-in owner sees no tasks of this conversation.
   const otherConfig = join(root, 'relay-other.json');
@@ -595,7 +622,74 @@ test('a lost resume acknowledgement is retried under the same IDs and is never r
   assert.equal(calls.dispatch.length, 1, 'no replacement child was dispatched');
   assert.equal(new Set(calls.resume.map(entry => entry.executionId)).size, 1);
   const detail = await (await request(relay.web, `/api/tasks/${waiting.id}`, auth)).json();
-  assert.ok(detail.task.items[0].deliveredAt, 'the settle records the delivery even without the resume acknowledgement');
+  // The settle arrived with no receipt for the item, so a delivery is not claimed: the answer is saved and the outcome
+  // is final, but the ledger does not pretend the response reached a park it never saw acknowledged.
+  assert.equal(detail.task.items[0].deliveredAt, undefined, 'a settle without a receipt never fabricates a delivery');
+  assert.deepEqual(detail.task.items.map(entry => [entry.status, entry.response]), [['answered', 'Tuesday']]);
+});
+
+test('a settle that carries the worker receipt records the delivery when the resume acknowledgement was lost', { timeout: 60_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-resume-receipt-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  const calls = { dispatch: [], resume: [], cancel: [], settle: [] };
+  const relayInternal = { url: 'http://127.0.0.1:1' };
+  const relayCall = async (path, body, idem) => {
+    const response = await fetch(`${relayInternal.url}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(idem && { 'idempotency-key': idem }) },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+    });
+    return [response.status, await response.json().catch(() => ({}))];
+  };
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    if (dispatch) {
+      const body = await read();
+      calls.dispatch.push({ taskId: dispatch[1], ...body });
+      const [parkStatus] = await relayCall(`/v1/tasks/${dispatch[1]}/inbox`,
+        { executionId: body.executionId, kind: 'question', prompt: 'Which date?' }, 'park-1');
+      assert.equal(parkStatus, 200);
+      return json({ status: 'running' });
+    }
+    const resume = /^\/v1\/tasks\/([0-9a-f]{32})\/resume$/.exec(req.url);
+    if (resume) {
+      const body = await read();
+      calls.resume.push(body);
+      if (calls.resume.length === 1) {
+        // The child consumed the response and finished before the relay read the acknowledgement. The settle carries the
+        // worker's own receipt for the item, which is the positive evidence a delivery needs.
+        const [status] = await relayCall(`/v1/tasks/${resume[1]}/settle`,
+          { executionId: body.executionId, outcome: 'done', summary: 'Resumed once.', deliveredItems: [body.itemId] }, 'settle-receipt-1');
+        calls.settle.push(status);
+        res.writeHead(502).end();
+        return;
+      }
+      return json({ delivered: true, replay: true });
+    }
+    const cancel = /^\/v1\/tasks\/([0-9a-f]{32})\/cancel$/.exec(req.url);
+    if (cancel) { await read(); calls.cancel.push(cancel[1]); return json({ ok: true }); }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relay = await launchTaskRelay(t, { root, dataDir: join(root, 'relay'), stubUrl: addr(server.address().port), token, password });
+  relayInternal.url = relay.internal;
+  const auth = basic('owner', password);
+  await createTaskForTest(relay.web, relay.internal, token, auth, { title: 'Resume receipt' });
+  const waiting = await until(async () => (await taskList(relay.web, auth)).find(row => row.status === 'waiting'), 'stub parks');
+  const item = (await (await request(relay.web, '/api/inbox', auth)).json()).taskItems[0];
+  assert.equal((await request(relay.web, `/api/tasks/${waiting.id}/inbox/${item.id}/respond`, auth, 'POST', { answer: 'Tuesday' }, mutation)).status, 200);
+  const done = await until(async () => (await taskList(relay.web, auth)).find(row => row.status === 'done'), 'task settles after the lost resume ack');
+  assert.equal(done.outcome, 'Resumed once.');
+  assert.deepEqual(calls.settle, [200]);
+  assert.equal(calls.dispatch.length, 1, 'no replacement child was dispatched');
+  const detail = await (await request(relay.web, `/api/tasks/${waiting.id}`, auth)).json();
+  assert.ok(detail.task.items[0].deliveredAt, 'the worker receipt records the delivery even without the resume acknowledgement');
 });
 
 test('an ambiguous resume acknowledgement is retried with the same IDs and answered from the receipt', { timeout: 60_000 }, async t => {

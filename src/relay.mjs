@@ -907,11 +907,19 @@ async function internal(req, res, path) {
     if (req.method === 'POST' && action === 'settle') {
       const operationKey = idempotencyKey();
       const body = await readJson(req);
-      if (!ownFields(body, 'executionId', 'outcome', 'summary') || typeof body.executionId !== 'string' ||
+      // The worker's own delivery receipts ride along with the outcome. They are the only evidence that an Inbox answer
+      // reached the child; the ledger never infers a delivery from the settle itself.
+      const delivered = body?.deliveredItems ?? [];
+      const fields = body?.deliveredItems === undefined
+        ? ['executionId', 'outcome', 'summary'] : ['executionId', 'outcome', 'summary', 'deliveredItems'];
+      if (!ownFields(body, ...fields) || typeof body.executionId !== 'string' ||
           !TASK_ID.test(body.executionId) || !['done', 'failed'].includes(body.outcome) ||
-          typeof body.summary !== 'string' || body.summary.length > MAX_TASK_INPUT) throw fail(400);
+          typeof body.summary !== 'string' || body.summary.length > MAX_TASK_INPUT ||
+          !Array.isArray(delivered) || delivered.length > 10 ||
+          !delivered.every(id => typeof id === 'string' && TASK_ID.test(id))) throw fail(400);
       return respond(res, 200, store.tasks.settle({
-        taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary, key: operationKey,
+        taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary,
+        deliveredItems: delivered, key: operationKey,
       }));
     }
     if (req.method === 'POST' && action === 'heartbeat') {
@@ -1083,6 +1091,9 @@ const DEFINITIVE_START = new Map([
   ['invalid_task', 'The worker refused the Task assignment as invalid.'],
 ]);
 const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
+// A start is acknowledged only by a parsed worker reply naming a state a worker reports for an admitted execution. A 200
+// with an empty or unfamiliar body does not prove the child was admitted, so the dispatch stays owed.
+const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled']);
 
 // One scheduler pass per Task: a claimed row is either a fresh execution or the delivery of an Inbox response to the
 // parked one. Nothing here starts a second execution while the previous one can still be live.
@@ -1116,6 +1127,12 @@ async function runTask(task) {
       store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
       return;
     }
+    if (result.ok && result.body?.delivered === false && result.body.reason === 'not_yet_parked') {
+      // The execution is live but had not stored its park marker when the answer arrived, so the answer may still reach
+      // it. That is ambiguous, not a lost call: retry the same delivery under the same IDs.
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.');
+      return;
+    }
     if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
       store.tasks.resumeUnavailable({
@@ -1144,7 +1161,9 @@ async function runTask(task) {
     store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
     return;
   }
-  if (result.ok) {
+  if (result.ok && START_ACK.has(result.body?.status)) {
+    // Only a parsed acknowledgement naming a state the worker reports: the child is admitted, and a later restart must
+    // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity.
     store.tasks.ackDispatch(task.id, executionId);
     return;
   }

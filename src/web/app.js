@@ -1236,6 +1236,8 @@ const cancelTaskButton = byId('cancel-task');
 let activeTasks;
 let historyTasks;
 let historyCursor;
+// True once the owner has appended a page: a background poll then extends what is loaded instead of replacing it.
+let historyPaged = false;
 let taskBlueprints = [];
 let selectedTask;
 let tasksError = '';
@@ -1336,7 +1338,7 @@ function renderTaskTree() {
     if (!entry.byBlueprint.has(blueprint)) entry.byBlueprint.set(blueprint, []);
     entry.byBlueprint.get(blueprint).push(task);
   }
-  const key = JSON.stringify([...groups].map(([id, entry]) => [id, [...entry.byBlueprint].map(([name, rows]) => [name, rows.map(row => row.id)])]));
+  const key = JSON.stringify([...groups].map(([id, entry]) => [id, [...entry.byBlueprint]]));
   if (key === renderedTreeKey) return;
   renderedTreeKey = key;
   const focused = taskTree.contains(document.activeElement) ? document.activeElement.dataset.taskId : undefined;
@@ -1399,7 +1401,7 @@ function scheduleTasksRefresh() {
   if (tasksBlocked || tasksPanel.hidden) return;
   if (!(activeTasks ?? []).some(task => !TASK_TERMINAL.has(task.status))) return;
   tasksRefreshTimer = setTimeout(() => {
-    if (!tasksPanel.hidden) void refreshTasks();
+    if (!tasksPanel.hidden) void refreshTasks({ background: true });
   }, 4000);
 }
 
@@ -1413,18 +1415,29 @@ function historyQuery({ append = false } = {}) {
 }
 
 // Active work and History are separate server reads. History is filtered and paged by the ledger, so a long run of
-// terminal Tasks can never push active work out of the view or force the browser to hold every record.
-async function refreshTasks({ append = false } = {}) {
+// terminal Tasks can never push active work out of the view or force the browser to hold every record. A background
+// poll that keeps the panel live must not replace the pages the owner already loaded: new terminal rows are merged in
+// front of them, and the cursor at the end of the loaded pages stays valid because the tail itself is unchanged.
+async function refreshTasks({ append = false, background = false } = {}) {
   const request = Symbol();
   historyRequest = request;
+  // Set while the request is in flight so the merge knows which History the pages it is about to extend belongs to.
+  const paging = !append && background && historyPaged && historyTasks !== undefined;
   try {
     const result = await api(`${TASKS_PATH}?${historyQuery({ append })}`);
     if (historyRequest !== request) return;
     if (!Array.isArray(result.active) || !Array.isArray(result.history)) throw new Error('Unexpected task list');
     activeTasks = result.active.map(taskSummary);
     const page = result.history.map(taskSummary);
-    historyTasks = append ? [...(historyTasks ?? []), ...page] : page;
-    historyCursor = typeof result.historyCursor === 'string' ? result.historyCursor : undefined;
+    if (paging) {
+      // Keep the loaded pages, add only rows that are not among them, and keep their cursor.
+      const loaded = new Set(historyTasks.map(task => task.id));
+      historyTasks = [...page.filter(task => !loaded.has(task.id)), ...historyTasks];
+    } else {
+      historyTasks = append ? [...(historyTasks ?? []), ...page] : page;
+      historyCursor = typeof result.historyCursor === 'string' ? result.historyCursor : undefined;
+      historyPaged = append;
+    }
     taskBlueprints = Array.isArray(result.blueprints) ? result.blueprints.filter(name => typeof name === 'string') : [];
     tasksBlocked = false;
     tasksError = '';
