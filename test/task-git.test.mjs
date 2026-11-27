@@ -498,3 +498,80 @@ test('a review record written without source provenance is completed from its va
   assert.equal(persisted.review.commit, commit);
   assert.equal(await git(prepared.path, 'rev-parse', 'HEAD'), commit, 'the checkout never moved');
 });
+
+async function sha256Repository(t) {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-git-sha256-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'source');
+  await mkdir(source, { recursive: true });
+  await git(source, 'init', '--object-format=sha256', '-b', 'main');
+  await git(source, 'config', 'user.email', 'test@example.invalid');
+  await git(source, 'config', 'user.name', 'Test');
+  await writeFile(join(source, 'README.md'), 'base\n');
+  await git(source, 'add', 'README.md');
+  await git(source, 'commit', '-m', 'base');
+  const remote = join(root, 'remote.git');
+  await run('git', ['clone', '--bare', source, remote]);
+  const baseSha = await git(source, 'rev-parse', 'HEAD');
+  return { root, remote, baseSha, dataDir: join(root, 'data') };
+}
+
+test('a Task store inherits a SHA-256 source and validates exact 40- or 64-character object ids', async t => {
+  const repo = await sha256Repository(t);
+  assert.equal(repo.baseSha.length, 64);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const taskId = id();
+  const workspace = await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  assert.equal(workspace.baseSha, repo.baseSha);
+  assert.equal(workspace.expectedHead, repo.baseSha);
+  // The Task's own store and worktree use the source's object format; a SHA-1 store could never fetch these objects.
+  assert.equal(await git(workspace.path, 'rev-parse', '--show-object-format'), 'sha256');
+  assert.equal(await git(workspace.path, 'rev-parse', 'HEAD'), repo.baseSha);
+  assert.deepEqual(await taskGit.checkFinish(taskId), {
+    ok: true, commit: repo.baseSha, base: repo.baseSha, expectedHead: repo.baseSha, unchanged: true,
+  });
+
+  // A commit on the Task branch is handed off and verified by exact 64-character id.
+  await writeFile(join(workspace.path, 'notes.txt'), 'task work\n');
+  await run('git', ['add', 'notes.txt'], { cwd: workspace.path });
+  await run('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'task work'], { cwd: workspace.path });
+  const head = await git(workspace.path, 'rev-parse', 'HEAD');
+  assert.equal(head.length, 64);
+  const missing = await taskGit.checkFinish(taskId);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, 'handoff_missing');
+  await git(workspace.path, 'push', repo.remote, `HEAD:refs/heads/task/${taskId}`);
+  const verified = await taskGit.checkFinish(taskId);
+  assert.equal(verified.ok, true);
+  assert.equal(verified.commit, head);
+
+  // A review of that exact commit opens in a SHA-256 store of its own.
+  const reviewId = id();
+  const review = await taskGit.prepareReview(reviewId,
+    { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote },
+    { sourceTaskId: taskId, commit: head, baseSha: repo.baseSha, branch: `task/${taskId}`, handoff: repo.remote });
+  assert.equal(review.expectedHead, head);
+  assert.equal(await git(review.path, 'rev-parse', 'HEAD'), head);
+  assert.equal(await git(review.path, 'rev-parse', '--show-object-format'), 'sha256');
+  assert.deepEqual(await taskGit.checkFinish(reviewId, { review: { commit: head, baseSha: repo.baseSha, sourceTaskId: taskId } }), {
+    ok: true, commit: head, base: repo.baseSha, expectedHead: head, unchanged: true,
+    review: { sourceTaskId: taskId, commit: head, baseSha: repo.baseSha, sourceBranch: `task/${taskId}`, sourceHandoff: repo.remote },
+  });
+
+  // Only a whole SHA-1 or SHA-256 object id is accepted: a 41-character prefix is not an object id.
+  for (const commit of ['a'.repeat(41), 'a'.repeat(63), 'g'.repeat(64), 'a'.repeat(80)]) {
+    await assert.rejects(
+      taskGit.prepareReview(id(), { name: 'sample', remote: repo.remote, base: 'main' },
+        { sourceTaskId: taskId, commit, baseSha: repo.baseSha }),
+      error => error.code === 'invalid_review',
+      `commit ${commit.length} characters`,
+    );
+  }
+  assert.equal(await git(workspace.mirror, 'rev-parse', '--show-object-format'), 'sha256');
+  // The private seed namespace is unchanged: the store holds only this Task's branch, seeded refs under refs/manolo, and
+  // no writable remote.
+  assert.deepEqual((await git(workspace.mirror, 'for-each-ref', '--format=%(refname)', 'refs/heads/')).split('\n').filter(Boolean),
+    [`refs/heads/task/${taskId}`]);
+  assert.match(await git(workspace.mirror, 'for-each-ref', '--format=%(refname)', 'refs/manolo/'), /refs\/manolo\/seed\/origin\/main/);
+  await assert.rejects(git(workspace.mirror, 'remote', 'get-url', 'origin'), /No such remote/);
+});

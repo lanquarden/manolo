@@ -16,7 +16,7 @@ import { admittedRoom, roomBotUsername } from './telegram-room.mjs';
 import { createTelegramXmppTransport } from './telegram-xmpp.mjs';
 import { createTypingActivity } from './typing-activity.mjs';
 import { createWebSessions } from './web-session.mjs';
-import { BLUEPRINT_ID, verifyBlueprintSnapshot, verifyProfileSnapshot } from './work-blueprints.mjs';
+import { BLUEPRINT_ID, TASK_CATALOG_LIMIT, TASK_PROFILE_LIMIT, verifyBlueprintSnapshot, verifyProfileSnapshot } from './work-blueprints.mjs';
 
 const webHost = process.env.HOST ?? '127.0.0.1';
 const internalHost = process.env.MANOLO_INTERNAL_HOST ?? '127.0.0.1';
@@ -592,20 +592,20 @@ function capabilityInventory(value) {
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'source', 64) !== undefined && { source: text(item, 'source', 64) }),
     }, 128),
-    // The catalog for creating work, forwarded exactly as the worker filtered it. History filters in the Tasks view are a
-    // separate projection and never stand in for this list.
+    // The catalog for creating work, forwarded exactly as the worker filtered it. The limit is the validated configured
+    // maximum for both Blueprint formats, so this projection can never hide a row that create_task still accepts.
     blueprints: rows('blueprints', item => typeof item?.id === 'string' && {
       id: item.id.slice(0, 64),
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'profile', 64) !== undefined && { profile: text(item, 'profile', 64) }),
-    }, 16),
+    }, TASK_CATALOG_LIMIT),
     profiles: optionalRows('profiles', item => typeof item?.id === 'string' && {
       id: item.id.slice(0, 64),
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'model', 128) !== undefined && { model: text(item, 'model', 128) }),
       ...(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(item?.thinkingLevel) &&
         { thinkingLevel: item.thinkingLevel }),
-    }, 16),
+    }, TASK_PROFILE_LIMIT),
     agentsFiles: rows('agentsFiles', item => typeof item?.path === 'string' && {
       path: item.path.slice(0, 1024),
       bytes: Number.isSafeInteger(item.bytes) && item.bytes >= 0 ? item.bytes : 0,

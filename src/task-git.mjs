@@ -9,7 +9,7 @@ import { isSafeBranch } from './work-blueprints.mjs';
 const exec = promisify(execFile);
 const TASK_ID = /^[0-9a-f]{32}$/;
 const BRANCH = /^(?:task|review)\/[0-9a-f]{32}$/;
-const SHA = /^[0-9a-f]{40,64}$/;
+const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_GIT_OUTPUT = 4 * 1024 * 1024;
 
 const failure = (code, message) => Object.assign(new Error(message), { code, taskGit: true });
@@ -153,6 +153,17 @@ export function openTaskGit({ dataDir }) {
 
   const taskMirrorPath = taskId => join(reposDir, `task-${taskId}.git`);
 
+  // Object IDs are not interchangeable between hashes, and a fetch refuses to cross formats. A Task's own store therefore
+  // inherits the object format of the seed it is built from rather than defaulting to SHA-1 and failing every fetch from a
+  // SHA-256 repository.
+  async function objectFormat(path) {
+    const format = (await git(['rev-parse', '--show-object-format'], path)).trim();
+    if (format !== 'sha1' && format !== 'sha256') {
+      throw failure('git_failed', 'The Task repository uses an unsupported object format.');
+    }
+    return format;
+  }
+
   // The shared store is fetched only through remote-tracking refs. Task branches live in each Task's own store, so a
   // fetch in one Task can never prune or rewrite another Task's branch, stash, or config.
   async function seedFor(repository, { tolerant = false } = {}) {
@@ -210,7 +221,7 @@ export function openTaskGit({ dataDir }) {
     const path = taskMirrorPath(taskId);
     if (existsSync(path)) return path;
     await mkdir(reposDir, { recursive: true, mode: 0o700 });
-    await git(['init', '--bare', '--quiet', '--', path], reposDir);
+    await git(['init', '--bare', '--quiet', `--object-format=${await objectFormat(seed)}`, '--', path], reposDir);
     await linkSeedPacks(seed, path);
     try {
       await git(['fetch', '--no-tags', '--force', '--', seed, SEED_REFS], path);

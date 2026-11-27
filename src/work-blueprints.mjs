@@ -12,7 +12,12 @@ const TOOL_ID = /^[a-z][a-z0-9_]{0,63}$/;
 const REPO_ID = BLUEPRINT_ID;
 const FILE_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 const MAX_BLUEPRINTS = 24;
+const MAX_LEGACY_BLUEPRINTS = 12;
+// The Task catalog every surface advertises is both formats combined: a bundle manifest and the legacy text map each keep
+// their own validated limit, and a consumer that merges them must not apply the smaller one to the merged list.
+export const TASK_CATALOG_LIMIT = MAX_BLUEPRINTS + MAX_LEGACY_BLUEPRINTS;
 const MAX_PROFILES = 16;
+export const TASK_PROFILE_LIMIT = MAX_PROFILES;
 const MAX_DESCRIPTION = 160;
 const MAX_INSTRUCTIONS = 4000;
 const MAX_BUNDLE_BYTES = 64 * 1024;
@@ -219,25 +224,25 @@ function blueprintConfig(root, id, value, profiles, repositories) {
 
 function legacyBlueprints(raw) {
   if (raw === undefined) return new Map();
-  if (raw.length > 64 * 1024) throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
+  if (raw.length > 64 * 1024) throw invalid(`MANOLO_WORK_BLUEPRINTS must define at most ${MAX_LEGACY_BLUEPRINTS} named, non-secret text blueprints with description and instructions.`);
   let value;
   try { value = JSON.parse(raw); } catch { throw invalid('MANOLO_WORK_BLUEPRINTS must be valid JSON.'); }
   const repeated = duplicateMember(raw);
   if (repeated !== undefined) throw invalid(`MANOLO_WORK_BLUEPRINTS repeats a blueprint id: ${repeated}.`);
-  if (!isObject(value) || Object.keys(value).length > 12) throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 blueprints.');
+  if (!isObject(value) || Object.keys(value).length > MAX_LEGACY_BLUEPRINTS) throw invalid(`MANOLO_WORK_BLUEPRINTS must define at most ${MAX_LEGACY_BLUEPRINTS} blueprints.`);
   return new Map(Object.entries(value).map(([id, blueprint]) => {
     if (!BLUEPRINT_ID.test(id) || !isObject(blueprint) || Object.keys(blueprint).length !== 2 ||
         !Object.hasOwn(blueprint, 'description') || !Object.hasOwn(blueprint, 'instructions')) {
-      throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
+      throw invalid(`MANOLO_WORK_BLUEPRINTS must define at most ${MAX_LEGACY_BLUEPRINTS} named, non-secret text blueprints with description and instructions.`);
     }
     const description = cleanText(blueprint.description, MAX_DESCRIPTION, `Blueprint ${id} description`);
     const text = blueprint.instructions;
     if (typeof text !== 'string' || !text.isWellFormed() || text.length > MAX_INSTRUCTIONS) {
-      throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
+      throw invalid(`MANOLO_WORK_BLUEPRINTS must define at most ${MAX_LEGACY_BLUEPRINTS} named, non-secret text blueprints with description and instructions.`);
     }
     const instructions = text.replace(/\r\n?/g, '\n').trim();
     if (!instructions || unsafeText.test(instructions)) {
-      throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
+      throw invalid(`MANOLO_WORK_BLUEPRINTS must define at most ${MAX_LEGACY_BLUEPRINTS} named, non-secret text blueprints with description and instructions.`);
     }
     // A legacy Blueprint keeps the exact pre-bundle revision formula. An unchanged text has the same hash after the
     // upgrade, so a queued Task pinned before the rollout still resolves.
@@ -281,7 +286,7 @@ export function loadWorkBlueprints(raw, { dir, env = process.env } = {}) {
   const repositoriesRaw = manifest.repositories ?? {};
   if (!isObject(profilesRaw) || Object.keys(profilesRaw).length > MAX_PROFILES) throw invalid('Blueprint manifest profiles are invalid.');
   if (!isObject(blueprintsRaw) || Object.keys(blueprintsRaw).length === 0 || Object.keys(blueprintsRaw).length > MAX_BLUEPRINTS) {
-    throw invalid('Blueprint manifest must define between 1 and 24 blueprints.');
+    throw invalid(`Blueprint manifest must define between 1 and ${MAX_BLUEPRINTS} blueprints.`);
   }
   if (!isObject(repositoriesRaw) || Object.keys(repositoriesRaw).length > 16) throw invalid('Blueprint manifest repositories are invalid.');
   const profiles = new Map(Object.entries(profilesRaw).map(([id, value]) => [id, profileConfig(id, value)]));

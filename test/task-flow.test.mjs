@@ -1530,3 +1530,118 @@ test('a migrated row cannot bare-settle around a required pull request, whatever
     store.db.close();
   }
 });
+
+test('a cf21513 ledger with a delivered resume and no item left migrates to a start of the same execution', { timeout: 20_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-resume-migration-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dbPath = join(root, 'relay.sqlite');
+  // The exact ledger shape of the candidate that shipped the durable delivery receipt: `resumeDelivered` cleared the item
+  // slot but left `execution_kind='resume'`, so a Task with nothing left to deliver read as an empty resume.
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY NOT NULL,
+      scope TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      origin_turn_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      input TEXT NOT NULL,
+      blueprint_id TEXT,
+      blueprint_revision TEXT,
+      blueprint_snapshot TEXT,
+      profile_snapshot TEXT,
+      status TEXT NOT NULL CHECK(status IN ('queued','running','waiting','done','failed','cancelled')),
+      finish_required INTEGER NOT NULL DEFAULT 1,
+      finish_accepted_at TEXT,
+      finish_summary TEXT,
+      handoff_evidence TEXT,
+      blocked_reason TEXT,
+      review_snapshot TEXT,
+      requires_pr INTEGER NOT NULL DEFAULT 0,
+      not_before INTEGER NOT NULL DEFAULT 0,
+      execution_id TEXT,
+      execution_kind TEXT NOT NULL DEFAULT 'start' CHECK(execution_kind IN ('start','resume')),
+      resume_item_id TEXT,
+      context TEXT,
+      claim_at INTEGER,
+      heartbeat_at INTEGER,
+      dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+      next_at INTEGER NOT NULL DEFAULT 0,
+      dispatch_pending INTEGER NOT NULL DEFAULT 0,
+      stop_pending INTEGER NOT NULL DEFAULT 0,
+      stop_attempts INTEGER NOT NULL DEFAULT 0,
+      stop_next_at INTEGER NOT NULL DEFAULT 0,
+      stop_confirmed_at TEXT,
+      outcome TEXT,
+      failure TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE task_inbox_items (
+      id TEXT PRIMARY KEY NOT NULL,
+      task_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('question','report')),
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('open','answered','declined','cancelled','fenced')),
+      response TEXT,
+      responded_at TEXT,
+      delivered_at TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  const now = new Date().toISOString();
+  const insertTask = legacy.prepare(`INSERT INTO tasks(id,scope,owner,agent,origin_turn_id,title,input,status,
+    execution_id,execution_kind,resume_item_id,context,dispatch_pending,next_at,blocked_reason,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,'resume',NULL,?,?,?,?,?,?)`);
+  const runningId = 'a'.repeat(32);
+  const queuedId = 'b'.repeat(32);
+  const undeliveredId = 'c'.repeat(32);
+  insertTask.run(runningId, 'scope', 'owner', 'canary', 'turn', 'Delivered resume', 'Work.', 'running',
+    '1'.repeat(32), 'The owner answered the question:\nYes', 0, 0, 'Resuming after the answer.', now, now);
+  insertTask.run(queuedId, 'scope', 'owner', 'canary', 'turn', 'Queued resume', 'Work.', 'queued',
+    '2'.repeat(32), 'The owner answered the question:\nYes', 0, 0, null, now, now);
+  insertTask.run(undeliveredId, 'scope', 'owner', 'canary', 'turn', 'Undelivered resume', 'Work.', 'running',
+    '3'.repeat(32), 'The owner answered the question:\nYes', 0, 0, null, now, now);
+  const item = legacy.prepare(`INSERT INTO task_inbox_items(id,task_id,kind,prompt,status,response,responded_at,delivered_at,created_at)
+    VALUES(?,?,'question','Ready?','answered','Yes',?,?,?)`);
+  item.run('4'.repeat(32), runningId, now, now, now);
+  item.run('5'.repeat(32), queuedId, now, now, now);
+  item.run('6'.repeat(32), undeliveredId, now, null, now);
+  legacy.close();
+
+  const store = openTaskStore(new DatabaseSync(dbPath));
+  try {
+    const read = id => store.db.prepare('SELECT * FROM tasks WHERE id=?').get(id);
+    // A recorded delivery is the durable evidence: the row becomes a plain start of the SAME execution and is scheduled.
+    const running = read(runningId);
+    assert.equal(running.execution_kind, 'start');
+    assert.equal(running.execution_id, '1'.repeat(32));
+    assert.equal(running.resume_item_id, null);
+    assert.equal(running.context, null, 'the delivered answer is not replayed to a fresh execution');
+    assert.equal(running.dispatch_pending, 1, 'the row is scheduled instead of stranded');
+    assert.equal(running.next_at, 0);
+    assert.deepEqual(store.dueDispatch(Date.now()).map(row => row.id), [runningId]);
+
+    const queued = read(queuedId);
+    assert.equal(queued.execution_kind, 'start');
+    const claimed = store.claim(Date.now());
+    assert.equal(claimed.id, queuedId);
+    assert.equal(claimed.execution_id, '2'.repeat(32), 'the same execution is dispatched, not a replacement');
+    assert.equal(claimed.execution_kind, 'start');
+    assert.equal(store.inboxItem(null), undefined, 'there is no item left to deliver');
+
+    // Without that evidence nothing is fabricated: the row keeps its shape and is still reported as an unavailable resume.
+    const undelivered = read(undeliveredId);
+    assert.equal(undelivered.execution_kind, 'resume');
+    assert.equal(undelivered.dispatch_pending, 0);
+    assert.equal(store.dueDispatch(Date.now()).some(row => row.id === undeliveredId), false);
+    assert.equal(store.resumeUnavailable({
+      taskId: undeliveredId, executionId: undelivered.execution_id, itemId: '6'.repeat(32),
+      reason: 'The execution that asked for your input is no longer available.',
+    }), true);
+    assert.equal(store.get('scope', undeliveredId).status, 'failed');
+  } finally {
+    store.db.close();
+  }
+});

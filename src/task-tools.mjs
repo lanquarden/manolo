@@ -22,6 +22,7 @@ const MAX_IDS = 500;
 const RELAY_TIMEOUT_MS = 8_000;
 const HEARTBEAT_MS = 15_000;
 const SETTLE_RETRY_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+const BLOCK_REPORT_ATTEMPTS = 6;
 const MAX_CONTINUATIONS = 5;
 const CONTINUE_TEXT = 'Your Task workspace was unavailable and is available again. Continue this Task in the same execution; call the finish tool when the work is complete and verified.';
 const EXECUTION_ID = /^[0-9a-f]{32}$/;
@@ -73,9 +74,13 @@ function toolResult(value, isError = false) {
 
 const idempotency = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 
-export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit, settleRetryMs = SETTLE_RETRY_MS }) {
+export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit, settleRetryMs = SETTLE_RETRY_MS, heartbeatMs = HEARTBEAT_MS }) {
   let harness;
+  // A watcher belongs to one admitted submission, not to an execution identity. A repaired execution that admits a
+  // continuation therefore always gets its own watcher even while the previous one is still tearing down, and the stale
+  // watcher is fenced by the submission it was admitted for.
   const watchers = new Map();
+  const watcherKey = (executionId, submissionId) => `${executionId}:${submissionId}`;
 
   async function relay(path, { method = 'POST', body, key, timeout = RELAY_TIMEOUT_MS } = {}) {
     if (!cfg.relay) throw new Error('Task orchestration needs a relay URL.');
@@ -576,16 +581,18 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   // Exactly one durable corrective turn per execution: a bare final turn is never success, and a second one fails the
   // Task instead of restarting the child in a loop. The counter lives in the execution document, so a worker restart
   // continues the same Task and session rather than granting a fresh corrective.
-  async function correctiveTurn(taskId, executionId) {
+  async function correctiveTurn(taskId, executionId, submissionId) {
     const before = await harness.snapshot(TaskExecution, taskId, context);
-    if (!before || before.executionId !== executionId || before.state === 'cancelled' || before.finishAccepted ||
+    if (!before || before.executionId !== executionId || before.submissionId !== submissionId ||
+        before.state === 'cancelled' || before.finishAccepted ||
         (before.correctives ?? 0) >= 1 || !before.conversationId) return undefined;
     // The conversation handle must be opened outside the commit; opening it inside waits on the commit itself.
     const conversation = await harness.conversation(before.conversationId, context);
     if (!conversation) return undefined;
     return harness.commit(async tx => {
       const execution = await tx.doc(TaskExecution, taskId, null);
-      if (execution.executionId !== executionId || execution.state === 'cancelled' || execution.finishAccepted) return undefined;
+      if (execution.executionId !== executionId || execution.submissionId !== submissionId ||
+          execution.state === 'cancelled' || execution.finishAccepted) return undefined;
       if ((execution.correctives ?? 0) >= 1) return undefined;
       const run = await tx.doc(TaskRun, before.conversationId, null);
       if (run.yielded !== undefined || run.state === 'cancelled') return undefined;
@@ -616,27 +623,56 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     }
   }
 
-  async function reportBlocked(taskId, executionId, state) {
+  async function reportBlocked(taskId, executionId, submissionId, state) {
+    // The intent is durable on this worker before the relay is told. A dispatch retry that lands while the report is in
+    // flight (or after it was lost) must not answer "running" for a submission that has already ended: it promotes the
+    // same intent to the blocked state and answers "blocked", so the relay keeps a retry obligation instead of clearing
+    // one that a later local block would need.
     const reason = boundedPlain(state.message ?? state.reason ?? 'The Task workspace is unavailable.', MAX_NOTE);
+    const intent = { reason: state.reason ?? 'worktree_missing', message: reason };
+    const written = await harness.commit(async tx => {
+      const record = await tx.doc(TaskExecution, taskId, null);
+      if (record.executionId !== executionId || record.submissionId !== submissionId) return false;
+      if (record.state === 'cancelled' || record.finishAccepted) return false;
+      record.blockIntent = intent;
+      return true;
+    }, context).catch(() => false);
+    if (!written) return false;
+    // A block report that lands after a relay restart or a transient failure still has to create its obligation, so it is
+    // retried past the first few attempts; only a worker restart ends the retries, and the durable intent covers that.
     let reported = false;
-    for (let attempt = 0; attempt < 3 && !reported; attempt += 1) {
+    for (let attempt = 0; attempt < BLOCK_REPORT_ATTEMPTS && !reported; attempt += 1) {
+      const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+      // A continuation admitted while this report was in flight owns the execution now; a block for the old submission
+      // would only make the relay re-drive work that is already live again.
+      if (!current || current.executionId !== executionId || current.submissionId !== submissionId ||
+          current.state === 'cancelled' || current.finishAccepted) return false;
       const result = await relay(`/v1/tasks/${taskId}/block`, {
-        key: idempotency('block', taskId, executionId, state.reason),
+        key: idempotency('block', taskId, executionId, intent.reason),
         body: { executionId, reason },
       }).catch(() => ({ ok: false }));
       reported = result.ok;
       if (!reported) await sleep(settleRetryMs[Math.min(attempt, settleRetryMs.length - 1)]).catch(() => {});
     }
-    // The relay must know it owes a retry before the local execution stops watching. If the report never landed, leave
-    // the execution running so a restart reattaches and evaluates the workspace again instead of stranding the Task.
+    // An unacknowledged report keeps its durable intent and leaves the execution running, so a restart re-reports it and
+    // a dispatch retry answers "blocked" instead of stranding the Task in a running state with no relay obligation.
     if (!reported) return false;
-    await harness.commit(async tx => {
+    return promoteBlocked(taskId, executionId, submissionId, intent);
+  }
+
+  // The intent becomes the durable blocked state exactly once, for the submission that reported it. A newer submission
+  // of the same execution is never relabelled, so a continuation that was admitted meanwhile keeps its own watcher.
+  async function promoteBlocked(taskId, executionId, submissionId, intent) {
+    const changed = await harness.commit(async tx => {
       const record = await tx.doc(TaskExecution, taskId, null);
-      if (record.executionId !== executionId || record.state === 'cancelled' || record.finishAccepted) return;
+      if (record.executionId !== executionId || record.submissionId !== submissionId) return false;
+      if (record.state === 'cancelled' || record.finishAccepted) return false;
       record.state = 'blocked';
-      record.blockedReason = reason;
-    }, context);
-    return true;
+      record.blockedReason = intent?.message ?? record.blockIntent?.message ?? 'The Task workspace is unavailable.';
+      delete record.blockIntent;
+      return true;
+    }, context).catch(() => false);
+    return changed;
   }
 
   // Continue a blocked execution in its own conversation after the workspace is restored. The conversation already holds
@@ -647,6 +683,10 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (!execution || execution.executionId !== executionId) return { ok: false, reason: 'unknown_execution' };
     if (execution.state !== 'blocked') return { ok: false, reason: 'not_blocked' };
     if ((execution.continuations ?? 0) >= MAX_CONTINUATIONS) return { ok: false, reason: 'continuation_limit' };
+    // The workspace must genuinely be back before another continuation is admitted: admitting against a workspace that is
+    // still lost would spend a continuation on a run that is blocked before its first tool call.
+    const workspace = await workspaceState(execution);
+    if (!workspace.ok) return { ok: false, reason: workspace.reason ?? 'worktree_missing', message: workspace.message };
     const conversation = execution.conversationId ? await harness.conversation(execution.conversationId, context) : undefined;
     if (!conversation) return { ok: false, reason: 'unknown_execution' };
     const submissionId = await harness.commit(async tx => {
@@ -665,6 +705,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       record.submissionId = admitted;
       record.state = 'running';
       delete record.blockedReason;
+      delete record.blockIntent;
       if (itemId) record.resumedItem = itemId;
       Object.assign(run, { taskId, executionId, state: 'running' });
       delete run.yielded;
@@ -684,8 +725,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   }
 
   function watch(taskId, executionId, submissionId) {
-    if (watchers.has(executionId)) return;
-    watchers.set(executionId, true);
+    const key = watcherKey(executionId, submissionId);
+    if (watchers.has(key)) return;
+    watchers.set(key, true);
     void (async () => {
       try {
         let current = submissionId;
@@ -698,7 +740,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             let finished = false;
             const wait = submission.wait(context).then(value => { finished = true; return value; },
               () => { finished = true; return undefined; });
-            const timer = sleep(HEARTBEAT_MS, undefined, { signal: beat.signal }).then(() => null, () => null);
+            const timer = sleep(heartbeatMs, undefined, { signal: beat.signal }).then(() => null, () => null);
             const result = await Promise.race([wait, timer]);
             beat.abort();
             if (finished) {
@@ -710,6 +752,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           if (!settled) return;
           let execution = await harness.snapshot(TaskExecution, taskId, context);
           if (!execution || execution.executionId !== executionId || execution.state === 'cancelled') return;
+          // This watcher owns exactly the submission it was admitted for. A continuation or corrective admitted meanwhile
+          // has its own owner, so a late result here must not settle, continue, or downgrade that newer submission.
+          if (execution.submissionId !== current) return;
           // A restart can lose the local finish marker after the relay accepted it. Reconcile before deciding that a
           // bare final needs a corrective turn or that a failed provider stop wins.
           if (!execution.finishAccepted) {
@@ -717,7 +762,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             if (remote?.ok && remote.body?.finishAccepted) {
               await harness.commit(async tx => {
                 const record = await tx.doc(TaskExecution, taskId, null);
-                if (record.executionId !== executionId || record.state === 'cancelled') return;
+                if (record.executionId !== executionId || record.submissionId !== current || record.state === 'cancelled') return;
                 record.finishAccepted = true;
                 record.finishSummary = remote.body.finishSummary;
                 record.finishEvidence = remote.body.evidence;
@@ -736,8 +781,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           // terminal failure are spent on it, and a restored workspace continues this same Task.
           const workspace = await workspaceState(execution);
           if (!workspace.ok) {
-            // A block the relay did not record leaves the execution reattachable for a restart rather than stranded.
-            await reportBlocked(taskId, executionId, workspace);
+            // A block whose report never landed keeps its durable intent; a dispatch retry or a restart promotes and
+            // re-reports it instead of acknowledging a submission that has already ended.
+            await reportBlocked(taskId, executionId, current, workspace);
             return;
           }
           if (settled.status !== 'done') {
@@ -752,13 +798,13 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
             return;
           }
-          const next = await correctiveTurn(taskId, executionId).catch(() => undefined);
+          const next = await correctiveTurn(taskId, executionId, current).catch(() => undefined);
           if (next) {
             current = next;
             continue;
           }
           const latest = await harness.snapshot(TaskExecution, taskId, context);
-          if (latest?.finishAccepted) {
+          if (latest?.executionId === executionId && latest.submissionId === current && latest.finishAccepted) {
             const summary = latest.finishSummary ?? await readResult(settled.conversationId, settled.answer);
             const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
             if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
@@ -772,7 +818,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       } catch {
         // A missing submission or a closed Harness leaves the Task running for a restart to reattach.
       } finally {
-        watchers.delete(executionId);
+        watchers.delete(key);
       }
     })();
   }
@@ -786,22 +832,34 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (!task || typeof task.title !== 'string' || typeof task.input !== 'string') throw Object.assign(new Error('Invalid task'), { status: 400 });
     const existing = await harness.snapshot(TaskExecution, taskId, context);
     if (existing?.executionId === executionId) {
-      // A dispatch retry reuses the execution ID: the same child submission, never a second one. The workspace must
-      // still prove its identity; a replaced directory blocks recoverably instead of being recreated or failed.
-      const workspace = await workspaceState(existing);
-      if (!workspace.ok) return { status: 'blocked', reason: workspace.reason, message: workspace.message };
+      // A dispatch retry reuses the execution ID: the same child submission, never a second one.
       if (existing.state === 'blocked') {
         const continued = await continueExecution(taskId, executionId);
         if (continued.ok) return { status: 'running' };
         // A competing dispatch already continued it; that dispatch owns the watcher, so this retry only acknowledges.
         if (continued.reason === 'not_blocked') return { status: 'running' };
         return {
-          status: 'blocked', reason: 'worktree_missing',
+          status: 'blocked', reason: continued.reason ?? 'worktree_missing',
           message: continued.reason === 'continuation_limit'
             ? 'The Task workspace was lost repeatedly; the Task was not resumed. Restore it and start a new Task, or finish it explicitly.'
-            : 'The blocked Task execution could not be resumed; restore its workspace.',
+            : continued.message ?? 'The blocked Task execution could not be resumed; restore its workspace.',
         };
       }
+      // The durable intent left by a report whose acknowledgement was delayed or lost. The submission it belongs to has
+      // ended, so acknowledging this retry as "running" would let the relay clear the retry obligation that the block
+      // still needs. Promote the intent here and answer truthfully; the relay records the block and drives the retry.
+      if (existing.blockIntent !== undefined && existing.submissionId !== undefined) {
+        const intent = existing.blockIntent;
+        await promoteBlocked(taskId, executionId, existing.submissionId, intent);
+        return {
+          status: 'blocked', reason: intent.reason ?? 'worktree_missing',
+          message: intent.message ?? 'The Task workspace is unavailable.',
+        };
+      }
+      // The workspace must still prove its identity; a replaced directory blocks recoverably instead of being recreated
+      // or failed, so a retry never acknowledges a runnable execution whose child cannot work.
+      const workspace = await workspaceState(existing);
+      if (!workspace.ok) return { status: 'blocked', reason: workspace.reason, message: workspace.message };
       if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
       return { status: existing.state ?? 'running' };
     }
@@ -967,7 +1025,14 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         await recordDelivery(taskId, executionId, itemId);
         return { delivered: true };
       }
-      return { delivered: false, reason: continued.reason === 'continuation_limit' ? 'worktree_missing' : 'not_yet_parked' };
+      return {
+        delivered: false,
+        // A missing workspace keeps the answered item and blocks the same execution; a competing dispatch that already
+        // continued it leaves the answer to the next attempt rather than declaring it undeliverable.
+        ...(continued.reason === 'worktree_missing'
+          ? { reason: 'worktree_missing', ...(continued.message && { message: continued.message }) }
+          : { reason: continued.reason === 'continuation_limit' ? 'worktree_missing' : 'not_yet_parked' }),
+      };
     }
     if (!execution.conversationId) return { delivered: false, reason: 'unknown_execution' };
     const run = await harness.snapshot(TaskRun, execution.conversationId, context);
@@ -1056,12 +1121,21 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     worker,
     attach(openHarness) { harness = openHarness; },
     // Reattach after a restart: a run that was admitted before the process died still has to report its outcome, and a
-    // parked call wakes from the durable signal.
+    // parked call wakes from the durable signal. A block intent that was never acknowledged is re-reported first, so the
+    // relay's retry obligation exists before anything can mistake this execution for runnable.
     async start() {
       const index = await harness.snapshot(TaskIndex, 'all', context);
       for (const taskId of index?.ids ?? []) {
-        const execution = await harness.snapshot(TaskExecution, taskId, context);
-        if (!execution?.submissionId || !['running', 'parked'].includes(execution.state)) continue;
+        let execution = await harness.snapshot(TaskExecution, taskId, context);
+        if (!execution?.submissionId) continue;
+        if (execution.blockIntent !== undefined && execution.state === 'running') {
+          await reportBlocked(taskId, execution.executionId, execution.submissionId, execution.blockIntent).catch(() => {});
+          // The replay either promoted the block (a dispatch or the relay continues it) or kept the intent durable, so
+          // this execution is not advertised as runnable either way.
+          execution = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+          if (!execution || execution.blockIntent !== undefined) continue;
+        }
+        if (!['running', 'parked'].includes(execution.state)) continue;
         watch(taskId, execution.executionId, execution.submissionId);
       }
     },

@@ -1014,16 +1014,19 @@ test('a pinned model profile keeps resolving from the trusted proxy catalog afte
   await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
   await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
     version: 1,
-    profiles: { fast: { description: 'Fast alias', model: 'alt-model', thinkingLevel: 'low' } },
+    profiles: { fast: { description: 'Fast alias', model: 'z-alt-model', thinkingLevel: 'low' } },
     blueprints: {
       general: { description: 'Fast Task', role: 'task', profile: 'fast', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
     },
   }));
+  // A catalog larger than any earlier registry cap. The pinned alias sorts last, so a prefix of the trusted list could
+  // never contain it: membership must be the whole served set, not the first N entries of it.
+  const catalog = [...Array.from({ length: 128 }, (_, index) => `filler-${String(index).padStart(3, '0')}`), 'served-model', 'z-alt-model'];
   const requests = [];
   const proxy = createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ object: 'list', data: [{ id: 'served-model' }, { id: 'alt-model' }] }));
+      res.end(JSON.stringify({ object: 'list', data: catalog.map(id => ({ id })) }));
       return;
     }
     let body = '';
@@ -1053,7 +1056,7 @@ test('a pinned model profile keeps resolving from the trusted proxy catalog afte
   const pinned = sealBlueprintSnapshot({
     id: 'general', role: 'task', description: 'Fast Task', instructions: 'Work.', files: [],
     tools: ['report_progress', 'post_inbox', 'finish'],
-    profile: { id: 'fast', description: 'Fast alias', provider: 'model-proxy', model: 'alt-model', thinkingLevel: 'low' },
+    profile: { id: 'fast', description: 'Fast alias', provider: 'model-proxy', model: 'z-alt-model', thinkingLevel: 'low' },
   });
   const settings = {
     MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'served-model',
@@ -1071,8 +1074,9 @@ test('a pinned model profile keeps resolving from the trusted proxy catalog afte
       },
     }),
   });
+  assert.ok(catalog.length > 128, `${catalog.length} served models`);
   const assertPinnedRequest = body => {
-    assert.equal(body.model, 'alt-model');
+    assert.equal(body.model, 'z-alt-model');
     assert.equal(body.reasoning_effort, 'low');
   };
 

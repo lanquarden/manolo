@@ -5,19 +5,30 @@ import { defineDoc, defineExtension, defineTool, ProviderDoc, wrapTool } from '@
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
 import { WORK_TOOL_NAMES } from './work-sessions.mjs';
 
-// The proxy exposes an OpenAI-compatible model list. It is read once at startup: the id it returns are the ids a profile
-// may resolve to. A request that fails or does not parse means the catalog is unknown, and only the explicit default is
-// advertised rather than every alias the manifest happens to name.
+// The proxy exposes an OpenAI-compatible model list. It is read once at startup: the ids it returns are the ids a profile
+// may resolve to. The read is bounded by bytes, not by a count of entries: the list is the proxy's own authority on what it
+// serves, and dropping its tail could not resolve a model the proxy still serves. A request that fails, is oversized, or
+// does not parse means the catalog is unknown, and only the explicit default is advertised rather than every alias the
+// manifest happens to name.
+const MAX_PROXY_CATALOG_BYTES = 512 * 1024;
+
 async function proxyCatalog(url, apiKey) {
   try {
     const response = await fetch(`${url.href}/models`, {
       headers: { authorization: `Bearer ${apiKey}` }, redirect: 'error', signal: AbortSignal.timeout(5_000),
     });
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       await response.body?.cancel().catch(() => {});
       return undefined;
     }
-    const body = await response.json();
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of response.body) {
+      bytes += chunk.byteLength;
+      if (bytes > MAX_PROXY_CATALOG_BYTES) return undefined;
+      chunks.push(chunk);
+    }
+    const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, bytes)));
     if (!Array.isArray(body?.data)) return undefined;
     const ids = body.data.map(entry => entry?.id).filter(id => typeof id === 'string' && id.length <= 128);
     return new Set(ids);
@@ -25,9 +36,6 @@ async function proxyCatalog(url, apiKey) {
     return undefined;
   }
 }
-
-// A pinned Task profile is validated against the trusted catalog, which is bounded like every other inventory here.
-const MAX_PROXY_CATALOG = 128;
 
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
 const PROVIDERS = new Map(Object.entries({
@@ -147,7 +155,7 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
   }
   const providerId = env.MANOLO_PROVIDER;
   const modelId = env.MANOLO_MODEL;
-  if (providerId === 'model-proxy') return createProxyModels(modelId, env, profileModelIds);
+  if (providerId === 'model-proxy') return createProxyModels(modelId, env);
   const [factory, keyName] = PROVIDERS.get(providerId) ?? [];
   const apiKey = factory && env[keyName]?.trim();
   if (!apiKey || !modelId) throw new Error('Provider configuration missing');
@@ -167,7 +175,7 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
   return { models, model: { provider: providerId, modelId }, thinkingLevel, apiKey, credentialEnv: keyName };
 }
 
-async function createProxyModels(modelId, env, profileModelIds = []) {
+async function createProxyModels(modelId, env) {
   const credentialEnv = 'MANOLO_MODEL_PROXY_KEY';
   const apiKey = env[credentialEnv]?.trim();
   const url = URL.parse(env.MANOLO_MODEL_PROXY_URL ?? '');
@@ -191,13 +199,14 @@ async function createProxyModels(modelId, env, profileModelIds = []) {
     compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: true },
   });
   // The proxy's own list is the authorized runtime catalog. A Task that pinned an exact served alias keeps resolving it
-  // after the manifest profile that introduced it is edited or removed, because the values are validated against what the
-  // trusted upstream actually serves, not against today's role aliases. Discovery stays restricted to the profiles the
-  // current manifest declares (`resolveProfiles`), so widening the catalog never advertises an unconfigured role.
+  // after the manifest profile that introduced it is edited or removed, because membership is the trusted upstream list
+  // itself, not a manifest role alias and not an arbitrary prefix of it. Discovery stays restricted to the profiles the
+  // current manifest declares (`resolveProfiles`), so widening membership never advertises an unconfigured role; a model
+  // the proxy stopped serving is absent and therefore unresolvable, never assumed.
   const served = listed
-    ? [...listed].filter(id => /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(id)).sort().slice(0, MAX_PROXY_CATALOG)
+    ? [...listed].filter(id => /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(id)).sort()
     : [];
-  const catalogIds = [...new Set([modelId, ...served, ...(listed ? profileModelIds.filter(id => listed.has(id)) : [])])];
+  const catalogIds = [...new Set([modelId, ...served])];
   const catalogModels = catalogIds.map(catalogModelFor);
   if (thinkingLevel && !getSupportedThinkingLevels(catalogModels[0]).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
   // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.

@@ -192,6 +192,19 @@ export function openTaskStore(db) {
     ]) {
       if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
+    // A ledger written by an earlier candidate can hold a resume that was already delivered: the response reached the
+    // child, the slot was cleared, but `execution_kind` stayed 'resume' with no item left to deliver. The scheduler would
+    // read that as an empty resume and fail the Task. The recorded delivery on this Task's own item is the durable
+    // evidence, so the row goes back to a plain start of the SAME execution instead. Nothing is invented for a row without
+    // that evidence: it keeps its shape and is still reported as an unavailable resume.
+    db.exec(`UPDATE tasks SET execution_kind='start', context=NULL,
+      dispatch_pending = CASE WHEN status='running' THEN 1 ELSE dispatch_pending END,
+      dispatch_attempts = CASE WHEN status='running' THEN 0 ELSE dispatch_attempts END,
+      dispatch_epoch = CASE WHEN status='running' THEN dispatch_epoch + 1 ELSE dispatch_epoch END,
+      next_at = CASE WHEN status='running' THEN 0 ELSE next_at END
+      WHERE execution_kind='resume' AND resume_item_id IS NULL AND execution_id IS NOT NULL
+        AND status IN ('queued','running')
+        AND EXISTS (SELECT 1 FROM task_inbox_items i WHERE i.task_id = tasks.id AND i.delivered_at IS NOT NULL)`);
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');

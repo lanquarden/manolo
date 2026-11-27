@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/context';
 import { AssistantEntry, configure, defineDocFamily, defineExtension, defineTool, LiveDoc } from '@earendil-works/pi-durable';
 import app from '../package.json' with { type: 'json' };
-import { BLUEPRINT_ID } from './work-blueprints.mjs';
+import { BLUEPRINT_ID, TASK_CATALOG_LIMIT, TASK_PROFILE_LIMIT } from './work-blueprints.mjs';
 
 const workIndex = kind => defineDocFamily({ kind, scope: 'session', version: 1, family: true, initial: () => ({}), checkpointWhen: () => true });
 const Scope = workIndex('manolo.work-scope');
@@ -71,11 +71,11 @@ export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns
   }));
   // The Task catalog is reported next to the delegate targets, never as one of them: a bundle Task needs its pinned
   // snapshot, tools, profile, and finish gate, so it is not an ungoverned delegate_work recipe.
-  const publicTaskBlueprints = [...taskBlueprints.values()].filter(blueprint => blueprint?.role === 'task').slice(0, 24)
+  const publicTaskBlueprints = [...taskBlueprints.values()].filter(blueprint => blueprint?.role === 'task').slice(0, TASK_CATALOG_LIMIT)
     .map(({ id, description, profile }) => ({
       id, description: redact(description), ...(profile && { profile: profile.id }),
     }));
-  const publicProfiles = [...profiles.values()].slice(0, 16).map(profile => ({
+  const publicProfiles = [...profiles.values()].slice(0, TASK_PROFILE_LIMIT).map(profile => ({
     id: profile.id, description: redact(profile.description),
     model: `${profile.model.provider}/${profile.model.modelId}`,
     ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }),
