@@ -57,6 +57,12 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
       if (directive('fixture:model')) {
         return fauxAssistantMessage(JSON.stringify({ model: model?.id ?? null, reasoning: options?.reasoning ?? null }));
       }
+      if (directive('fixture:finish-pr')) {
+        if (messages.at(-1)?.role === 'toolResult') return fauxAssistantMessage('Fixture task finished');
+        return fauxAssistantMessage(fauxToolCall('finish', {
+          summary: 'pull request finished', pullRequestUrl: 'https://github.com/lanquarden/manolo/pull/1',
+        }), { stopReason: 'toolUse' });
+      }
       if (directive('fixture:finish')) {
         if (messages.at(-1)?.role === 'toolResult') return fauxAssistantMessage('Fixture task finished');
         return fauxAssistantMessage(fauxToolCall('finish', { summary: `selected:${model?.id ?? 'none'}:${options?.reasoning ?? 'none'}` }), { stopReason: 'toolUse' });

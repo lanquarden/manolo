@@ -48,6 +48,17 @@ a Manolo repository Task.
 The legacy `MANOLO_WORK_BLUEPRINTS` text map still loads and keeps the old behavior: no explicit tool set and no
 profile. Duplicate ids between the two formats are refused.
 
+## Conversation Blueprint
+
+The single `role: "conversation"` Blueprint supplies the main conversation's instructions, resolved model profile, and
+optional exact tools. It is re-read for each new turn: an operator edit applies to the next turn, while a retry of an
+already-admitted turn keeps the settings and history it was admitted with. If the selection changes while another run is
+live, the new turn is refused until the session is idle. An unavailable profile or tool fails the new turn rather than
+substituting another.
+
+A conversation Blueprint is never a delegation target. Only legacy text Blueprints are offered to `delegate_work`; a
+configured Task bundle cannot run as an ungoverned work-session child.
+
 ## Pinning and revision
 
 A Task pins a **snapshot** at creation: role, description, rendered instruction text, exact tool names, the resolved
@@ -55,8 +66,11 @@ profile values, the resolved repository values, and file hashes. The revision is
 so editing a file or profile is a new revision. The relay stores the snapshot; dispatch reads the snapshot, not a
 mutable path. A Task queued before an edit keeps its old text and policy, and a retry keeps its history.
 
-An unavailable pinned profile, unknown tool, invalid repository, or missing worktree is a definitive refusal with an
-actionable reason. The worker never substitutes a model, reasoning level, or tool.
+An unavailable pinned profile, unknown tool, invalid repository, or missing worktree blocks the Task with a visible
+reason and the same execution identity; restoring the worker or workspace resumes it. The worker never substitutes a
+model, reasoning level, or tool. A relay checks a worker's `/v1/task-protocol` before sending snapshot, profile, review,
+or finish-protocol fields; an old worker is never fed an assignment it would silently run with substituted defaults.
+Legacy tasks without those fields still use the old dispatch path.
 
 ## Profiles
 
@@ -79,13 +93,25 @@ single source of truth for policy.
 ## Finish gate
 
 A Task succeeds only after the child calls `finish`. The tool validates the workspace read-only and returns an
-actionable error instead of ending a dirty or unverifiable Task. On acceptance the relay records a finish receipt for
-the execution; the worker's final turn then settles the Task. A replay after acceptance returns the same receipt.
+actionable error instead of ending a dirty or unverifiable Task. Acceptance is a **one-way durable boundary**:
+
+- the relay stores the finish receipt and evidence; the worker's final turn then settles the Task;
+- a replay after acceptance reads the relay receipt or the worker's marker without sampling Git again, so a workspace
+  change after a lost acknowledgement cannot block recovery;
+- a later failure settle cannot downgrade it, and no further `post_inbox`, progress, or other tool call runs. The yield
+  guard blocks every tool after acceptance except an idempotent `finish` replay;
+- an explicit cancellation after acceptance is still the owner's terminal decision; a success settle from the stopped
+  execution is refused.
 
 A final turn without `finish` is never success. The first one gets exactly one durable corrective turn in the same Task
 and session; a second one fails the Task. The counter lives in the execution record, so a worker restart does not grant
 another correction. The relay refuses a success settle for a finish-required Task that has no finish acceptance.
 Tasks created before this protocol keep the legacy settle behavior so a queued or in-flight Task is not stranded.
+
+Settlement is confirmed from the relay, not assumed. A 409, timeout, or exhausted retry budget leaves the local
+execution non-terminal and preserves the workspace; a restart replays the same settle. Cleanup runs only after an
+authoritative done/failed/cancelled state, and only a successfully handed-off or untouched tree is removed. Clean
+detached work, unhanded commits, dirty work, and local-only scratch files are preserved with recovery metadata.
 
 ## Repository Tasks and worktrees
 
@@ -95,9 +121,23 @@ A Blueprint repository binding is operator-managed. On the first execution the w
 2. records that SHA and creates `task/<task id>` plus a persistent Git worktree under the worker data directory;
 3. records the worktree path in the execution record and uses it as the file/shell cwd.
 
-A retry or resume reuses the same worktree with no fetch or rebase. A missing worktree, or a directory without its
-record, is reported as blocked/recovery and is never re-created. Two Tasks in one repository get independent worktrees;
-only the service's short admin operations (fetch, worktree add/remove) serialize, never Task runs.
+A retry or resume reuses the same worktree with no fetch or rebase. The worktree must prove its identity: the recorded
+mirror, branch, repository hash, and Git toplevel all have to match. A missing worktree, a replaced path, or a switched
+branch blocks recoverably with a visible reason; it is never re-created or silently switched. Dispatch, resume, and
+every Task tool check this identity. Two Tasks in one repository get independent worktrees; only the service's short
+admin operations (fetch, worktree add/remove) serialize, never Task runs.
+
+The shared bare mirror is only an object store. A Task's handoff destination is metadata, not a named remote in the
+mirror, so creating Task B cannot rewrite Task A's push destination. The child receives the exact handoff URL and its
+`task/<task id>` branch in its instructions.
+
+A **review Task** binds a finished source Task's exact handed-off commit and comparison base. It gets its own worktree
+on branch `review/<task id>` at that commit, never a mutable branch tip. Its finish evidence records the source Task,
+commit, base, branch, and handoff remote. The Orchestrator and Task history expose the same evidence.
+
+When an assignment explicitly requires a pull request, `finish` fails closed without a structured GitHub pull-request
+URL bound to the accepted commit. This is evidence validation, not a live GitHub API check; no pull request is
+published automatically.
 
 The worktree is a working arrangement, not a security boundary. The shell is not a sandbox: it can run installed
 binaries and read credentials the pod exposes. No external worktree setup hook runs.
@@ -116,8 +156,10 @@ These are measured limits of this slice, not silent downgrades:
 
 - No automated pull-request creation, merge, or deployment. `finish` records the exact handed-off commit, branch, and
   remote, but a PR is still an owner action.
-- No separate review-assignment tool. A review handoff names the exact `task/<task id>` commit; the comparison base is
-  the recorded base SHA in the execution record.
+- Pull-request evidence is structural (URL plus commit), not a live GitHub API verification. The Task fails closed
+  when the required evidence is missing.
+- A review binding needs a finished source Task with recorded handoff evidence. A read-only source with no commit has
+  nothing to review.
 - Profiles resolve within the worker's configured provider catalog (or proxy catalog). A profile naming another provider
   is dropped, so it is not discoverable; a Task pinned to it is refused.
 - Terminal cleanup is opportunistic in the worker that observes the terminal outcome. A worker crash before cleanup
@@ -136,6 +178,7 @@ Worker environment:
 | `MANOLO_PROVIDER`, `MANOLO_MODEL`, `MANOLO_THINKING_LEVEL` | Default model and reasoning when no profile applies. |
 | `MANOLO_MODEL_PROXY_URL`, `MANOLO_MODEL_PROXY_KEY` | Proxy runtime; profile model ids are added to its catalog. |
 | `MANOLO_TASK_FINISH` | Relay-side finish enforcement. `required` (default) refuses a success settle with no finish. `legacy` is only for a mixed-version rollout with a worker that predates `finish`. |
+| `/v1/task-protocol` | Worker capability handshake. Version 2 is required before a new-style snapshot/profile/review/finish assignment is sent. |
 
 The Task surfaces remain gated by `MANOLO_WORK_SESSION_AGENT`. An unconfigured worker keeps its old default model, no
 Blueprint, and the default tool set, but still requires `finish` for new Tasks. Drop `MANOLO_BLUEPRINTS_DIR` to return to

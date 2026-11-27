@@ -135,10 +135,14 @@ function blueprintConfig(root, id, value, profiles, repositories) {
   const total = files.reduce((sum, file) => sum + Buffer.byteLength(file.text), 0);
   if (total > MAX_BUNDLE_BYTES) throw invalid(`Blueprint ${id} files exceed ${MAX_BUNDLE_BYTES} bytes.`);
   const tools = value.tools;
-  if (!Array.isArray(tools) || tools.length > MAX_TOOLS || tools.some(tool => typeof tool !== 'string' || !TOOL_ID.test(tool))) {
+  // A conversation Blueprint may leave tools unset to keep the worker's default selection. A Task Blueprint must list
+  // its exact tools, including the lifecycle tools.
+  if (role === 'task' && !Array.isArray(tools)) throw invalid(`Blueprint ${id} tools must be an array of exact tool names.`);
+  if (tools !== null && tools !== undefined &&
+      (!Array.isArray(tools) || tools.length > MAX_TOOLS || tools.some(tool => typeof tool !== 'string' || !TOOL_ID.test(tool)))) {
     throw invalid(`Blueprint ${id} tools must be an array of at most ${MAX_TOOLS} exact tool names.`);
   }
-  if (new Set(tools).size !== tools.length) throw invalid(`Blueprint ${id} repeats a tool name.`);
+  if (Array.isArray(tools) && new Set(tools).size !== tools.length) throw invalid(`Blueprint ${id} repeats a tool name.`);
   if (role === 'task') {
     for (const tool of LIFECYCLE_TOOLS) {
       if (!tools.includes(tool)) throw invalid(`Blueprint ${id} must explicitly include the Task lifecycle tool ${tool}.`);
@@ -190,9 +194,10 @@ function legacyBlueprints(raw) {
     if (!instructions || unsafeText.test(instructions)) {
       throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
     }
-    // A legacy Blueprint has no explicit tool set or profile. It keeps the runtime defaults, exactly as before.
-    const pinned = { id, role: 'task', description, instructions, tools: null, files: [], legacy: true };
-    return [id, { ...pinned, revision: hash(pinned) }];
+    // A legacy Blueprint keeps the exact pre-bundle revision formula. An unchanged text has the same hash after the
+    // upgrade, so a queued Task pinned before the rollout still resolves.
+    const revision = createHash('sha256').update(JSON.stringify([id, description, instructions])).digest('hex');
+    return [id, { id, description, role: 'task', instructions, tools: null, files: [], legacy: true, revision }];
   }));
 }
 

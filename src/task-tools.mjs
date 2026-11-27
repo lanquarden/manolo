@@ -28,6 +28,8 @@ const unsafe = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/gu;
 export const TASK_ORCHESTRATOR_TOOLS = ['create_task', 'list_tasks', 'get_task', 'cancel_task'];
 export const TASK_WORKER_TOOLS = ['report_progress', 'post_inbox', 'finish'];
 export const TASK_TOOL_NAMES = [...TASK_ORCHESTRATOR_TOOLS, ...TASK_WORKER_TOOLS];
+const TASK_PROTOCOL = 2;
+const PULL_REQUEST = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*$/;
 const CORRECTIVE_TEXT = 'You ended this Task without calling finish. Call the finish tool now with a concise summary of the work and the verification you performed. Do not start new work unless it is needed to make finish valid. A second final message without finish fails this Task.';
 
 export const TASK_PARENT_RULES = '\n\nYou can create durable Tasks with create_task. A Task keeps its own identity and runs in a separate pod session; it can wait for a person in Inbox without blocking this conversation. Use create_task for delegated work the user should be able to follow, list_tasks and get_task to read status, and cancel_task to stop one. Task notifications also arrive in this conversation; do not poll to learn that input is needed.';
@@ -69,7 +71,7 @@ function toolResult(value, isError = false) {
 
 const idempotency = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 
-export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit }) {
+export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit, settleRetryMs = SETTLE_RETRY_MS }) {
   let harness;
   const watchers = new Map();
 
@@ -96,6 +98,11 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       return { ok: false, status: 503 };
     }
     return { ok: true, status: response.status, body: value };
+  }
+
+
+  async function relayState(taskId, executionId, timeout = RELAY_TIMEOUT_MS) {
+    return relay(`/v1/tasks/${taskId}/state?executionId=${encodeURIComponent(executionId)}`, { method: 'GET', timeout });
   }
 
   // Authority comes from the placed input of this exact tool run, as in work sessions: the current turn must be a
@@ -197,14 +204,16 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
 
   const createTask = defineTool({
     name: 'create_task', callers: ['model'], replay: 'safe',
-    description: `Queue one durable Task for a separate pod session. Returns its ID and status without waiting for execution. Optionally pin a blueprint and model profile, or set notBefore to schedule it later. The Task keeps its identity while it runs, waits for Inbox input, and must call its finish tool to succeed. ${discovery}`,
+    description: `Queue one durable Task for a separate pod session. Returns its ID and status without waiting for execution. Optionally pin a blueprint and model profile, bind a review of a finished Task's exact handed-off commit with reviewOf, require pull-request evidence, or set notBefore to schedule it later. The Task keeps its identity while it runs, waits for Inbox input, and must call its finish tool to succeed. ${discovery}`,
     parameters: schema({
       title: textField(MAX_TITLE), task: textField(MAX_TASK),
       blueprint: { type: 'string', pattern: BLUEPRINT_ID.source },
       profile: { type: 'string', pattern: BLUEPRINT_ID.source },
+      reviewOf: { type: 'string', pattern: ID.source },
+      requiresPullRequest: { type: 'boolean' },
       notBefore: { type: 'string', maxLength: 40 },
     }, ['title', 'task']),
-    async execute({ title, task, blueprint, profile, notBefore }, api, ctx) {
+    async execute({ title, task, blueprint, profile, reviewOf, requiresPullRequest, notBefore }, api, ctx) {
       title = boundedPlain(redact(title), MAX_TITLE).trim();
       task = boundedPlain(redact(task), MAX_TASK).trim();
       if (!title || !task) throw new Error('A non-empty title and task are required.');
@@ -216,15 +225,21 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       }
       const selected = blueprintFor(blueprint);
       let pinnedProfile;
-      if (profile !== undefined) {
-        const known = profiles.get(profile);
+      const requestedProfile = profile ?? selected?.profile?.id;
+      if (requestedProfile !== undefined) {
+        const known = profiles.get(requestedProfile);
         if (!known) throw new Error('Unknown model profile; use one listed in the create_task description.');
-        pinnedProfile = { id: known.id, description: known.description, model: known.model.modelId,
-          ...(known.model.provider !== model.provider && { provider: known.model.provider }),
-          ...(known.thinkingLevel && { thinkingLevel: known.thinkingLevel }) };
+        // The resolved provider is part of the durable assignment, even when it is the worker default.
+        pinnedProfile = {
+          id: known.id, description: known.description, model: known.model.modelId,
+          provider: known.model.provider,
+          ...(known.thinkingLevel && { thinkingLevel: known.thinkingLevel }),
+        };
       }
-      let snapshot = selected ? blueprintSnapshot(selected) : undefined;
-      // An explicit profile overrides the Blueprint's profile, but it is still pinned by value so a later config edit
+      // Legacy Blueprints keep their old id/revision identity: no snapshot is sent, so a pre-upgrade queued row and
+      // the old revision hash continue to resolve. Bundle Blueprints pin the full snapshot.
+      let snapshot = selected && !selected.legacy ? blueprintSnapshot(selected) : undefined;
+      // The resolved profile overrides the Blueprint's profile and is always pinned by value. A later config edit
       // cannot change what this Task runs.
       if (snapshot && pinnedProfile) snapshot = sealBlueprintSnapshot({ ...snapshot, profile: pinnedProfile });
       const turnId = await api.commit(async tx => (await parentTurn(tx, api)).id, ctx);
@@ -232,8 +247,12 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         key: idempotency('create_task', cfg.agentId, turnId, api.taskId),
         body: {
           turnId, title, task, notBefore: when,
-          ...(snapshot && { blueprint: { id: snapshot.id, revision: snapshot.revision, snapshot } }),
+          ...(snapshot
+            ? { blueprint: { id: snapshot.id, revision: snapshot.revision, snapshot } }
+            : selected && { blueprint: { id: selected.id, revision: selected.revision } }),
           ...(pinnedProfile && { profile: pinnedProfile }),
+          ...(reviewOf && { reviewOf }),
+          ...(requiresPullRequest === true && { requiresPullRequest: true }),
         },
       });
       if (!result.ok) return toolResult({ error: 'The relay did not queue the task; do not retry automatically.' }, true);
@@ -355,46 +374,99 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
 
   const finishTask = defineTool({
     name: 'finish', callers: ['model'], replay: 'safe',
-    description: 'Complete this Task successfully. Validates the Task workspace read-only, records the finish, and ends the Task after this turn. A dirty worktree or an unverified commit is refused with an actionable error; fix it and call finish again.',
-    parameters: schema({ summary: textField(MAX_RESULT) }),
-    async execute({ summary }, api, ctx) {
+    description: 'Complete this Task successfully. Validates the Task workspace read-only, records a replay-stable finish, and ends the Task after this turn. A dirty worktree, an unverified commit, or a required pull request without structured evidence is refused with an actionable error; fix it and call finish again.',
+    parameters: schema({
+      summary: textField(MAX_RESULT),
+      pullRequestUrl: { type: 'string', maxLength: 2048 },
+    }, ['summary']),
+    async execute({ summary, pullRequestUrl }, api, ctx) {
       summary = boundedPlain(redact(summary), MAX_RESULT).trim();
       if (!summary) throw new Error('A non-empty finish summary is required.');
       const run = await api.commit(tx => readRun(api, tx), ctx);
       if (run.yielded !== undefined) return toolResult({ error: 'This execution already yielded; finish is not available until the owner responds.' }, true);
-      const remembered = await harness.snapshot(TaskExecution, run.taskId, context);
-      if (remembered?.executionId === run.executionId && remembered.finishAccepted) {
-        return toolResult({ accepted: true, replay: true });
+      const execution = await harness.snapshot(TaskExecution, run.taskId, context);
+      if (!execution || execution.executionId !== run.executionId) {
+        return toolResult({ error: 'This Task execution is no longer current.' }, true);
+      }
+      if (execution.state === 'cancelled') return toolResult({ error: 'This Task was cancelled.' }, true);
+      const remember = async (value) => {
+        await api.commit(async tx => {
+          const record = await tx.doc(TaskExecution, run.taskId, null);
+          if (record.executionId !== run.executionId || record.state === 'cancelled') return;
+          record.finishAccepted = true;
+          record.finishSummary = value.summary ?? summary;
+          if (value.evidence?.commit) record.finishCommit = value.evidence.commit;
+          record.finishEvidence = value.evidence;
+        }, ctx);
+        return toolResult({ accepted: true, ...(value.replay && { replay: true }) });
+      };
+      if (execution.finishAccepted) return remember({ replay: true, summary: execution.finishSummary ?? summary, evidence: execution.finishEvidence });
+      // A lost acknowledgement is reconciled from authoritative relay state before any Git is sampled again. The
+      // accepted finish is the durable boundary; later workspace changes cannot invalidate it.
+      const authoritative = await relayState(run.taskId, run.executionId).catch(() => undefined);
+      if (authoritative?.ok && authoritative.body?.finishAccepted) {
+        return remember({ replay: true, summary: authoritative.body.finishSummary ?? summary, evidence: authoritative.body.evidence });
       }
       let check = { ok: true };
       try {
-        if (taskGit) check = await taskGit.checkFinish(run.taskId);
+        // A legacy/in-flight execution has no recorded workspace: keep its old protocol without inventing one.
+        if (taskGit && execution.workspace) check = await taskGit.checkFinish(run.taskId);
       } catch (error) {
         return toolResult({ error: error.message ?? 'The Task workspace could not be checked.', code: error.code ?? 'workspace_check_failed' }, true);
       }
-      if (!check.ok) { console.error('FINISH-CHECK-NOT-OK', check.message); return toolResult({ error: check.message, code: check.code }, true); }
+      if (!check.ok) return toolResult({ error: check.message, code: check.code }, true);
+      const commit = check.commit ?? execution.workspace?.expectedHead;
+      let pullRequest;
+      if (execution.requiresPullRequest) {
+        if (typeof pullRequestUrl !== 'string' || !PULL_REQUEST.test(pullRequestUrl)) {
+          return toolResult({
+            error: 'This Task requires a pull request. Open it, then call finish with its GitHub pull-request URL.',
+            code: 'pull_request_required',
+          }, true);
+        }
+        if (!commit) return toolResult({ error: 'A pull request needs a Task commit; no commit is available.', code: 'pull_request_required' }, true);
+        pullRequest = { url: redact(pullRequestUrl), commit };
+      }
+      const evidence = {
+        ...(commit && { commit, base: check.base ?? execution.workspace?.baseSha ?? null }),
+        ...(check.branch && { branch: check.branch }),
+        ...(check.handoff && { handoff: check.handoff }),
+        ...(check.review && { review: check.review }),
+        ...(pullRequest && { pullRequest }),
+      };
       const result = await relay(`/v1/tasks/${run.taskId}/finish`, {
         key: idempotency('finish', run.taskId, run.executionId),
-        body: { executionId: run.executionId, summary, ...(check.commit && { evidence: { commit: check.commit, ...(check.branch && { branch: check.branch }), ...(check.handoff && { handoff: check.handoff }) } }) },
+        body: { executionId: run.executionId, summary, ...(evidence.commit && { evidence }) },
       });
-      if (!result.ok) { console.error('FINISH-RELAY-ERR', result.status); return toolResult({ error: result.status === 409 ? 'The relay refused this finish; this execution is no longer current or already finished.' : 'The relay did not record this finish; try again.' }, true); }
-      // The relay receipt is durable first; the local marker only makes a replay cheap. A crash between the two is
-      // healed by replaying the same idempotency key.
-      await api.commit(async tx => {
-        const record = await tx.doc(TaskExecution, run.taskId, null);
-        if (record.executionId !== run.executionId || record.state === 'cancelled') return;
-        record.finishAccepted = true;
-        record.finishSummary = summary;
-        if (check.commit) record.finishCommit = check.commit;
-      }, ctx);
-      return toolResult({ accepted: true });
+      if (result.ok) return remember({ summary, evidence });
+      // A rejection or transport ambiguity after the commit is reconciled from state, never guessed from the failure.
+      const after = await relayState(run.taskId, run.executionId).catch(() => undefined);
+      if (after?.ok && after.body?.finishAccepted) {
+        return remember({ replay: true, summary: after.body.finishSummary ?? summary, evidence: after.body.evidence });
+      }
+      return toolResult({ error: result.status === 409 ? 'The relay refused this finish; this execution is no longer current or the Task is terminal.' : 'The finish outcome is unknown; call finish again to reconcile it.' }, true);
     },
   });
 
   const guard = hook(ToolTask, {
     async beforeTool(call, api, ctx) {
-      if (TASK_TOOL_NAMES.includes(call.name)) return undefined;
       const run = await api.snapshot(TaskRun, api.conversationId, ctx);
+      if (!run?.taskId) return undefined;
+      const execution = await api.snapshot(TaskExecution, run.taskId, ctx);
+      if (execution?.executionId === run.executionId) {
+        // Once finish is accepted, no tool may create a new side effect. A finish replay is the only allowed call.
+        if (execution.finishAccepted && call.name !== 'finish') {
+          return { block: 'Finish was accepted for this Task; no further tool calls run.' };
+        }
+        if (execution.workspace && taskGit && call.name !== 'finish') {
+          try {
+            await taskGit.assertWorkspace(run.taskId);
+          } catch (error) {
+            return { block: `${error.message ?? 'The Task workspace is unavailable.'} Restore the workspace; no tool call ran.` };
+          }
+        }
+      }
+      if (TASK_TOOL_NAMES.includes(call.name)) return undefined;
       if (run?.yielded === undefined) return undefined;
       return { block: 'This Task execution yielded for Inbox input; no further work runs until the owner responds.' };
     },
@@ -435,14 +507,39 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     return [...new Set(items.filter(itemId => ID.test(itemId)))].slice(-10);
   }
 
+  // Settle returns only an authoritative terminal state. A rejection, a timeout, or an exhausted retry budget is
+  // ambiguous: the local execution stays running, no workspace is cleaned, and a later restart reattaches the same
+  // watcher. An accepted finish is authoritative even when a failure report races it.
   async function settle(taskId, executionId, outcome, summary) {
-    const key = idempotency('settle', taskId, executionId, outcome);
+    let desired = outcome;
+    let text = summary;
     const deliveredItems = await deliveryEvidence(taskId, executionId).catch(() => []);
     for (let attempt = 0; ; attempt++) {
-      const result = await relay(`/v1/tasks/${taskId}/settle`, { key, body: { executionId, outcome, summary, deliveredItems } });
-      if (result.ok || result.status === 409) return;
-      if (attempt >= SETTLE_RETRY_MS.length) return;
-      await sleep(SETTLE_RETRY_MS[attempt]).catch(() => {});
+      let result;
+      try {
+        result = await relay(`/v1/tasks/${taskId}/settle`, {
+          key: idempotency('settle', taskId, executionId, desired),
+          body: { executionId, outcome: desired, summary: text, deliveredItems },
+        });
+      } catch {
+        result = { ok: false, status: 0 };
+      }
+      if (result.ok && ['done', 'failed', 'cancelled'].includes(result.body?.status)) {
+        return { state: result.body.status, summary: text };
+      }
+      const authoritative = await relayState(taskId, executionId).catch(() => undefined);
+      if (authoritative?.ok) {
+        if (authoritative.body.finishAccepted && desired !== 'done') {
+          desired = 'done';
+          text = authoritative.body.finishSummary ?? text;
+          continue;
+        }
+        if (['done', 'failed', 'cancelled'].includes(authoritative.body.status)) {
+          return { state: authoritative.body.status, summary: authoritative.body.finishSummary ?? text };
+        }
+      }
+      if (attempt >= settleRetryMs.length) return { state: undefined };
+      await sleep(settleRetryMs[attempt]).catch(() => {});
     }
   }
 
@@ -493,6 +590,13 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   }
 
 
+  async function applyTerminal(taskId, executionId, confirmation) {
+    const state = confirmation.state;
+    const localState = state === 'done' ? 'settled' : state === 'cancelled' ? 'cancelled' : 'failed';
+    await finish(taskId, executionId, localState, confirmation.summary);
+    await taskGit?.cleanup(taskId, { terminal: true, successful: state === 'done' }).catch(() => {});
+  }
+
   function watch(taskId, executionId, submissionId) {
     if (watchers.has(executionId)) return;
     watchers.set(executionId, true);
@@ -515,26 +619,45 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
               settled = result;
               break;
             }
-            // A heartbeat only shows that the execution is alive; it never changes Task state.
             await relay(`/v1/tasks/${taskId}/heartbeat`, { body: { executionId } });
           }
           if (!settled) return;
-          const execution = await harness.snapshot(TaskExecution, taskId, context);
+          let execution = await harness.snapshot(TaskExecution, taskId, context);
           if (!execution || execution.executionId !== executionId || execution.state === 'cancelled') return;
-          if (settled.status !== 'done') {
-            await settle(taskId, executionId, 'failed', 'The Task execution ended without an answer.');
-            await finish(taskId, executionId, 'failed', 'The Task execution ended without an answer.');
-            await taskGit?.cleanup(taskId, { terminal: true }).catch(() => {});
-            return;
+          // A restart can lose the local finish marker after the relay accepted it. Reconcile before deciding that a
+          // bare final needs a corrective turn or that a failed provider stop wins.
+          if (!execution.finishAccepted) {
+            const remote = await relayState(taskId, executionId).catch(() => undefined);
+            if (remote?.ok && remote.body?.finishAccepted) {
+              await harness.commit(async tx => {
+                const record = await tx.doc(TaskExecution, taskId, null);
+                if (record.executionId !== executionId || record.state === 'cancelled') return;
+                record.finishAccepted = true;
+                record.finishSummary = remote.body.finishSummary;
+                record.finishEvidence = remote.body.evidence;
+              }, context);
+              execution = await harness.snapshot(TaskExecution, taskId, context);
+            }
           }
+          // An accepted finish wins over a failed provider stop: the Task is already complete.
           if (execution.finishAccepted) {
             const summary = execution.finishSummary ?? await readResult(settled.conversationId, settled.answer);
-            await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
-            await finish(taskId, executionId, 'settled', summary);
-            await taskGit?.cleanup(taskId, { terminal: true }).catch(() => {});
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
             return;
           }
-          // A bare final turn. One corrective turn in the same Task and session; the next bare turn fails the Task.
+          if (settled.status !== 'done') {
+            const confirmation = await settle(taskId, executionId, 'failed', 'The Task execution ended without an answer.');
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            return;
+          }
+          // Legacy/in-flight executions created before the finish protocol settle from a bare final turn.
+          if (!execution.finishRequired) {
+            const summary = await readResult(settled.conversationId, settled.answer);
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            return;
+          }
           const next = await correctiveTurn(taskId, executionId).catch(() => undefined);
           if (next) {
             current = next;
@@ -543,19 +666,17 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           const latest = await harness.snapshot(TaskExecution, taskId, context);
           if (latest?.finishAccepted) {
             const summary = latest.finishSummary ?? await readResult(settled.conversationId, settled.answer);
-            await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
-            await finish(taskId, executionId, 'settled', summary);
-            await taskGit?.cleanup(taskId, { terminal: true }).catch(() => {});
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
             return;
           }
           const summary = 'The Task ended without calling its finish tool after one corrective turn.';
-          await settle(taskId, executionId, 'failed', summary);
-          await finish(taskId, executionId, 'failed', summary);
-          await taskGit?.cleanup(taskId, { terminal: true }).catch(() => {});
+          const confirmation = await settle(taskId, executionId, 'failed', summary);
+          if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
           return;
         }
       } catch {
-        // A missing submission or a closed Harness leaves the Task running for the owner to cancel or retry.
+        // A missing submission or a closed Harness leaves the Task running for a restart to reattach.
       } finally {
         watchers.delete(executionId);
       }
@@ -571,7 +692,13 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (!task || typeof task.title !== 'string' || typeof task.input !== 'string') throw Object.assign(new Error('Invalid task'), { status: 400 });
     const existing = await harness.snapshot(TaskExecution, taskId, context);
     if (existing?.executionId === executionId) {
-      // A dispatch retry reuses the execution ID: the same child submission, never a second one.
+      // A dispatch retry reuses the execution ID: the same child submission, never a second one. The workspace must
+      // still prove its identity; a replaced directory blocks recoverably instead of being recreated or failed.
+      if (existing.workspace && taskGit) {
+        try { await taskGit.assertWorkspace(taskId); } catch (error) {
+          return { status: 'blocked', reason: error.code ?? 'worktree_missing', message: error.message };
+        }
+      }
       if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
       return { status: existing.state ?? 'running' };
     }
@@ -594,12 +721,24 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       throw Object.assign(new Error(error.message), { status: 409, reason });
     }
     const { blueprint, selected, tools } = pinned;
+    // A newer relay states finishRequired explicitly. An older relay that already sent a snapshot/profile does not, so
+    // infer the new protocol from those fields; a truly legacy assignment stays on the old bare-final path.
+    const finishRequired = Object.hasOwn(task, 'finishRequired')
+      ? task.finishRequired === true
+      : Boolean(task.blueprint?.snapshot || task.profile || task.review);
+    const protocol = task.protocol === TASK_PROTOCOL || task.blueprint?.snapshot || task.profile || task.review
+      ? TASK_PROTOCOL : 1;
     // Repository Tasks get a real persistent worktree; every other Task gets its own private directory. Neither can
     // fall back to the shared worker workspace.
     let workspace;
     if (taskGit) {
       try {
-        workspace = blueprint?.repository ? await taskGit.prepare(taskId, blueprint.repository) : await taskGit.prepareScratch(taskId);
+        if (task.review) {
+          if (!blueprint?.repository) throw Object.assign(new Error('A review Task needs a repository Blueprint binding.'), { code: 'invalid_review' });
+          workspace = await taskGit.prepareReview(taskId, blueprint.repository, task.review);
+        } else {
+          workspace = blueprint?.repository ? await taskGit.prepare(taskId, blueprint.repository) : await taskGit.prepareScratch(taskId);
+        }
       } catch (error) {
         throw Object.assign(new Error(error.message ?? 'The Task workspace is unavailable.'), {
           status: 409, reason: error.code ?? 'worktree_missing',
@@ -607,7 +746,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       }
     }
     const workspaceText = workspace?.kind === 'worktree'
-      ? `Your Task workspace is ${workspace.path}, branch ${workspace.branch}, based on ${workspace.baseSha}. Work and commit only there. Do not fetch or rebase. To hand off a commit, push it to the handoff remote on branch ${workspace.branch} (for example git push handoff HEAD:refs/heads/${workspace.branch}); finish verifies that branch without writing to it.`
+      ? `Your Task workspace is ${workspace.path}, branch ${workspace.branch}, ${workspace.review ? `at the exact handed-off commit ${workspace.expectedHead}` : `based on ${workspace.baseSha}`}. Work and commit only there. Do not fetch or rebase.${workspace.review ? '' : ` To hand off a commit, push it to ${workspace.handoff ?? 'the configured handoff remote'} on branch ${workspace.branch} (for example git push ${workspace.handoff ?? '<handoff>'} HEAD:refs/heads/${workspace.branch}); finish verifies that branch without writing to it.`}`
       : workspace ? `Your Task workspace is ${workspace.path}. Work only there.` : '';
     const instructions = `${TASK_CHILD_RULES}${TASK_CHILD_POLICY}${blueprint ? `\n\nApply the following Blueprint only within those limits:\n${redact(blueprint.instructions)}` : ''}${workspaceText ? `\n\n${workspaceText}` : ''}`;
     const conversationId = await harness.commit(async tx => {
@@ -615,9 +754,16 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       await configure(tx, id, {
         model: selected.model, ...(selected.thinkingLevel ? { thinkingLevel: selected.thinkingLevel } : {}),
         instructions, compaction: { enabled: false }, extensions: { add: [worker] },
-        ...(tools !== undefined && { tools }),
+        // `tools` enables the listed registrations; `modelTools` is what actually offers deferred ones to the model.
+        ...(tools !== undefined && { tools, modelTools: tools }),
       });
-      if (workspace) Object.assign(await tx.doc(TaskWorkspace, id, null), { path: workspace.path, ...(workspace.kind === 'worktree' && { branch: workspace.branch, baseSha: workspace.baseSha }) });
+      if (workspace) Object.assign(await tx.doc(TaskWorkspace, id, null), {
+        path: workspace.path,
+        ...(workspace.kind === 'worktree' && {
+          branch: workspace.branch, baseSha: workspace.baseSha, expectedHead: workspace.expectedHead,
+          ...(workspace.handoff && { handoff: workspace.handoff }), ...(workspace.review && { review: workspace.review }),
+        }),
+      });
       return id;
     }, context);
     const conversation = await harness.conversation(conversationId, context);
@@ -646,8 +792,18 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       Object.assign(execution, {
         taskId, executionId, conversationId, submissionId: admitted, state: 'running',
         title: boundedPlain(redact(task.title), MAX_TITLE), input: text,
-        ...(workspace && { workspace: { kind: workspace.kind, path: workspace.path,
-          ...(workspace.branch && { branch: workspace.branch }), ...(workspace.baseSha && { baseSha: workspace.baseSha }) } }),
+        finishRequired, protocol,
+        ...(task.review && { review: task.review }),
+        ...(task.requiresPullRequest === true && { requiresPullRequest: true }),
+        ...(task.profile && { profile: task.profile }),
+        ...(workspace && { workspace: {
+          kind: workspace.kind, path: workspace.path,
+          ...(workspace.branch && { branch: workspace.branch }),
+          ...(workspace.baseSha && { baseSha: workspace.baseSha }),
+          ...(workspace.expectedHead && { expectedHead: workspace.expectedHead }),
+          ...(workspace.handoff && { handoff: workspace.handoff }),
+          ...(workspace.review && { review: workspace.review }),
+        } }),
       });
       delete run.yielded;
       delete run.itemId;

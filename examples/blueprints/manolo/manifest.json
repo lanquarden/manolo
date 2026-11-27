@@ -20,7 +20,7 @@
       "description": "Main Manolo conversation context. Never a delegation target.",
       "role": "conversation",
       "files": ["CONVERSATION.md"],
-      "tools": []
+      "tools": null
     },
     "general": {
       "description": "Generic Task with the pod coding tools and no repository binding.",

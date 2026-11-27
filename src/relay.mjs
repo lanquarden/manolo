@@ -199,6 +199,34 @@ function taskTurnScope(turnId, agent) {
   return { turn, scope: store.webSession(turn.owner, agent) };
 }
 
+// A new-style Task carries a pinned snapshot/profile, review binding, or the finish protocol. The relay asks the worker
+// for its protocol before sending those fields. A worker with no route is old and is never fed a newer assignment that
+// it might silently run with substituted defaults.
+const workerProtocols = new Map();
+async function workerTaskProtocol(agent) {
+  const cached = workerProtocols.get(agent);
+  // A negative result is short-lived so a worker upgrade is noticed without a relay restart.
+  if (cached && Date.now() - cached.at < (cached.version === 2 ? 30_000 : 2_000)) return cached.version;
+  let version = 0;
+  try {
+    const { url, token } = config.agents.get(agent);
+    const response = await fetch(`${url}/v1/task-protocol`, {
+      redirect: 'error', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(3000)]),
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (response.ok) {
+      const body = JSON.parse((await readBounded(response, 8192, AbortSignal.timeout(3000))).toString('utf8'));
+      if (body?.version === 2) version = 2;
+    } else {
+      await response.body?.cancel().catch(() => {});
+    }
+  } catch {
+    version = 0;
+  }
+  workerProtocols.set(agent, { version, at: Date.now() });
+  return version;
+}
+
 async function workerTaskRequest(agent, path, { method = 'GET', body, timeout = 15_000 } = {}) {
   const { url, token } = config.agents.get(agent);
   const response = await fetch(`${url}${path}`, {
@@ -833,7 +861,7 @@ async function internal(req, res, path) {
     return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
       name => config.owners.get(name)?.agent === agent));
   }
-  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat))?)?$/.exec(path);
+  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat|state))?)?$/.exec(path);
   if (taskRoute) {
     if (!workSessionAgents.size) throw fail(404);
     if (!workSessionsEnabled(agent)) throw fail(403);
@@ -848,6 +876,7 @@ async function internal(req, res, path) {
       const body = await readJson(req, 64 * 1024);
       let blueprintSnapshot;
       let profile;
+      let review;
       try {
         if (body && Object.hasOwn(body, 'blueprint') && body.blueprint && Object.hasOwn(body.blueprint, 'snapshot')) {
           blueprintSnapshot = verifyBlueprintSnapshot(body.blueprint.snapshot);
@@ -856,8 +885,11 @@ async function internal(req, res, path) {
       } catch {
         throw fail(400);
       }
+      if (body && Object.hasOwn(body, 'reviewOf') &&
+          (typeof body.reviewOf !== 'string' || !TASK_ID.test(body.reviewOf))) throw fail(400);
+      if (body && Object.hasOwn(body, 'requiresPullRequest') && typeof body.requiresPullRequest !== 'boolean') throw fail(400);
       if (!body || typeof body !== 'object' || Array.isArray(body) ||
-          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'profile', 'notBefore'].includes(field)) ||
+          Object.keys(body).some(field => !['turnId', 'title', 'task', 'blueprint', 'profile', 'reviewOf', 'requiresPullRequest', 'notBefore'].includes(field)) ||
           typeof body.turnId !== 'string' || !isTaskTitle(body.title) || !isTaskInput(body.task) ||
           (Object.hasOwn(body, 'blueprint') && (!body.blueprint || typeof body.blueprint !== 'object' ||
             !ownFields(body.blueprint, 'id', 'revision', ...(blueprintSnapshot ? ['snapshot'] : [])) || typeof body.blueprint.id !== 'string' ||
@@ -869,9 +901,24 @@ async function internal(req, res, path) {
       }
       const operationKey = idempotencyKey();
       const { turn, scope } = taskTurnScope(body.turnId, agent);
+      if (body.reviewOf) {
+        const source = store.tasks.get(scope, body.reviewOf);
+        if (!source || source.status !== 'done') throw fail(409);
+        if (!source.handoff?.commit || !/^[0-9a-f]{40,64}$/.test(source.handoff.commit) ||
+            !/^[0-9a-f]{40,64}$/.test(source.handoff.base ?? '')) throw fail(409);
+        if (!blueprintSnapshot?.repository) throw fail(409);
+        if (!source.handoff.handoff || source.handoff.handoff !== blueprintSnapshot.repository.handoff) throw fail(409);
+        review = {
+          sourceTaskId: source.id, commit: source.handoff.commit, baseSha: source.handoff.base,
+          ...(source.handoff.branch && { branch: source.handoff.branch }),
+          ...(source.handoff.handoff && { handoff: source.handoff.handoff }),
+        };
+      }
       const task = store.tasks.create({
         owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
-        blueprint: body.blueprint, blueprintSnapshot, profile, finishRequired: taskFinishRequired, notBefore: body.notBefore ?? 0, key: operationKey,
+        blueprint: body.blueprint, blueprintSnapshot, profile, review,
+        requiresPr: body.requiresPullRequest === true,
+        finishRequired: taskFinishRequired, notBefore: body.notBefore ?? 0, key: operationKey,
       });
       return respond(res, 200, task);
     }
@@ -893,6 +940,17 @@ async function internal(req, res, path) {
       const task = store.tasks.get(scope, taskId);
       if (!task) throw fail(404);
       return respond(res, 200, task);
+    }
+    if (req.method === 'GET' && action === 'state') {
+      const meta = store.tasks.meta(taskId);
+      if (!meta || meta.agent !== agent) throw fail(404);
+      const query = new URLSearchParams(new URL(req.url, 'http://local.invalid').search);
+      const executionId = query.get('executionId');
+      if (executionId !== null && (!TASK_ID.test(executionId) || meta.executionId !== executionId)) throw fail(409);
+      return respond(res, 200, {
+        status: meta.status, executionId: meta.executionId, finishAccepted: meta.finishAccepted,
+        finishSummary: meta.finishSummary, evidence: meta.handoff, blocked: meta.blocked,
+      });
     }
     if (req.method === 'POST' && action === 'cancel') {
       const body = await readJson(req);
@@ -928,8 +986,15 @@ async function internal(req, res, path) {
       if (typeof body.executionId !== 'string' || !TASK_ID.test(body.executionId) || typeof body.summary !== 'string' ||
           body.summary.length > 2500 ||
           (body.evidence !== undefined && (typeof body.evidence !== 'object' || body.evidence === null ||
-            Object.keys(body.evidence).some(field => !['commit', 'branch', 'handoff'].includes(field)) ||
-            Object.values(body.evidence).some(value => typeof value !== 'string' || value.length > 2048)))) throw fail(400);
+            Object.keys(body.evidence).some(field => !['commit', 'base', 'branch', 'handoff', 'review', 'pullRequest'].includes(field)) ||
+            ['commit', 'branch', 'handoff'].some(field => body.evidence[field] !== undefined &&
+              (typeof body.evidence[field] !== 'string' || body.evidence[field].length > 2048)) ||
+            (body.evidence.commit !== undefined && !/^[0-9a-f]{40,64}$/.test(body.evidence.commit)) ||
+            (body.evidence.base !== undefined && body.evidence.base !== null && !/^[0-9a-f]{40,64}$/.test(body.evidence.base)) ||
+            (body.evidence.review !== undefined && (typeof body.evidence.review !== 'object' || body.evidence.review === null)) ||
+            (body.evidence.pullRequest !== undefined && (!body.evidence.pullRequest ||
+              typeof body.evidence.pullRequest.url !== 'string' || !/^https:\/\/github\.com\//.test(body.evidence.pullRequest.url) ||
+              typeof body.evidence.pullRequest.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.evidence.pullRequest.commit)))))) throw fail(400);
       return respond(res, 200, store.tasks.acceptFinish({
         taskId, executionId: body.executionId, summary: body.summary, evidence: body.evidence, key: operationKey,
       }));
@@ -1120,13 +1185,20 @@ const DEFINITIVE_START = new Map([
   ['another_execution_current', 'The worker already has a different execution for this Task.'],
   ['invalid_task', 'The worker refused the Task assignment as invalid.'],
   ['invalid_blueprint', 'The pinned Blueprint snapshot is invalid.'],
-  ['profile_unavailable', 'The pinned model profile is not available on the worker.'],
-  ['unknown_tool', 'The pinned Blueprint names a tool the worker does not have.'],
-  ['invalid_repository', 'The pinned repository configuration is invalid.'],
-  ['worktree_missing', 'The Task worktree is missing or cannot be recovered automatically.'],
-  ['git_failed', 'The worker could not prepare the Task worktree.'],
 ]);
-const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call', 'worktree_missing']);
+// These are recoverable by restoring the worker/profile/tool/workspace, not by substituting another selection. The Task
+// stays running and blocked, with the same execution identity, and dispatch is retried.
+const BLOCKING_START = new Map([
+  ['profile_unavailable', 'The pinned model profile is temporarily unavailable on the worker. Restore it; the same assignment will resume.'],
+  ['unknown_tool', 'A tool pinned by the Blueprint is not installed on the worker. Install it; the same assignment will resume.'],
+  ['invalid_repository', 'The pinned repository configuration is invalid for this worker.'],
+  ['worktree_missing', 'The Task worktree is missing or was replaced. Restore it; the Task will resume.'],
+  ['git_failed', 'The worker could not prepare the Task worktree.'],
+  ['invalid_review', 'The review binding needs a repository Blueprint and exact commit.'],
+  ['review_commit_missing', 'The exact review commit is not available from the configured handoff remote.'],
+  ['worker_protocol', 'The worker does not support this Task protocol. Upgrade it; the Task will resume.'],
+]);
+const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
 // A start is acknowledged only by a parsed worker reply naming a state a worker reports for an admitted execution. A 200
 // with an empty or unfamiliar body does not prove the child was admitted, so the dispatch stays owed.
 const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled']);
@@ -1169,17 +1241,30 @@ async function runTask(task) {
       store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.');
       return;
     }
+    if (result.ok && result.body?.delivered === false && result.body.reason === 'worktree_missing') {
+      // A lost or replaced worktree is recoverable. Keep the answered item and block; restoring the workspace retries
+      // the same resume instead of terminally failing the Task.
+      store.tasks.block(task.id, executionId, result.body.message ?? 'The Task worktree is missing; restore it and the response will resume.');
+      return;
+    }
     if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
       store.tasks.resumeUnavailable({
         taskId: task.id, executionId, itemId: item.id,
-        reason: result.body.reason === 'worktree_missing'
-          ? 'The Task worktree is missing; its work cannot be recovered automatically. Your response is saved in the Task.'
-          : 'The execution that asked for your input is no longer available. Your response is saved in the Task.',
+        reason: 'The execution that asked for your input is no longer available. Your response is saved in the Task.',
       });
       return;
     }
     store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.');
+    return;
+  }
+  // A new-style assignment must not reach a worker that would ignore its snapshot/profile/review fields or its finish
+  // protocol. Version 2 is required for those fields; a legacy Task (no snapshot/profile/review and no finish protocol)
+  // may still use the old path.
+  const requiresV2 = Boolean(task.blueprint_snapshot || task.profile_snapshot || task.review_snapshot ||
+    task.requires_pr === 1 || task.finish_required === 1);
+  if (requiresV2 && await workerTaskProtocol(task.agent) < 2) {
+    store.tasks.block(task.id, executionId, 'The worker does not support the Task protocol needed by this assignment. Upgrade it; the same assignment will resume.');
     return;
   }
   let result;
@@ -1189,6 +1274,8 @@ async function runTask(task) {
       body: {
         executionId,
         task: {
+          protocol: 2,
+          finishRequired: task.finish_required === 1,
           title: task.title, input: task.input,
           ...(task.context && { context: task.context }),
           ...(task.blueprint_id && {
@@ -1198,11 +1285,17 @@ async function runTask(task) {
             },
           }),
           ...(task.profile_snapshot && { profile: JSON.parse(task.profile_snapshot) }),
+          ...(task.review_snapshot && { review: JSON.parse(task.review_snapshot) }),
+          ...(task.requires_pr === 1 && { requiresPullRequest: true }),
         },
       },
     });
   } catch {
     store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
+    return;
+  }
+  if (result.ok && result.body?.status === 'blocked') {
+    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.');
     return;
   }
   if (result.ok && START_ACK.has(result.body?.status)) {
@@ -1219,6 +1312,11 @@ async function runTask(task) {
   const definitive = DEFINITIVE_START.get(result.body?.reason);
   if (definitive) {
     store.tasks.failExecution(task.id, executionId, definitive);
+    return;
+  }
+  const blocking = BLOCKING_START.get(result.body?.reason);
+  if (blocking) {
+    store.tasks.block(task.id, executionId, blocking);
     return;
   }
   store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.');

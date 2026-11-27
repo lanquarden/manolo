@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
 import { key } from '../src/relay-config.mjs';
+import { loadWorkBlueprints } from '../src/work-blueprints.mjs';
 
 const cwd = new URL('../', import.meta.url);
 const secret = () => randomBytes(24).toString('hex');
@@ -383,7 +384,10 @@ test('a Task ledger refuses stale executions, keeps retries stable, and fences c
     assert.throws(() => store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Bare prose', key: 's-0' }), { statusCode: 409 });
     assert.deepEqual(store.acceptFinish({ taskId: task.id, executionId, summary: 'Done', key: 'f-1' }), { accepted: true });
     assert.deepEqual(store.acceptFinish({ taskId: task.id, executionId, summary: 'Done', key: 'f-1' }), { accepted: true }, 'finish replay is a receipt');
-    assert.throws(() => store.acceptFinish({ taskId: task.id, executionId, summary: 'Again', key: 'f-2' }), { statusCode: 409 });
+    assert.equal(store.acceptFinish({ taskId: task.id, executionId, summary: 'Again', key: 'f-2' }).replay, true, 'one-way finish boundary');
+    assert.throws(() => store.park({ taskId: task.id, executionId, kind: 'question', prompt: 'After finish?', key: 'i-after' }), { statusCode: 409 });
+    assert.throws(() => store.progress({ taskId: task.id, executionId, note: 'After finish', key: 'p-after' }), { statusCode: 409 });
+    assert.throws(() => store.settle({ taskId: task.id, executionId, outcome: 'failed', summary: 'After finish', key: 's-fail' }), { statusCode: 409 });
     assert.deepEqual(store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Done', key: 's-1' }), { status: 'done' });
     assert.deepEqual(store.settle({ taskId: task.id, executionId, outcome: 'done', summary: 'Done', key: 's-1' }), { status: 'done' });
     assert.equal(store.get(scope, task.id).status, 'done');
@@ -425,7 +429,7 @@ test('a Task ledger refuses stale executions, keeps retries stable, and fences c
   }
 });
 
-async function launchTaskRelay(t, { root, dataDir, stubUrl, token, password, name = 'relay' }) {
+async function launchTaskRelay(t, { root, dataDir, stubUrl, token, password, name = 'relay', extraEnv = {} }) {
   const config = join(root, `${name}.json`);
   await writeFile(config, JSON.stringify({
     agents: { canary: { url: stubUrl, tokenEnv: 'CANARY_TOKEN' } },
@@ -433,7 +437,7 @@ async function launchTaskRelay(t, { root, dataDir, stubUrl, token, password, nam
   }));
   const relay = start(t, 'relay', {
     CANARY_TOKEN: token, OWNER_PASSWORD: password, MANOLO_RELAY_CONFIG: config, MANOLO_DATA_DIR: dataDir,
-    MANOLO_WORK_SESSION_AGENT: 'canary', PORT: '0', MANOLO_INTERNAL_PORT: '0',
+    MANOLO_WORK_SESSION_AGENT: 'canary', PORT: '0', MANOLO_INTERNAL_PORT: '0', ...extraEnv,
   });
   const internal = addr(await relay.port(/internal listening on .*:(\d+)/));
   const web = addr(await relay.port(/web listening on .*:(\d+)/));
@@ -473,6 +477,7 @@ test('a definitively lost execution fails the Task, keeps the answer, and never 
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -517,6 +522,138 @@ test('a definitively lost execution fails the Task, keeps the answer, and never 
   assert.deepEqual(turns.map(row => row.id), ['origin'], 'no chat turn was inserted for the response');
 });
 
+test('a legacy row without the finish protocol still settles a queued Task', { timeout: 40_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-legacy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  const raw = JSON.stringify({ review: { description: 'Legacy review', instructions: 'Review locally.' } });
+  const revision = loadWorkBlueprints(raw).blueprints.get('review').revision;
+  let relayInternal = 'http://127.0.0.1:1';
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+      let body = ''; for await (const chunk of req) body += chunk;
+      const parsed = JSON.parse(body);
+      assert.equal(parsed.task.finishRequired, false);
+      const taskId = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url)[1];
+      await fetch(`${relayInternal}/v1/tasks/${taskId}/settle`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': 'settle-legacy' },
+        body: JSON.stringify({ executionId: parsed.executionId, outcome: 'done', summary: 'legacy done' }),
+      });
+      return json({ status: 'running' });
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relay = await launchTaskRelay(t, {
+    root, dataDir: join(root, 'relay'), stubUrl: addr(server.address().port), token, password,
+    extraEnv: { MANOLO_TASK_FINISH: 'legacy' },
+  });
+  relayInternal = relay.internal;
+  const auth = basic('owner', password);
+  assert.equal((await request(relay.web, '/api/turns', auth, 'POST', { id: 'legacy-origin', text: 'Start' }, mutation)).status, 200);
+  const created = await request(relay.internal, '/v1/tasks', { authorization: `Bearer ${token}` }, 'POST', {
+    turnId: key('web', 'owner', 'canary', 'legacy-origin'), title: 'Legacy task', task: 'fixture:bare',
+    blueprint: { id: 'review', revision },
+  }, { 'idempotency-key': 'create-legacy' });
+  assert.equal(created.status, 200, await created.clone().text());
+  const task = await created.json();
+  const settled = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === task.id && row.status === 'done'), 'legacy Task settles');
+  assert.equal(settled.status, 'done');
+});
+
+test('an unavailable pinned profile blocks and later resumes the same assignment without substitution', { timeout: 30_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-profile-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  let available = false;
+  const dispatch = [];
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+      let body = ''; for await (const chunk of req) body += chunk;
+      const parsed = JSON.parse(body);
+      dispatch.push(parsed);
+      if (!available) return json({ error: 'task request rejected', reason: 'profile_unavailable' }, 409);
+      return json({ status: 'running' });
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relayData = join(root, 'relay');
+  const relay = await launchTaskRelay(t, { root, dataDir: relayData, stubUrl: addr(server.address().port), token, password });
+  const auth = basic('owner', password);
+  assert.equal((await request(relay.web, '/api/turns', auth, 'POST', { id: 'profile-origin', text: 'Start' }, mutation)).status, 200);
+  const profile = { id: 'deep', description: 'Deep profile', provider: 'model-proxy', model: 'deep-model', thinkingLevel: 'high' };
+  const created = await request(relay.internal, '/v1/tasks', { authorization: `Bearer ${token}` }, 'POST', {
+    turnId: key('web', 'owner', 'canary', 'profile-origin'), title: 'Profile task', task: 'Do it.', profile,
+  }, { 'idempotency-key': 'create-profile' });
+  assert.equal(created.status, 200, await created.clone().text());
+  const task = await created.json();
+  const blocked = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === task.id && row.blocked), 'profile blocked');
+  assert.match(blocked.blocked, /profile/i);
+  assert.equal(dispatch[0].task.profile.model, 'deep-model');
+  available = true;
+  const resumed = await until(async () => {
+    const db = new DatabaseSync(join(relayData, 'relay.sqlite'));
+    db.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(task.id);
+    db.close();
+    const row = (await taskList(relay.web, auth)).find(entry => entry.id === task.id);
+    return dispatch.length >= 2 && row && !row.blocked && row;
+  }, 'profile assignment resumes after restore');
+  assert.equal(resumed.executionId, blocked.executionId);
+  assert.equal(dispatch.at(-1).task.profile.model, 'deep-model');
+  assert.equal(dispatch.at(-1).task.profile.thinkingLevel, 'high');
+});
+
+test('a new-style Task is blocked before an old worker is asked to run a substituted assignment, then resumes', { timeout: 40_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-protocol-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  let protocol = 0;
+  const dispatch = [];
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return protocol === 2 ? json({ version: 2 }) : json({}, 404);
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+      let body = ''; for await (const chunk of req) body += chunk;
+      dispatch.push(JSON.parse(body));
+      return json({ status: 'running' });
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relayData = join(root, 'relay');
+  const relay = await launchTaskRelay(t, { root, dataDir: relayData, stubUrl: addr(server.address().port), token, password });
+  const auth = basic('owner', password);
+  await createTaskForTest(relay.web, relay.internal, token, auth, { title: 'Protocol task' });
+  const blocked = await until(async () => (await taskList(relay.web, auth)).find(row => row.blocked), 'task blocked on worker protocol');
+  assert.match(blocked.blocked, /protocol|Upgrade/i);
+  assert.equal(dispatch.length, 0, 'an old worker is never sent the new assignment');
+  protocol = 2;
+  const resumed = await until(async () => {
+    const db = new DatabaseSync(join(relayData, 'relay.sqlite'));
+    db.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(blocked.id);
+    db.close();
+    const row = (await taskList(relay.web, auth)).find(entry => entry.id === blocked.id);
+    return dispatch.length > 0 && row && !row.blocked && row;
+  }, 'same Task dispatches after worker upgrade');
+  assert.equal(resumed.id, blocked.id);
+  assert.equal(dispatch[0].task.protocol, 2);
+  assert.equal(dispatch[0].executionId, blocked.executionId, 'the same execution identity resumes');
+});
+
 test('a lost dispatch acknowledgement retries the same execution and accepts a finish that lands meanwhile', { timeout: 60_000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'manolo-task-ack-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -534,6 +671,7 @@ test('a lost dispatch acknowledgement retries the same execution and accepts a f
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -588,6 +726,7 @@ test('a lost resume acknowledgement is retried under the same IDs and is never r
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -656,6 +795,7 @@ test('a settle that carries the worker receipt records the delivery when the res
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -720,6 +860,7 @@ test('an ambiguous resume acknowledgement is retried with the same IDs and answe
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -791,6 +932,7 @@ test('a relay restart between claim and dispatch re-drives the same execution id
   };
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
@@ -839,6 +981,7 @@ test('cancelling a Task retries the worker stop, reports it as unconfirmed, and 
   let relayInternal = 'http://127.0.0.1:1';
   const server = createServer(async (req, res) => {
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
     const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);

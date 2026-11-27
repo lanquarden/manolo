@@ -25,7 +25,13 @@ A named provider, model, and reasoning selection that a Blueprint or Task pins. 
 The directory a Task's file and shell tools use. A repository Task gets its own Git worktree on `task/<task id>`; any other Task gets its own scratch directory. It is not a security boundary.
 
 **Handoff**:
-The configured remote and scoped Task branch where a repository Task's final commit is verified before `finish`. The verification is read-only.
+The configured remote and scoped Task branch where a repository Task's final commit is verified before `finish`. The verification is read-only, and the evidence (commit, base, branch, remote) stays visible on the Task.
+
+**Review Task**:
+A Task bound to a finished source Task's exact handed-off commit and comparison base, with its own worktree. It never follows a mutable branch tip.
+
+**Blocked Task**:
+A running Task whose worker, profile, tool, or workspace is temporarily unavailable. It keeps the same execution identity and a visible reason; restoring the condition resumes it instead of substituting another selection.
 
 **Trigger**:
 A rule that creates a new task for each matching time or event occurrence.
@@ -34,4 +40,4 @@ A rule that creates a new task for each matching time or event occurrence.
 A question or report awaiting the user's response. A question requests an answer; a report requests a review. A progress update does neither.
 
 **Finish**:
-The child's explicit declaration that the Task's work is complete and verified. Success requires an accepted finish; a bare final turn triggers at most one corrective turn, then fails.
+The child's explicit declaration that the Task's work is complete and verified. Acceptance is a one-way durable boundary: later work, progress, Inbox items, or a failure report cannot undo it. A bare final turn triggers at most one corrective turn, then fails.

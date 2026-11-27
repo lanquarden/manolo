@@ -180,7 +180,7 @@ test('Blueprint snapshots pin profiles and tools; model/reasoning reach the requ
     'echo work > work.txt',
     'git add work.txt',
     'git commit -m task-work',
-    `git push handoff HEAD:refs/heads/$(git rev-parse --abbrev-ref HEAD)`,
+    `git push ${remote} HEAD:refs/heads/$(git rev-parse --abbrev-ref HEAD)`,
   ].join(' && ');
   await createTask('repo-one', { title: 'Repo task', task: fixtureTool('bash', { command }), blueprint: 'repo' });
   const repoTask = await settled('Repo task');
@@ -190,8 +190,72 @@ test('Blueprint snapshots pin profiles and tools; model/reasoning reach the requ
   const files = (await exec('git', ['--git-dir', remote, 'ls-tree', '--name-only', `task/${repoTask.id}`])).stdout;
   assert.match(files, /work\.txt/);
   // Terminal cleanup removed the clean worktree but kept the branch and a tombstone.
-  const meta = JSON.parse(await readFile(join(workerData, 'task-worktrees', `${repoTask.id}.json`), 'utf8'));
-  assert.equal(meta.kind, 'cleaned');
+  const meta = await until(async () => {
+    const value = JSON.parse(await readFile(join(workerData, 'task-worktrees', `${repoTask.id}.json`), 'utf8'));
+    return value.kind === 'cleaned' && value;
+  }, 'repository worktree cleanup');
+  assert.equal(repoTask.handoff.commit, head);
+  assert.equal(repoTask.handoff.branch, `task/${repoTask.id}`);
+  assert.match(repoTask.handoff.handoff, /remote\.git$/);
+
+  // A review Task binds the exact handed-off commit and base, in its own worktree, and exposes that evidence.
+  await createTask('review-one', { title: 'Review task', task: 'fixture:finish', blueprint: 'repo', reviewOf: repoTask.id });
+  const reviewTask = await settled('Review task');
+  assert.equal(reviewTask.review.commit, head);
+  assert.equal(reviewTask.review.baseSha, repoTask.handoff.base);
+  assert.equal(reviewTask.review.sourceTaskId, repoTask.id);
+  assert.equal(reviewTask.handoff.commit, head);
+  assert.equal(reviewTask.handoff.base, repoTask.handoff.base);
+  const reviewMeta = await until(async () => {
+    const value = JSON.parse(await readFile(join(workerData, 'task-worktrees', `${reviewTask.id}.json`), 'utf8'));
+    return value.kind === 'cleaned' && value;
+  }, 'review worktree cleanup');
+  assert.equal(reviewMeta.previousHead, head);
+
+  // A configured bundle is not an ungoverned delegate_work child.
+  assert.equal((await request(web, '/api/turns', auth, 'POST', {
+    id: 'delegate-new-bundle', text: fixtureTool('delegate_work', { title: 'Ungoverned', task: 'Do it.', blueprint: 'general' }),
+  }, mutation)).status, 200);
+  const delegated = await until(async () => {
+    const row = await (await request(web, '/api/turns/delegate-new-bundle', auth)).json();
+    return row.status === 'done' && row;
+  }, 'delegate_work turn');
+  assert.equal(delegated.text, 'Fixture tool failed');
+  assert.equal(delegated.tools.find(tool => tool.name === 'delegate_work')?.status, 'error');
+
+  // A lost worktree blocks on resume rather than terminal-failing or recreating a workspace.
+  await createTask('repo-wait', {
+    title: 'Worktree loss', task: fixtureTool('post_inbox', { kind: 'question', prompt: 'Continue?' }), blueprint: 'repo',
+  });
+  const waiting = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.title === 'Worktree loss');
+    return row?.status === 'waiting' && row;
+  }, 'repository Task waits in Inbox');
+  const inbox = await (await request(web, '/api/inbox', auth)).json();
+  const item = inbox.taskItems.find(entry => entry.taskId === waiting.id);
+  await rm(join(workerData, 'task-worktrees', waiting.id), { recursive: true, force: true });
+  const responded = await request(web, `/api/tasks/${waiting.id}/inbox/${item.id}/respond`, auth, 'POST', { answer: 'yes' }, mutation);
+  assert.equal(responded.status, 200, await responded.clone().text());
+  const blocked = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === waiting.id);
+    return row?.blocked && row;
+  }, 'lost worktree blocks recoverably');
+  assert.equal(blocked.status, 'running');
+  assert.match(blocked.blocked, /worktree|workspace/i);
+
+  // A required pull request fails closed without structured evidence and succeeds with a URL bound to the exact commit.  // A required pull request fails closed without structured evidence and succeeds with a URL bound to the exact commit.
+  await createTask('review-pr', {
+    title: 'Review PR task', task: 'fixture:finish-pr', blueprint: 'repo', reviewOf: repoTask.id, requiresPullRequest: true,
+  });
+  const prTask = await settled('Review PR task');
+  assert.equal(prTask.handoff.pullRequest.commit, head);
+  assert.match(prTask.handoff.pullRequest.url, /^https:\/\/github\.com\/lanquarden\/manolo\/pull\/1$/);
+  await createTask('review-pr-missing', {
+    title: 'Missing PR proof', task: 'fixture:finish', blueprint: 'repo', reviewOf: repoTask.id, requiresPullRequest: true,
+  });
+  const missingPr = await settled('Missing PR proof', 'failed');
+  assert.match(missingPr.failure, /finish tool after one corrective turn/);
+  assert.equal(missingPr.handoff, undefined);
 
   await relay.end();
   await worker.end();

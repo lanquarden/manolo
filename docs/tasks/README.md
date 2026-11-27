@@ -132,8 +132,8 @@ Not implemented in this slice, and not implied by the UI:
   handling. There is deliberately no replacement child for Inbox input: a definitively lost execution fails the Task.
 - Declined-item policy beyond "the child is told the item was declined and continues".
 - Migrating legacy work sessions into Tasks.
-- Automated pull-request creation or merge/deployment actions. A review handoff names the exact Task branch commit; a PR
-  is created only when requested, and this slice does not perform or verify that live GitHub write.
+- Automated pull-request creation, merge, or deployment. A requested pull request needs structured URL/commit evidence;
+  this slice does not publish or live-verify the GitHub write. Review Tasks bind the exact handed-off commit and base.
 - Security isolation between Tasks. A worktree and a scratch directory are working arrangements; `bash` is not a
   sandbox and can use the pod's binaries and credentials.
 

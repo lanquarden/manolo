@@ -11,7 +11,7 @@ turn's placed input; no tool accepts an owner, scope, or delivery destination.
 
 | Tool | Status | Contract |
 | --- | --- | --- |
-| `create_task` | **Shipped** | Queue one task with a title, task text, optional Blueprint and named model profile (from `inspect_manolo` or the tool description), and optional `notBefore` ISO time. The resolved Blueprint text, tools, profile, and repository are pinned as a content-addressed snapshot. Returns the Task ID and current status without waiting. A future time makes it Scheduled until due. |
+| `create_task` | **Shipped** | Queue one task with a title, task text, optional Blueprint and named model profile, optional `reviewOf` a finished Task's exact handed-off commit, optional `requiresPullRequest`, and optional `notBefore` ISO time. The resolved Blueprint text, tools, profile, and repository are pinned as a content-addressed snapshot. Returns the Task ID and current status without waiting. A future time makes it Scheduled until due. |
 | `list_tasks` / `get_task` | **Shipped** | List or read this conversation's Tasks, including blueprint, latest progress, the open or answered Inbox item, and the terminal outcome. Filter by state, blueprint, or text. |
 | `cancel_task` | **Shipped** | Cancel a non-terminal Task, close its pending Inbox item, and fence late execution updates. The ledger cancellation and the retried worker stop are reported separately. Does not undo external effects. |
 | `list_blueprints` | **Proposed** | Discovery stays on `inspect_manolo`, which lists task Blueprints and their short descriptions plus resolvable profiles. |
@@ -25,7 +25,7 @@ own record; the model cannot name either.
 | Tool | Status | Contract |
 | --- | --- | --- |
 | `report_progress` | **Shipped** | Save a concise milestone without pausing. Visible in Task details; no conversation interruption. |
-| `finish` | **Shipped** | The only success path. Validates the Task workspace read-only (dirty/untracked work and an unverified handoff commit are refused with an actionable error), records a replay-stable finish receipt, and lets the final turn settle the Task. A bare final turn gets one corrective turn in the same session; a second one fails the Task. |
+| `finish` | **Shipped** | The only success path and a one-way durable boundary. Validates the Task workspace read-only (dirty/untracked work and an unverified handoff commit are refused with an actionable error), records replay-stable finish evidence, and blocks all later tools/progress/Inbox work. A lost acknowledgement is reconciled from relay state without resampling Git. A required pull request must carry a URL bound to the accepted commit. A bare final turn gets one corrective turn in the same session; a second one fails the Task. |
 | `post_inbox` | **Shipped** | Open one typed **question** or **report for review**, park the Task, and release its execution slot. Returns the owner's response when it arrives. This is a yield boundary: the tool parks on a durable signal, a guard refuses every other tool in that execution, and the relay refuses progress, another item, or a settle from the yielded execution. |
 | `get_task_context` | **Proposed** | The child receives its assignment, blueprint, and any response in its input and the tool result. |
 | `propose_follow_up` | **Proposed** | Follow-up proposals do not ship; the Orchestrator creates Tasks itself. |
@@ -35,6 +35,13 @@ The notification path is separate from tool calls: the service records an event 
 the chat shows it as a durable notice, and the next orchestrator turn receives undelivered notices once as data. The
 Orchestrator does not have to poll `get_task` to learn that input is needed. An Inbox response goes to the Task, not
 through model interpretation of a chat reply.
+
+## Blocked and recovered
+
+A running Task can be blocked on a recoverable condition: an unavailable model profile, a missing tool, a lost or
+replaced worktree, or a worker that predates the Task protocol. The row stays running with a `blocked` reason and the
+same execution identity; restoring the worker/profile/workspace resumes it. The relay never substitutes another model,
+tool set, or workspace.
 
 ## Blueprint and workspace
 

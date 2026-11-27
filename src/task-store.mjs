@@ -44,6 +44,11 @@ export function taskView(row, now = Date.now()) {
     updatedAt: row.updated_at,
     ...(row.blueprint_id && { blueprint: { id: row.blueprint_id, revision: row.blueprint_revision } }),
     ...(row.profile_snapshot && { profile: (() => { const profile = JSON.parse(row.profile_snapshot); return { id: profile.id, model: profile.model, ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }) }; })() }),
+    ...(row.review_snapshot && { review: JSON.parse(row.review_snapshot) }),
+    ...(row.handoff_evidence && { handoff: JSON.parse(row.handoff_evidence) }),
+    ...(row.finish_accepted_at && { finish: { acceptedAt: row.finish_accepted_at, summary: row.finish_summary ?? null } }),
+    ...(row.blocked_reason && { blocked: row.blocked_reason }),
+    ...(row.requires_pr === 1 && { requiresPullRequest: true }),
     originTurnId: row.origin_turn_id,
     ...(row.outcome && { outcome: row.outcome }),
     ...(row.failure && { failure: row.failure }),
@@ -95,6 +100,10 @@ export function openTaskStore(db) {
       finish_required INTEGER NOT NULL DEFAULT 1,
       finish_accepted_at TEXT,
       finish_summary TEXT,
+      handoff_evidence TEXT,
+      blocked_reason TEXT,
+      review_snapshot TEXT,
+      requires_pr INTEGER NOT NULL DEFAULT 0,
       not_before INTEGER NOT NULL DEFAULT 0,
       execution_id TEXT,
       execution_kind TEXT NOT NULL DEFAULT 'start' CHECK(execution_kind IN ('start','resume')),
@@ -173,6 +182,10 @@ export function openTaskStore(db) {
       ['finish_required', 'INTEGER NOT NULL DEFAULT 0'],
       ['finish_accepted_at', 'TEXT'],
       ['finish_summary', 'TEXT'],
+      ['handoff_evidence', 'TEXT'],
+      ['blocked_reason', 'TEXT'],
+      ['review_snapshot', 'TEXT'],
+      ['requires_pr', 'INTEGER NOT NULL DEFAULT 0'],
     ]) {
       if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
@@ -262,7 +275,7 @@ export function openTaskStore(db) {
   return {
     db,
 
-    create({ owner, agent, scope, originTurnId, title, input, blueprint, blueprintSnapshot, profile, finishRequired = true, notBefore = 0, key, now = Date.now() }) {
+    create({ owner, agent, scope, originTurnId, title, input, blueprint, blueprintSnapshot, profile, review, requiresPr = false, finishRequired = true, notBefore = 0, key, now = Date.now() }) {
       return transaction(() => {
         if (key) {
           const stored = operation.get(key);
@@ -274,12 +287,14 @@ export function openTaskStore(db) {
         const id = newId();
         const createdAt = iso(now);
         db.prepare(`INSERT INTO tasks(id,scope,owner,agent,origin_turn_id,title,input,blueprint_id,blueprint_revision,
-          blueprint_snapshot,profile_snapshot,status,finish_required,not_before,execution_kind,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?, 'queued', ?, ?, 'start', ?, ?)`)
+          blueprint_snapshot,profile_snapshot,review_snapshot,requires_pr,status,finish_required,not_before,execution_kind,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'queued', ?, ?, 'start', ?, ?)`)
           .run(id, scope, owner, agent, originTurnId, plain(title, MAX_TITLE), plain(input, MAX_INPUT),
             blueprint?.id ?? null, blueprint?.revision ?? null,
             blueprintSnapshot === undefined ? null : JSON.stringify(blueprintSnapshot),
-            profile === undefined ? null : JSON.stringify(profile), finishRequired ? 1 : 0, notBefore, createdAt, createdAt);
+            profile === undefined ? null : JSON.stringify(profile),
+            review === undefined ? null : JSON.stringify(review), requiresPr ? 1 : 0,
+            finishRequired ? 1 : 0, notBefore, createdAt, createdAt);
         const view = taskView(row.get(id), now);
         if (key) remember(key, id, 'create', view, now);
         return view;
@@ -343,7 +358,7 @@ export function openTaskStore(db) {
         // `dispatch_pending` is the durable marker that an outbound RPC is owed for this execution identity. It survives
         // a relay restart, so a claim committed just before a crash is re-driven with the same IDs instead of being lost.
         const changed = db.prepare(`UPDATE tasks SET status='running', execution_id=?, claim_at=?, heartbeat_at=?, next_at=0,
-          dispatch_pending=1, dispatch_attempts=0, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
+          dispatch_pending=1, dispatch_attempts=0, blocked_reason=NULL, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
           .run(executionId, now, now, iso(now), next.id, now);
         if (changed.changes !== 1) return undefined;
         return row.get(next.id);
@@ -378,9 +393,24 @@ export function openTaskStore(db) {
 
     // The worker accepted the RPC. A later restart must not re-drive acknowledged work.
     ackDispatch(taskId, executionId, now = Date.now()) {
-      const changed = db.prepare(`UPDATE tasks SET dispatch_pending=0, dispatch_attempts=0, next_at=0, updated_at=?
+      const changed = db.prepare(`UPDATE tasks SET dispatch_pending=0, dispatch_attempts=0, next_at=0, blocked_reason=NULL, updated_at=?
         WHERE id=? AND execution_id=? AND status='running' AND dispatch_pending=1`).run(iso(now), taskId, executionId);
       return changed.changes === 1;
+    },
+
+    // A recoverable refusal (an unavailable profile, a lost worktree, a worker that predates this Task protocol) keeps
+    // the Task running but blocks dispatch with a visible reason. It is retried with a bounded backoff; restoring the
+    // worker/profile/workspace makes the same execution eligible again. It never substitutes another selection.
+    block(taskId, executionId, reason, now = Date.now(), retryAfterMs = 60_000) {
+      return transaction(() => {
+        const task = row.get(taskId);
+        if (!task || task.status !== 'running' || task.execution_id !== executionId || task.finish_accepted_at) return false;
+        const first = task.blocked_reason !== reason;
+        db.prepare(`UPDATE tasks SET blocked_reason=?, dispatch_pending=1, dispatch_attempts=0, next_at=?, updated_at=? WHERE id=?`)
+          .run(plain(reason, MAX_NOTE), now + Math.min(Math.max(retryAfterMs, 1_000), 300_000), iso(now), taskId);
+        if (first) addEvent.run(taskId, task.scope, 'blocked', `Task “${task.title}” is blocked: ${plain(reason, MAX_NOTE)}`, iso(now));
+        return true;
+      });
     },
 
     park({ taskId, executionId, kind, prompt, key, now = Date.now() }) {
@@ -388,6 +418,7 @@ export function openTaskStore(db) {
         const previous = receipt(key, taskId, 'inbox');
         if (previous) return previous;
         const task = fenced(taskId, executionId);
+        if (task.finish_accepted_at) throw bad(409, 'Finish was accepted; this execution cannot open another Inbox item');
         if (openItem.get(taskId)) throw bad(409, 'This task already has an open Inbox item');
         const id = newId();
         db.prepare('INSERT INTO task_inbox_items(id,task_id,kind,prompt,status,created_at) VALUES(?,?,?,?, \'open\', ?)')
@@ -405,7 +436,8 @@ export function openTaskStore(db) {
       return transaction(() => {
         const previous = receipt(key, taskId, 'progress');
         if (previous) return previous;
-        fenced(taskId, executionId);
+        const task = fenced(taskId, executionId);
+        if (task.finish_accepted_at) throw bad(409, 'Finish was accepted; this execution can no longer report progress');
         db.prepare('INSERT INTO task_progress(task_id,execution_id,note,created_at) VALUES(?,?,?,?)')
           .run(taskId, executionId, plain(note, MAX_NOTE), iso(now));
         db.prepare('UPDATE tasks SET heartbeat_at=?, updated_at=? WHERE id=?').run(now, iso(now), taskId);
@@ -424,7 +456,7 @@ export function openTaskStore(db) {
     failExecution(taskId, executionId, reason, now = Date.now()) {
       return transaction(() => {
         const task = row.get(taskId);
-        if (!task || task.status !== 'running' || task.execution_id !== executionId) return false;
+        if (!task || task.status !== 'running' || task.execution_id !== executionId || task.finish_accepted_at) return false;
         db.prepare(`UPDATE tasks SET status='failed', outcome=NULL, failure=?, execution_kind='start', resume_item_id=NULL,
           context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`).run(plain(reason, MAX_NOTE), iso(now), taskId);
         addEvent.run(taskId, task.scope, 'outcome', `Task “${task.title}” failed.`, iso(now));
@@ -434,7 +466,12 @@ export function openTaskStore(db) {
 
     meta(id) {
       const task = row.get(id);
-      return task && { agent: task.agent, scope: task.scope, status: task.status, executionId: task.execution_id };
+      return task && {
+        agent: task.agent, scope: task.scope, status: task.status, executionId: task.execution_id,
+        finishAccepted: Boolean(task.finish_accepted_at), finishSummary: task.finish_summary ?? null,
+        blocked: task.blocked_reason ?? null, handoff: task.handoff_evidence ? JSON.parse(task.handoff_evidence) : null,
+        review: task.review_snapshot ? JSON.parse(task.review_snapshot) : null,
+      };
     },
 
     inboxItem(itemId) {
@@ -450,9 +487,15 @@ export function openTaskStore(db) {
         if (previous) return previous;
         const task = fenced(taskId, executionId, { allowQueued: true });
         if (task.status !== 'running') throw bad(409, 'Execution is not running');
-        if (task.finish_accepted_at) throw bad(409, 'Finish was already accepted for this Task');
-        db.prepare('UPDATE tasks SET finish_accepted_at=?, finish_summary=?, updated_at=? WHERE id=?')
-          .run(iso(now), plain(summary, MAX_SUMMARY), iso(now), taskId);
+        // Acceptance is the durable terminal boundary. A repeated finish from the same execution is a replay even with a
+        // different operation key, so a lost acknowledgement is recoverable from authoritative state.
+        if (task.finish_accepted_at) {
+          return { accepted: true, replay: true, summary: task.finish_summary ?? null,
+            ...(task.handoff_evidence && { evidence: JSON.parse(task.handoff_evidence) }) };
+        }
+        db.prepare(`UPDATE tasks SET finish_accepted_at=?, finish_summary=?, handoff_evidence=?, blocked_reason=NULL,
+          updated_at=? WHERE id=?`)
+          .run(iso(now), plain(summary, MAX_SUMMARY), evidence === undefined ? null : JSON.stringify(evidence), iso(now), taskId);
         return remember(key, taskId, 'finish', { accepted: true, ...(evidence && { evidence }) }, now);
       });
     },
@@ -478,8 +521,13 @@ export function openTaskStore(db) {
         if (outcome === 'done' && fencedTask.finish_required === 1 && !fencedTask.finish_accepted_at) {
           throw bad(409, 'Finish is required before a Task can succeed');
         }
+        // An accepted finish is a one-way terminal boundary. A later failure report cannot downgrade it; the worker must
+        // retry the done settle instead.
+        if (outcome !== 'done' && fencedTask.finish_accepted_at) {
+          throw bad(409, 'Finish was accepted; this Task cannot be recorded as failed');
+        }
         db.prepare(`UPDATE tasks SET status=?, outcome=?, failure=?, execution_kind='start', resume_item_id=NULL, context=NULL,
-          claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
+          claim_at=NULL, dispatch_pending=0, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=?`)
           .run(outcome, outcome === 'done' ? plain(summary, MAX_SUMMARY) : null,
             outcome === 'failed' ? plain(summary, MAX_SUMMARY) : null, iso(now), taskId);
         addEvent.run(taskId, fencedTask.scope, 'outcome',
@@ -506,6 +554,7 @@ export function openTaskStore(db) {
           if (record.status !== status || record.response !== response) throw bad(409, 'This Inbox item is already resolved');
           return receiptFor();
         }
+        if (task.finish_accepted_at) throw bad(409, 'Finish was accepted; this Inbox item can no longer advance the Task');
         if (task.status !== 'waiting' || task.resume_item_id !== itemId) throw bad(409, 'This Inbox item is not open for response');
         const changed = db.prepare(`UPDATE task_inbox_items SET status=?, response=?, responded_at=? WHERE id=? AND status='open'`)
           .run(status, response, iso(now), itemId);
@@ -529,10 +578,11 @@ export function openTaskStore(db) {
         if (!task || task.execution_id !== executionId) return false;
         if (task.status === 'cancelled') return false;
         // A fast finish can settle the Task before this report lands; the delivery still happened and is recorded.
-        db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`).run(iso(now), itemId);
-        if (task.status === 'running') {
-          db.prepare(`UPDATE tasks SET resume_item_id=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
-            .run(iso(now), taskId);
+        db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND task_id=? AND delivered_at IS NULL`).run(iso(now), itemId, taskId);
+        // A late acknowledgement of an older item must not clear a newer response that is queued for resume.
+        if (task.status === 'running' && task.resume_item_id === itemId) {
+          db.prepare(`UPDATE tasks SET resume_item_id=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=? AND resume_item_id=?`)
+            .run(iso(now), taskId, itemId);
         }
         return true;
       });
