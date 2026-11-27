@@ -143,6 +143,26 @@ the next-turn notice exposure. Delivery is not exactly-once transport.
   before the worker. Rolling the worker back while a negotiated execution is in flight is refused rather than
   downgraded: the ledger answers 409 to its runless results and the worker leaves the execution visibly running, so let
   those Tasks finish or cancel them before rolling the worker back, and roll the relay back last.
+- `MANOLO_TASK_FINISH=legacy` is the relay-wide companion for the relay-first window. A new relay normally marks a new
+  Task `finish_required=1`, and a structured Task (pinned snapshot, profile, review binding, or required pull request)
+  always needs the v2 worker route. An old worker has neither the route nor a `finish` tool, so while it still serves new
+  *unstructured* Tasks the relay must run with `MANOLO_TASK_FINISH=legacy`: that marks them `finish_required=0` so the
+  worker's bare final can settle them, and the ledger still refuses a bare success for any structured row. Without the
+  flag the relay holds such a Task at dispatch with "The worker does not support the Task protocol…" instead of running
+  it under a contract the worker cannot honour. Set the flag only for this mixed window and unset it once no pre-finish
+  worker serves Tasks: with it on, an unstructured bare final succeeds without `finish` even on a new worker.
+- Rollback and restore: stop the newer relay, restore the previous relay ref, and keep the existing data directory and
+  ledger. An older relay ignores the newer columns, but a negotiated execution still names its admission, and an older
+  relay does not accept that shape, so drain or cancel those Tasks before rolling the relay back (the worker-side
+  rollback is refused the same way). Restore the worker from its previous ref only after those executions are terminal.
+  Isolated compatibility checkouts and data directories are disposable; the durable ledger and Task worktrees are not.
+- Mixed-version check: `node scripts/task-compat.mjs --old e93ec28 --candidate HEAD` extracts both refs with `git
+  archive` into temporary checkouts, refuses to reuse `node_modules` unless both refs pin the installed package-lock,
+  and runs the real relay and worker processes over loopback for candidate relay + old worker (with
+  `MANOLO_TASK_FINISH=legacy`), old relay + new worker, and the new relay's default refusal without the flag. It prints
+  the one plain dispatch route, the runless settlement shape, and each terminal outcome, and touches neither the working
+  tree nor any network beyond loopback. Use `--candidate <ref>` to name the candidate explicitly and `--keep` to keep the
+  temporary checkouts for inspection.
 - The slice is gated by the existing `MANOLO_WORK_SESSION_AGENT` list: without it, `/api/tasks` is 404, the internal
   task routes are 404, and no turn is flagged for orchestration tools. No chart change is required.
 - Reversal: drop `MANOLO_WORK_SESSION_AGENT` (or the agent from it) and the Task surfaces disappear while existing rows

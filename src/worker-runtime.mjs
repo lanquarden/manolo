@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemMessage, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { defineDoc, defineExtension, defineTool, ProviderDoc, wrapTool } from '@earendil-works/pi-durable';
@@ -65,6 +66,19 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
       const directive = name => text.split('\n').some(line => line.trim() === name);
       const systemInstructions = getCurrentSystemMessage(messages)?.sections?.instructions ?? '';
       const taskChild = systemInstructions.includes('executing one durable Task');
+      // A Task child can be held at a known point until the test publishes a gate file. That makes an ordering that
+      // matters - a lost start acknowledgement, a workspace lost while the submission is live, a restored checkout -
+      // controlled by the test instead of by a delay that happens to be long enough. Fixture mode only.
+      const gate = taskChild
+        ? text.split('\n').map(line => line.trim()).find(line => line.startsWith('fixture:gate:'))?.slice('fixture:gate:'.length)
+        : undefined;
+      if (gate) {
+        while (!existsSync(gate)) {
+          if (options?.signal?.aborted) break;
+          await sleep(25, undefined, { signal: options?.signal }).catch(() => {});
+          if (options?.signal?.aborted) break;
+        }
+      }
       if (inspectSetup && text === 'fixture:setup') {
         const system = getCurrentSystemMessage(messages);
         // Inspect what arrived at the fixture provider, without echoing prompt text, env or auth options.
@@ -119,13 +133,18 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
               : [...turn].reverse().find(message => message.role === 'toolResult' && message.toolCallId === callId);
             if (toolResult) {
               const result = toolResult.isError ? 'Fixture tool failed' : 'Fixture tool succeeded';
+              // The echoed summary carries the tool's own structured result into the Task outcome and transcript, so a test
+              // can prove an Inbox answer reached this exact submission rather than only that the Task finished.
+              const echoed = (toolResult.content ?? []).filter(block => block.type === 'text')
+                .map(block => block.text).join('\n').slice(0, 2000);
+              const summary = !toolResult.isError && directive('fixture:finish-echo') && echoed ? echoed : result;
               // Inside a Task execution, a tool result is followed by the mandatory finish call rather than bare prose.
               const calledFinish = turn.some(message => message.role === 'assistant' &&
                 (message.content ?? []).some(block => block.type === 'toolCall' && block.name === 'finish'));
               if (taskChild && !calledFinish) {
-                return fauxAssistantMessage(fauxToolCall('finish', { summary: result }), { stopReason: 'toolUse' });
+                return fauxAssistantMessage(fauxToolCall('finish', { summary }), { stopReason: 'toolUse' });
               }
-              return fauxAssistantMessage(result);
+              return fauxAssistantMessage(summary);
             }
             return fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
           }

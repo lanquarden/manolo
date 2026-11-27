@@ -24,6 +24,12 @@ const request = (url, path, auth, method = 'GET', body, extra = {}) => fetch(`${
   body: body && JSON.stringify(body), signal: AbortSignal.timeout(5000),
 });
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function until(check, label) {
   const deadline = Date.now() + 25_000;
   while (Date.now() < deadline) {
@@ -415,6 +421,241 @@ test('a workspace lost after the Inbox answer reached the child resumes the same
   const finalDetail = await detailOf(waiting.id);
   assert.ok(finalDetail.items[0].deliveredAt, 'the answer stays recorded as delivered');
   assert.equal(finalDetail.items.length, 1, 'the answer was not delivered again');
+
+  await relay.end();
+  await worker.end();
+  assert.doesNotMatch(worker.log(), /Task request failed|Unhandled|AssertionError/);
+});
+
+test('a workspace lost during a live initial submission is observed by the start retry, then the same run answers Inbox once and finishes', { timeout: 120_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-live-loss-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const remote = await seedRemote(root);
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'You are a Task agent for this repository.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    repositories: { sample: { remote, base: 'main', handoff: remote } },
+    blueprints: {
+      repo: { description: 'Repository Task', role: 'task', repository: 'sample', files: ['IDENTITY.md'],
+        tools: ['bash', 'read', 'write', 'edit', 'finish', 'post_inbox', 'report_progress'] },
+    },
+  }));
+
+  const token = secret();
+  const password = secret();
+  const workerData = join(root, 'worker');
+  const relayData = join(root, 'relay');
+  const configPath = join(root, 'relay.json');
+  const gate = join(root, 'release-the-child');
+  const payload = `answer-${randomBytes(8).toString('hex')}`;
+
+  // The worker reaches the relay's internal listener through a stable forwarder, and every report it makes is recorded:
+  // the shape of the settle and the number of settles are evidence, not assumptions.
+  const reported = [];
+  let internal = 'http://127.0.0.1:1';
+  const toRelay = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    let parsed;
+    try { parsed = body.length ? JSON.parse(body.toString('utf8')) : undefined; } catch { parsed = undefined; }
+    reported.push({ path: req.url, body: parsed, key: req.headers['idempotency-key'] });
+    try {
+      const response = await fetch(internal + req.url, {
+        method: req.method,
+        headers: Object.fromEntries(Object.entries(req.headers)
+          .filter(([name]) => ['authorization', 'content-type', 'idempotency-key'].includes(name))),
+        body: body.length ? body : undefined,
+      });
+      res.writeHead(response.status, { 'content-type': 'application/json' });
+      res.end(await response.text());
+    } catch {
+      res.writeHead(503).end();
+    }
+  }).listen(0, '127.0.0.1');
+  await once(toRelay, 'listening');
+  t.after(() => { toRelay.closeAllConnections?.(); toRelay.close(); });
+
+  // The relay reaches the worker through a forwarder too. The first execution POST is admitted by the real worker and
+  // then its acknowledgement is lost, held open until the test has taken the workspace away. Holding the response keeps
+  // the relay scheduler from opening a second dispatch obligation, so the ordering is driven, not timed.
+  let workerUrl = 'http://127.0.0.1:1';
+  let dropStartAck = true;
+  const held = deferred();
+  const releaseAck = deferred();
+  const toWorker = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    try {
+      const response = await fetch(workerUrl + req.url, {
+        method: req.method,
+        headers: Object.fromEntries(Object.entries(req.headers)
+          .filter(([name]) => ['authorization', 'content-type', 'idempotency-key'].includes(name))),
+        body: body.length ? body : undefined,
+      });
+      const text = await response.text();
+      if (dropStartAck && req.method === 'POST' && /\/executions(?:\/v2)?$/.test(req.url)) {
+        dropStartAck = false;
+        held.resolve();
+        await releaseAck.promise;
+        res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"start acknowledgement lost"}');
+        return;
+      }
+      res.writeHead(response.status, { 'content-type': 'application/json' });
+      res.end(text);
+    } catch {
+      res.writeHead(503).end();
+    }
+  }).listen(0, '127.0.0.1');
+  await once(toWorker, 'listening');
+  t.after(() => { toWorker.closeAllConnections?.(); toWorker.close(); });
+  const workerProxy = addr(toWorker.address().port);
+
+  const worker = start(t, 'worker', {
+    MANOLO_AGENT_ID: 'canary', MANOLO_AGENT_TOKEN: token, MANOLO_DATA_DIR: workerData,
+    MANOLO_MODE: 'fixture', MANOLO_CODING_TOOLS: '1', MANOLO_FIXTURE_TOOLS: '1', PORT: '0',
+    MANOLO_BLUEPRINTS_DIR: bundles, MANOLO_RELAY_URL: addr(toRelay.address().port),
+  });
+  workerUrl = addr(await worker.port(/worker listening on (\d+)/));
+  await writeFile(configPath, JSON.stringify({
+    agents: { canary: { url: workerProxy, tokenEnv: 'CANARY_TOKEN' } },
+    owners: { owner: { agent: 'canary', passwordEnv: 'OWNER_PASSWORD' } }, routes: [], inbox: [],
+  }));
+  const relay = start(t, 'relay', {
+    CANARY_TOKEN: token, OWNER_PASSWORD: password, MANOLO_RELAY_CONFIG: configPath,
+    MANOLO_DATA_DIR: relayData, MANOLO_WORK_SESSION_AGENT: 'canary', PORT: '0', MANOLO_INTERNAL_PORT: '0',
+  });
+  const web = addr(await relay.port(/web listening on .*:(\d+)/));
+  internal = addr(await relay.port(/internal listening on .*:(\d+)/));
+  const auth = basic('owner', password);
+  const tasksOf = async () => {
+    const response = await request(web, '/api/tasks', auth);
+    assert.equal(response.status, 200, await response.clone().text());
+    const payload = await response.json();
+    return [...payload.active, ...payload.history];
+  };
+  const rowOf = id => {
+    const db = new DatabaseSync(join(relayData, 'relay.sqlite'), { readOnly: true });
+    try { return db.prepare('SELECT * FROM tasks WHERE id=?').get(id); }
+    finally { db.close(); }
+  };
+  const workerTranscript = async id => {
+    const response = await fetch(`${workerUrl}/v1/tasks/${id}/transcript`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 200, await response.clone().text());
+    return response.json();
+  };
+
+  // The child waits at a fixture gate: it has been admitted and its workspace prepared, but it has not posted yet.
+  assert.equal((await request(web, '/api/turns', auth, 'POST', {
+    id: 'live-loss', text: fixtureTool('create_task', {
+      title: 'Live initial loss',
+      task: [`fixture:gate:${gate}`, fixtureTool('post_inbox', { kind: 'question', prompt: 'May I finish?' }), 'fixture:finish-echo'].join('\n'),
+      blueprint: 'repo',
+    }),
+  }, mutation)).status, 200);
+  const task = await until(async () => (await tasksOf()).find(entry => entry.title === 'Live initial loss' && entry.executionId), 'the Task is dispatched');
+  const executionId = rowOf(task.id).execution_id;
+  assert.match(executionId, /^[0-9a-f]{32}$/);
+
+  // The first start acknowledgement is already lost: the relay is still waiting on it while the child is admitted.
+  await held.promise;
+  const admitted = await until(async () => {
+    const body = await workerTranscript(task.id);
+    return body.state === 'running' && body.transcript?.[0]?.text?.includes(gate) && body;
+  }, 'the initial submission is admitted and waiting at its gate');
+  assert.equal(admitted.state, 'running');
+  assert.equal(rowOf(task.id).execution_id, executionId, 'the acknowledgement loss did not mint another execution');
+
+  // The real checkout is taken away while that same submission is still live.
+  const path = join(workerData, 'task-worktrees', task.id);
+  await rename(path, `${path}.lost`);
+  releaseAck.resolve();
+
+  // The retry that the lost acknowledgement owes arrives while the checkout is gone. It must observe a temporary
+  // condition, not retire the live admission: the fence stays at run 1 and the execution keeps its run.
+  const retried = await until(() => {
+    const row = rowOf(task.id);
+    return row?.dispatch_pending === 1 && row.dispatch_attempts >= 1 && row;
+  }, 'the lost acknowledgement leaves a retry obligation');
+  assert.equal(retried.execution_id, executionId);
+  const relayDb = new DatabaseSync(join(relayData, 'relay.sqlite'));
+  relayDb.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(task.id);
+  relayDb.close();
+  const observed = await until(() => {
+    const row = rowOf(task.id);
+    return row?.blocked_reason && row;
+  }, 'the retry reports an unavailable workspace');
+  assert.match(observed.blocked_reason, /worktree|workspace/i);
+  assert.equal(observed.status, 'running');
+  assert.equal(observed.execution_id, executionId, 'an observation never replaces the execution');
+  assert.equal(observed.run_fence, 1, 'an observation leaves the live admission its authority');
+  assert.equal(observed.admission_contract, 2);
+  assert.equal(observed.finish_accepted_at, null);
+  assert.equal(observed.dispatch_pending, 1, 'the block schedules the recovery retry');
+  assert.equal((await workerTranscript(task.id)).state, 'running', 'the live submission is not blocked locally');
+  assert.equal(reported.filter(entry => entry.path === `/v1/tasks/${task.id}/block`).length, 0, 'no block was retired for a live run');
+
+  // Restoring the exact checkout and releasing the child lets the original submission post its one Inbox question.
+  await rename(`${path}.lost`, path);
+  await writeFile(gate, 'restored\n');
+  const waiting = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === task.id);
+    return row?.status === 'waiting' && row;
+  }, 'the original submission posts its Inbox question');
+  // The observation stays visible while the Task waits: it is cleared only by the acknowledgement that matches the
+  // current obligation, which is the resume of the restored execution, not by parking over it.
+  assert.match(waiting.blocked ?? '', /worktree|workspace/i);
+  const parkedRow = rowOf(task.id);
+  assert.match(parkedRow.blocked_reason ?? '', /worktree|workspace/i);
+  assert.equal(parkedRow.dispatch_pending, 0, 'parking releases the observation retry');
+  assert.equal(parkedRow.execution_id, executionId);
+  const inbox = await (await request(web, '/api/inbox', auth)).json();
+  const items = inbox.taskItems.filter(entry => entry.taskId === task.id);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].prompt, 'May I finish?');
+
+  // The answer resumes that same durable submission exactly once, and the original run finishes with its own admission.
+  assert.equal((await request(web, `/api/tasks/${task.id}/inbox/${items[0].id}/respond`, auth, 'POST', { answer: payload }, mutation)).status, 200);
+  const done = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === task.id);
+    return row?.status === 'done' && row;
+  }, 'the original run finishes after the answer');
+  assert.equal(done.id, task.id);
+  assert.equal(done.failure, undefined);
+  assert.equal(done.blocked, undefined);
+
+  const finalRow = rowOf(task.id);
+  assert.equal(finalRow.execution_id, executionId, 'the answer reached the original execution, never a replacement');
+  assert.equal(finalRow.execution_kind, 'start');
+  assert.equal(finalRow.resume_item_id, null);
+  assert.equal(finalRow.run_fence, 1, 'the original admission settled its own Task');
+  assert.equal(finalRow.admission_contract, 2);
+  assert.notEqual(finalRow.finish_accepted_at, null);
+
+  // The answer payload is visible in the outcome and in the child transcript, and the answer is recorded on exactly one item.
+  assert.match(done.outcome, /"status":"answered"/);
+  assert.ok(done.outcome.includes(payload), 'the finish summary carries the delivered answer');
+  const detail = await (await request(web, `/api/tasks/${task.id}`, auth)).json();
+  assert.equal(detail.task.items.length, 1, 'one Inbox item was opened and answered once');
+  assert.equal(detail.task.items[0].response, payload);
+  assert.ok(detail.task.items[0].deliveredAt, 'the answer was delivered to the child');
+  assert.equal(detail.transcript.at(-1).role, 'assistant');
+  assert.ok(detail.transcript.at(-1).text.includes(payload), 'the transcript carries the delivered answer');
+  assert.equal(detail.transcript.some(entry => entry.role === 'user' && entry.text.includes('ended this Task')), false,
+    'the original run never needed a corrective turn');
+
+  const settles = reported.filter(entry => entry.path === `/v1/tasks/${task.id}/settle`);
+  assert.equal(settles.length, 1, 'the original run settled exactly once');
+  assert.equal(settles[0].body.run, 1);
+  assert.equal(settles[0].body.outcome, 'done');
+  const inboxCalls = reported.filter(entry => entry.path === `/v1/tasks/${task.id}/inbox`);
+  assert.equal(new Set(inboxCalls.map(entry => JSON.stringify(entry.body))).size, 1, 'every Inbox call names the same one item');
+  assert.equal(new Set(inboxCalls.map(entry => entry.key)).size, 1, 'a replayed call is the same operation, not a second question');
+  assert.equal(inboxCalls.every(entry => entry.body.run === 1), true, 'the question belongs to the original admission');
+  assert.equal((await (await request(web, '/api/inbox', auth)).json()).taskItems.filter(entry => entry.taskId === task.id).length, 0);
 
   await relay.end();
   await worker.end();
