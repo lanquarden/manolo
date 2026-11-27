@@ -114,6 +114,7 @@ test('the Tasks view groups active work, filters and pages history, answers the 
     ['/', 'index.html', 'text/html'], ['/app.js', 'app.js', 'text/javascript'], ['/style.css', 'style.css', 'text/css'],
     ['/theme.js', 'theme.js', 'text/javascript'],
   ].map(async ([path, file, type]) => [path, { type, body: await readFile(new URL(`../src/web/${file}`, import.meta.url)) }])));
+  let historyPageGate;
   const server = createServer(async (req, res) => {
     const { url, method } = req;
     const json = (body, status = 200) => {
@@ -144,6 +145,7 @@ test('the Tasks view groups active work, filters and pages history, answers the 
       const blueprint = query.get('blueprint') ?? '';
       const text = query.get('text') ?? '';
       const cursor = query.get('cursor');
+      if (cursor && historyPageGate) await historyPageGate;
       const matches = row => (blueprint ? row.blueprint?.id === blueprint : true) &&
         (text ? `${row.title} ${row.progress ?? ''} ${row.outcome ?? ''}`.toLowerCase().includes(text.toLowerCase()) : true);
       const filtered = history.filter(row => (status === 'history' ? true : row.status === status) && matches(row));
@@ -231,13 +233,26 @@ test('the Tasks view groups active work, filters and pages history, answers the 
   await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 25`);
   assert.equal(await run(`document.querySelector('#task-history-more').hidden`), false);
   assert.deepEqual(listRequests.at(-1), { status: 'history' });
-  await run(`document.getElementById('task-history-more').click()`);
+  let releasePage;
+  historyPageGate = new Promise(resolve => { releasePage = resolve; });
+  const beforePaging = listRequests.length;
+  try {
+    await run(`document.getElementById('task-history-more').click()`);
+    await sleep(4200); // Hold the page through the four-second poll deadline.
+    assert.deepEqual(listRequests.slice(beforePaging), [{ status: 'history', cursor: '25' }]);
+  } finally {
+    releasePage();
+    historyPageGate = undefined;
+  }
   await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 30`);
   assert.equal(await run(`document.querySelector('#task-history-more').hidden`), true);
   assert.equal(listRequests.at(-1).cursor, '25', 'the next page is requested by cursor');
   const beforePoll = listRequests.length;
   active.find(row => row.status === 'running').progress = 'New milestone from background refresh';
+  history[1].stopPending = false;
+  history[1].stopConfirmedAt = '2026-01-02T00:01:00.000Z';
   await waitFor(run, `document.querySelector('#task-tree').textContent.includes('New milestone from background refresh')`);
+  assert.ok(await run(`document.querySelector('#task-history').textContent.includes('Worker stopped')`));
   assert.ok(listRequests.length > beforePoll);
   assert.equal(await run(`document.querySelectorAll('#task-history .task-link').length`), 30, 'an active poll keeps loaded History pages');
   assert.equal(await run(`document.querySelector('#task-history-more').hidden`), true);

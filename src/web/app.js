@@ -1419,6 +1419,8 @@ function historyQuery({ append = false } = {}) {
 // poll that keeps the panel live must not replace the pages the owner already loaded: new terminal rows are merged in
 // front of them, and the cursor at the end of the loaded pages stays valid because the tail itself is unchanged.
 async function refreshTasks({ append = false, background = false } = {}) {
+  // An explicit request wins over a running poll, and no new poll can supersede it while it is in flight.
+  clearTimeout(tasksRefreshTimer);
   const request = Symbol();
   historyRequest = request;
   // Set while the request is in flight so the merge knows which History the pages it is about to extend belongs to.
@@ -1430,9 +1432,9 @@ async function refreshTasks({ append = false, background = false } = {}) {
     activeTasks = result.active.map(taskSummary);
     const page = result.history.map(taskSummary);
     if (paging) {
-      // Keep the loaded pages, add only rows that are not among them, and keep their cursor.
-      const loaded = new Set(historyTasks.map(task => task.id));
-      historyTasks = [...page.filter(task => !loaded.has(task.id)), ...historyTasks];
+      // Use the fresh first page (including updates to existing rows), then keep the older pages and their cursor.
+      const fresh = new Set(page.map(task => task.id));
+      historyTasks = [...page, ...historyTasks.filter(task => !fresh.has(task.id))];
     } else {
       historyTasks = append ? [...(historyTasks ?? []), ...page] : page;
       historyCursor = typeof result.historyCursor === 'string' ? result.historyCursor : undefined;
@@ -1459,6 +1461,7 @@ async function refreshTasks({ append = false, background = false } = {}) {
       if (selectedTask) clearTaskDetail(tasksError);
     }
     renderTasks();
+    scheduleTasksRefresh();
   }
 }
 
