@@ -66,7 +66,7 @@ test('the selected profile reaches the model request and explicitly listed defer
       assert.deepEqual(await tasks.dispatch({
         taskId: assignment.id, executionId,
         task: { protocol: 2, finishRequired: true, title: 'probe', input: directive, blueprint: { id: 'general', revision: snapshot.revision, snapshot } },
-      }), { status: 'running' });
+      }), { status: 'running', run: 1 });
       const result = await settled.promise;
       assert.equal(result.outcome, 'done');
       assert.equal(result.summary, expected);
@@ -130,7 +130,7 @@ test('a saved snapshot keeps its pinned provider, model, reasoning, tools, and t
       assert.deepEqual(await tasks.dispatch({
         taskId: assignment.id, executionId,
         task: { protocol: 2, finishRequired: true, title: label, input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
-      }), { status: 'running' });
+      }), { status: 'running', run: 1 });
       assert.equal((await settled.promise).summary, expected, label);
     }
     // An edited alias for the same profile id must not redirect an already-pinned Task.
@@ -156,7 +156,7 @@ test('a saved snapshot keeps its pinned provider, model, reasoning, tools, and t
     assert.deepEqual(await retargeted.dispatch({
       taskId: assignment.id, executionId,
       task: { protocol: 2, finishRequired: true, title: 'edited alias', input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
-    }), { status: 'running' });
+    }), { status: 'running', run: 1 });
     assert.equal((await settled.promise).summary, 'selected:fixture-deep:high');
   } finally {
     await harness.close(context);

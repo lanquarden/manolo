@@ -97,8 +97,16 @@ One durable path, end to end, for flagged web conversations. Everything below is
   receipts; conflicts are refused.
 - **Resume delivery:** the item's `delivered_at` is the durable receipt, written with the delivery acknowledgement; a
   settle after a resume also records it. The worker keeps its own receipt in the execution record.
-- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID. A valid finish that
-  lands while a dispatch or resume acknowledgement is still owed is accepted instead of being rejected.
+- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID and by the worker's
+  admission run. The initial admission of an execution is run 1 and every new child submission of the same execution (a
+  corrective turn, a continuation after a recoverable block) is one higher; the run travels with `finish`, `block`, and
+  `settle`, and the ledger records the lowest admission that may still write as `run_fence`. A block withdraws the
+  admission that reported it (`fence = run + 1`), and the acknowledgement of a dispatch or resume records the admission
+  the worker made current, so a settlement that was already in flight for a replaced admission is refused instead of
+  ending live work. Reporting the same admission again after its recovery reopens exactly that admission. The field is
+  optional on every route, so a worker that predates it keeps the older execution-ID-only contract; an accepted finish
+  always settles from its own admission. A valid finish that lands while a dispatch or resume acknowledgement is still
+  owed is accepted instead of being rejected.
 - **Cancellation:** the ledger transition and the worker stop are separate facts. `stop_pending` is retried with a
   backoff and `stop_confirmed_at` records the confirmation; until then the Task reports the stop as unconfirmed. A
   pending dispatch is cleared, so a dispatch that has not been sent is never sent, and the worker writes a cancelled

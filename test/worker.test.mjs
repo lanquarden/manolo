@@ -1095,7 +1095,9 @@ test('a pinned model profile keeps resolving from the trusted proxy catalog afte
   const before = requests.length;
   const again = await dispatch(restartedUrl, randomBytes(16).toString('hex'));
   assert.equal(again.code, 200, JSON.stringify(again.body));
-  assert.deepEqual(again.body, { status: 'running' });
+  // The dispatch acknowledgement also names the admission that is current, so the relay can fence a settlement from an
+  // admission a recovery has replaced.
+  assert.deepEqual(again.body, { status: 'running', run: 1 });
   await until(() => requests.length > before, 'the pinned Task still reaches the proxy after the bundle is removed');
   assertPinnedRequest(requests.at(-1));
   // Discovery stays restricted to the current manifest: no bundle means no advertised catalog or profile.

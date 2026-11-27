@@ -121,14 +121,30 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     return relay(`/v1/tasks/${taskId}/state?executionId=${encodeURIComponent(executionId)}`, { method: 'GET', timeout });
   }
 
-  // Only the owner of the current submission may report a block or a terminal outcome for it. The durable record is read
-  // again at the moment of the report, so a continuation admitted while a slow report was in flight keeps the execution it
-  // already owns and the stale reporter stops instead of settling work that is live again.
+  // The admission run of one execution. The initial admission is run 1; every new child submission admitted for the same
+  // execution (a corrective turn, or a continuation after a recoverable block) is one higher. The number is durable in the
+  // execution record and travels with every settlement, so the relay can refuse an outcome for a submission that a newer
+  // recovery already replaced, even when that report was already in flight when it happened.
+  const admissionRun = execution => Number.isSafeInteger(execution?.run) && execution.run >= 1 ? execution.run : 1;
+  // A submission is only live while its execution is running. A blocked execution has ended its submission and is waiting
+  // for the relay's recovery obligation; a settled, failed or cancelled one is terminal. None of them has an owner left.
+  const liveState = state => state === undefined || state === 'running' || state === 'parked';
+
+  function isLiveOwner(current, executionId, submissionId) {
+    if (submissionId === undefined) return false;
+    if (!current || current.executionId !== executionId || current.submissionId !== submissionId) return false;
+    if (!liveState(current.state) || current.blockIntent !== undefined) return false;
+    return true;
+  }
+
+  // Only the owner of the current, live submission may report a block or a terminal outcome for it. The durable record is
+  // read again at the moment of the report, so a continuation admitted while a slow report was in flight keeps the execution
+  // it already owns and the stale reporter stops instead of settling work that is live again. A blocked execution is not
+  // owned by anyone: its submission ended and the relay's recovery obligation decides what happens next.
   async function ownsSubmission(taskId, executionId, submissionId) {
     if (submissionId === undefined) return false;
     const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
-    return Boolean(current && current.executionId === executionId && current.submissionId === submissionId &&
-      current.state !== 'cancelled');
+    return isLiveOwner(current, executionId, submissionId);
   }
 
   // Authority comes from the placed input of this exact tool run, as in work sessions: the current turn must be a
@@ -473,7 +489,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       };
       const result = await relay(`/v1/tasks/${run.taskId}/finish`, {
         key: idempotency('finish', run.taskId, run.executionId),
-        body: { executionId: run.executionId, summary, ...(evidence.commit && { evidence }) },
+        body: { executionId: run.executionId, summary, ...(evidence.commit && { evidence }), run: admissionRun(execution) },
       });
       if (result.ok) return remember({ summary, evidence });
       // A rejection or transport ambiguity after the commit is reconciled from state, never guessed from the failure.
@@ -552,14 +568,16 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     let text = summary;
     const deliveredItems = await deliveryEvidence(taskId, executionId).catch(() => []);
     for (let attempt = 0; ; attempt++) {
-      // Re-checked before every attempt, not once before the first: a continuation admitted while an earlier attempt was
-      // in flight owns this execution now, and the relay only knows the execution identity.
-      if (!(await ownsSubmission(taskId, executionId, submissionId))) return { state: undefined };
+      // Re-read before every attempt, not once before the first: a continuation admitted while an earlier attempt was in
+      // flight owns this execution now, and the relay only knows the execution identity. The attempt also carries the
+      // admission it reports for, so a settlement that is already on the wire cannot end a newer admission at the ledger.
+      const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+      if (!isLiveOwner(current, executionId, submissionId)) return { state: undefined };
       let result;
       try {
         result = await relay(`/v1/tasks/${taskId}/settle`, {
           key: idempotency('settle', taskId, executionId, desired),
-          body: { executionId, outcome: desired, summary: text, deliveredItems },
+          body: { executionId, outcome: desired, summary: text, deliveredItems, run: admissionRun(current) },
         });
       } catch {
         result = { ok: false, status: 0 };
@@ -605,29 +623,29 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   // continues the same Task and session rather than granting a fresh corrective.
   async function correctiveTurn(taskId, executionId, submissionId) {
     const before = await harness.snapshot(TaskExecution, taskId, context);
-    if (!before || before.executionId !== executionId || before.submissionId !== submissionId ||
-        before.state === 'cancelled' || before.finishAccepted ||
+    if (!isLiveOwner(before, executionId, submissionId) || before.finishAccepted ||
         (before.correctives ?? 0) >= 1 || !before.conversationId) return undefined;
     // The conversation handle must be opened outside the commit; opening it inside waits on the commit itself.
     const conversation = await harness.conversation(before.conversationId, context);
     if (!conversation) return undefined;
     return harness.commit(async tx => {
       const execution = await tx.doc(TaskExecution, taskId, null);
-      if (execution.executionId !== executionId || execution.submissionId !== submissionId ||
-          execution.state === 'cancelled' || execution.finishAccepted) return undefined;
+      if (!isLiveOwner(execution, executionId, submissionId) || execution.finishAccepted) return undefined;
       if ((execution.correctives ?? 0) >= 1) return undefined;
       const run = await tx.doc(TaskRun, before.conversationId, null);
       if (run.yielded !== undefined || run.state === 'cancelled') return undefined;
+      const next = admissionRun(execution) + 1;
       const admitted = await conversation.admit(tx, {
         type: 'input', content: CORRECTIVE_TEXT, requestId: `task-${taskId}-${executionId}-corrective-1`, whenBusy: 'reject',
       });
       execution.correctives = 1;
       execution.submissionId = admitted;
+      execution.run = next;
       execution.state = 'running';
       Object.assign(run, { taskId, executionId, state: 'running' });
       delete run.yielded;
       delete run.itemId;
-      return admitted;
+      return { submissionId: admitted, run: next };
     }, context);
   }
 
@@ -693,7 +711,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       const reason = boundedPlain(intent.message ?? intent.reason ?? 'The Task workspace is unavailable.', MAX_NOTE);
       const result = await relay(`/v1/tasks/${taskId}/block`, {
         key: idempotency('block', taskId, executionId, intent.reason),
-        body: { executionId, reason },
+        body: { executionId, reason, run: admissionRun(current) },
       }).catch(() => ({ ok: false }));
       if (!result.ok) return 'retry';
       return await promoteBlocked(taskId, executionId, submissionId, intent) ? 'reported' : 'stale';
@@ -770,20 +788,22 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (!workspace.ok) return { ok: false, reason: workspace.reason ?? 'worktree_missing', message: workspace.message };
     const conversation = execution.conversationId ? await harness.conversation(execution.conversationId, context) : undefined;
     if (!conversation) return { ok: false, reason: 'unknown_execution' };
-    const submissionId = await harness.commit(async tx => {
+    const admitted = await harness.commit(async tx => {
       const record = await tx.doc(TaskExecution, taskId, null);
       if (record.executionId !== executionId || record.state !== 'blocked') return undefined;
       const run = await tx.doc(TaskRun, record.conversationId, null);
       if (run.yielded !== undefined) return undefined;
       const next = (record.continuations ?? 0) + 1;
+      const nextRun = admissionRun(record) + 1;
       // The conversation already holds the assignment, the work so far, and the tool receipts, so the continuation is a
       // short instruction rather than a replay of the original request (which could repeat destructive steps).
-      const admitted = await conversation.admit(tx, {
+      const submissionId = await conversation.admit(tx, {
         type: 'input', requestId: `task-${taskId}-${executionId}-continue-${next}`, whenBusy: 'reject',
         content: `${CONTINUE_TEXT}${note ? `\n\n${note}` : ''}`,
       });
       record.continuations = next;
-      record.submissionId = admitted;
+      record.submissionId = submissionId;
+      record.run = nextRun;
       record.state = 'running';
       delete record.blockedReason;
       delete record.blockIntent;
@@ -791,11 +811,11 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       Object.assign(run, { taskId, executionId, state: 'running' });
       delete run.yielded;
       delete run.itemId;
-      return admitted;
+      return { submissionId, run: nextRun };
     }, context);
-    if (!submissionId) return { ok: false, reason: 'not_blocked' };
-    watch(taskId, executionId, submissionId);
-    return { ok: true, submissionId };
+    if (!admitted) return { ok: false, reason: 'not_blocked' };
+    watch(taskId, executionId, admitted.submissionId);
+    return { ok: true, submissionId: admitted.submissionId, run: admitted.run };
   }
 
   async function applyTerminal(taskId, executionId, confirmation, submissionId) {
@@ -818,6 +838,11 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       try {
         const current = submissionId;
         for (;;) {
+          // A watcher is only worth attaching to a live, current submission. A dispatch retry that stalled in an
+          // asynchronous workspace check can hand over a submission that ended (or was blocked or replaced) while it
+          // waited, and a watcher for it must not wait on an expired submission and report an outcome for dead work.
+          const attached = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+          if (!isLiveOwner(attached, executionId, current)) return;
           const submission = await harness.submission(current, context);
           if (!submission) return;
           let settled;
@@ -837,10 +862,10 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           }
           if (!settled) return;
           let execution = await harness.snapshot(TaskExecution, taskId, context);
-          if (!execution || execution.executionId !== executionId || execution.state === 'cancelled') return;
-          // This watcher owns exactly the submission it was admitted for. A continuation or corrective admitted meanwhile
-          // has its own owner, so a late result here must not settle, continue, or downgrade that newer submission.
-          if (execution.submissionId !== current) return;
+          // This watcher owns exactly the submission it was admitted for, and only while that submission is live. A
+          // continuation or corrective admitted meanwhile has its own owner, and a blocked, settled, failed or cancelled
+          // execution has no owner left: a late result here must not settle, continue, or downgrade that newer work.
+          if (!isLiveOwner(execution, executionId, current)) return;
           // A restart can lose the local finish marker after the relay accepted it. Reconcile before deciding that a
           // bare final needs a corrective turn or that a failed provider stop wins.
           if (!execution.finishAccepted) {
@@ -858,7 +883,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             // this watcher must not act on the snapshot it took before the call.
             if (!(await ownsSubmission(taskId, executionId, current))) return;
             execution = await harness.snapshot(TaskExecution, taskId, context);
-            if (!execution) return;
+            if (!isLiveOwner(execution, executionId, current)) return;
           }
           // An accepted finish wins over a failed provider stop: the Task is already complete.
           if (execution.finishAccepted) {
@@ -870,6 +895,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           // An active workspace that was lost or switched mid-run is a recoverable block: no corrective turn and no
           // terminal failure are spent on it, and a restored workspace continues this same Task.
           const workspace = await workspaceState(execution);
+          // The workspace check is asynchronous. A block promoted, a continuation admitted, or a cancellation that landed
+          // while it ran replaces this submission, so nothing is reported for it afterwards.
+          if (!(await ownsSubmission(taskId, executionId, current))) return;
           if (!workspace.ok) {
             // A block whose report never landed keeps its durable intent; the recovery driver, a dispatch retry or a
             // restart promotes and re-reports it instead of acknowledging a submission that has already ended.
@@ -893,13 +921,13 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             // The corrective submission is a new owner, not an extension of this one. Hand the watch over under its own
             // submission key and stop here; if a dispatch retry already took that key it owns the submission, and a
             // second watcher would race it into a block and a settle for the same work.
-            watch(taskId, executionId, next);
+            watch(taskId, executionId, next.submissionId);
             return;
           }
           const latest = await harness.snapshot(TaskExecution, taskId, context);
           // Nothing is settled unless this watcher still owns the current submission. A newer continuation may already be
           // live, and a failure report for the old submission would end it at the relay.
-          if (!latest || latest.executionId !== executionId || latest.submissionId !== current) return;
+          if (!isLiveOwner(latest, executionId, current)) return;
           if (latest.finishAccepted) {
             const summary = latest.finishSummary ?? await readResult(settled.conversationId, settled.answer);
             const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)', { submissionId: current });
@@ -932,11 +960,14 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       // A dispatch retry reuses the execution ID: the same child submission, never a second one.
       if (existing.state === 'blocked') {
         const continued = await continueExecution(taskId, executionId);
-        if (continued.ok) return { status: 'running' };
+        if (continued.ok) return { status: 'running', run: continued.run };
         // A competing dispatch already continued it; that dispatch owns the watcher, so this retry only acknowledges.
-        if (continued.reason === 'not_blocked') return { status: 'running' };
+        if (continued.reason === 'not_blocked') {
+          const latest = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+          return { status: 'running', ...(latest && { run: admissionRun(latest) }) };
+        }
         return {
-          status: 'blocked', reason: continued.reason ?? 'worktree_missing',
+          status: 'blocked', reason: continued.reason ?? 'worktree_missing', run: admissionRun(existing),
           message: continued.reason === 'continuation_limit'
             ? 'The Task workspace was lost repeatedly; the Task was not resumed. Restore it and start a new Task, or finish it explicitly.'
             : continued.message ?? 'The blocked Task execution could not be resumed; restore its workspace.',
@@ -949,16 +980,51 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         const intent = existing.blockIntent;
         await promoteBlocked(taskId, executionId, existing.submissionId, intent);
         return {
-          status: 'blocked', reason: intent.reason ?? 'worktree_missing',
+          status: 'blocked', reason: intent.reason ?? 'worktree_missing', run: admissionRun(existing),
           message: intent.message ?? 'The Task workspace is unavailable.',
         };
       }
       // The workspace must still prove its identity; a replaced directory blocks recoverably instead of being recreated
       // or failed, so a retry never acknowledges a runnable execution whose child cannot work.
       const workspace = await workspaceState(existing);
-      if (!workspace.ok) return { status: 'blocked', reason: workspace.reason, message: workspace.message };
-      if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
-      return { status: existing.state ?? 'running' };
+      // The workspace check is asynchronous, and this retry may have been waiting in it while the execution changed. The
+      // record is read again underneath it: a block promoted, a continuation admitted, or a cancellation that landed
+      // meanwhile means this retry must not attach a watcher to a submission that is no longer live. Answering "running"
+      // here would also clear the relay's retry obligation for work that already ended.
+      const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+      // An unreadable record reports no admission: the relay keeps whatever fence it has instead of being told about one
+      // this retry could not verify.
+      if (!current) return { status: 'running' };
+      if (current.executionId !== executionId) return { status: 'running', run: admissionRun(current) };
+      if (current.state === 'cancelled') {
+        throw Object.assign(new Error('Task is cancelled'), { status: 409, reason: 'task_cancelled' });
+      }
+      if (current.blockIntent !== undefined && current.submissionId !== undefined) {
+        // The durable intent left while this retry was in flight: promote it and answer truthfully, so the relay records
+        // the block and keeps the retry obligation instead of clearing it.
+        const intent = current.blockIntent;
+        await promoteBlocked(taskId, executionId, current.submissionId, intent);
+        return {
+          status: 'blocked', reason: intent.reason ?? 'worktree_missing', run: admissionRun(current),
+          message: intent.message ?? 'The Task workspace is unavailable.',
+        };
+      }
+      if (current.state === 'blocked') {
+        return {
+          status: 'blocked', reason: 'worktree_missing', run: admissionRun(current),
+          message: current.blockedReason ?? 'The Task execution is blocked; restore its workspace.',
+        };
+      }
+      if (!workspace.ok) {
+        return { status: 'blocked', reason: workspace.reason, run: admissionRun(current), message: workspace.message };
+      }
+      if (isLiveOwner(current, executionId, current.submissionId)) {
+        watch(taskId, executionId, current.submissionId);
+        return { status: current.state ?? 'running', run: admissionRun(current) };
+      }
+      // The execution is terminal locally, so there is no submission left to watch; the relay already knows the outcome.
+      if (current.state === 'settled' || current.state === 'failed') return { status: current.state, run: admissionRun(current) };
+      return { status: 'running', run: admissionRun(current) };
     }
     // These two checks are repeated inside the admission commit below. Here they only avoid creating a conversation for
     // a dispatch that is already known to be refused.
@@ -1039,7 +1105,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       if (execution.state === 'cancelled') return { refused: 'task_cancelled' };
       if (execution.executionId === executionId && execution.submissionId) {
         // A competing admission of this same dispatch already committed: it is the same child submission, not a second.
-        return { submissionId: execution.submissionId };
+        return { submissionId: execution.submissionId, run: admissionRun(execution) };
       }
       if (execution.executionId !== undefined && execution.executionId !== executionId) {
         // A different identity never overwrites the current execution, which may already be running or parked.
@@ -1052,7 +1118,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       delete execution.itemId;
       delete execution.result;
       Object.assign(execution, {
-        taskId, executionId, conversationId, submissionId: admitted, state: 'running',
+        taskId, executionId, conversationId, submissionId: admitted, state: 'running', run: 1,
         title: boundedPlain(redact(task.title), MAX_TITLE), input: text,
         finishRequired, protocol,
         ...(task.review && { review: task.review }),
@@ -1073,7 +1139,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       delete run.itemId;
       Object.assign(run, { taskId, executionId, state: 'running' });
       index.ids = [taskId, ...(index.ids ?? []).filter(id => id !== taskId)].slice(0, MAX_IDS);
-      return { submissionId: admitted };
+      return { submissionId: admitted, run: 1 };
     }, context);
     if (admission.refused) {
       throw Object.assign(
@@ -1082,7 +1148,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       );
     }
     watch(taskId, executionId, admission.submissionId);
-    return { status: 'running' };
+    return { status: 'running', run: admission.run };
   }
 
   // Record the delivery in the execution's own durable receipt before reporting it, so a replay after the park marker is

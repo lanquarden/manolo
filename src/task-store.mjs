@@ -31,6 +31,10 @@ const plain = (text, max) => {
   return cleaned.length > max ? `${cleaned.slice(0, max - 1).toWellFormed()}…` : cleaned;
 };
 const delay = attempts => Math.min(2 ** Math.min(attempts, 8) * 1000, 120_000);
+// The admission run a worker reports for one execution: the initial admission is 1 and every new child submission of the
+// same execution is one higher. It is optional on every route, so a worker that predates it keeps writing unversioned
+// reports; when it is present the ledger fences on it.
+const admissionRun = run => Number.isSafeInteger(run) && run >= 1 ? run : undefined;
 
 // A Task is "scheduled" while it is queued and its not-before time is still ahead. That is a view of one row, not a
 // second state: the scheduler only ever claims `queued` rows whose time has come.
@@ -116,6 +120,7 @@ export function openTaskStore(db) {
       next_at INTEGER NOT NULL DEFAULT 0,
       dispatch_pending INTEGER NOT NULL DEFAULT 0,
       dispatch_epoch INTEGER NOT NULL DEFAULT 0,
+      run_fence INTEGER NOT NULL DEFAULT 0,
       stop_pending INTEGER NOT NULL DEFAULT 0,
       stop_attempts INTEGER NOT NULL DEFAULT 0,
       stop_next_at INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +182,7 @@ export function openTaskStore(db) {
       ['profile_snapshot', 'TEXT'],
       ['dispatch_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['dispatch_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+      ['run_fence', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_attempts', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_next_at', 'INTEGER NOT NULL DEFAULT 0'],
@@ -371,14 +377,17 @@ export function openTaskStore(db) {
         // A retry of a dispatch that may already have reached the worker keeps its execution identity, so the worker
         // admits the same child submission instead of starting a second one. Only a Task without one mints a new ID.
         const executionId = next.execution_id ?? newId();
+        // A new execution identity starts a new admission sequence, so its fence starts over. A retry of the same
+        // execution keeps the fence it already earned: an older admission of that execution stays fenced out.
+        const runFence = next.execution_id == null ? 0 : next.run_fence ?? 0;
         // `dispatch_pending` is the durable marker that an outbound RPC is owed for this execution identity. It survives
         // a relay restart, so a claim committed just before a crash is re-driven with the same IDs instead of being lost.
         // The claim is not an acknowledgement: a visible block stays until the matching dispatch/resume ACK clears it.
         // Each claim opens a new dispatch obligation. Its epoch travels with the RPC the relay sends, so a late
         // acknowledgement of an older obligation can never clear a newer one.
         const changed = db.prepare(`UPDATE tasks SET status='running', execution_id=?, claim_at=?, heartbeat_at=?, next_at=0,
-          dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
-          .run(executionId, now, now, iso(now), next.id, now);
+          dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, run_fence=?, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
+          .run(executionId, now, now, runFence, iso(now), next.id, now);
         if (changed.changes !== 1) return undefined;
         return row.get(next.id);
       });
@@ -425,29 +434,41 @@ export function openTaskStore(db) {
 
     // The worker accepted the RPC for exactly this dispatch obligation. A late acknowledgement from an earlier attempt
     // (an answer still in flight when the worker reported a block, a newer response, or an accepted finish) must not
-    // clear the newer recovery, so the epoch identifies the obligation, not only the execution identity.
-    ackDispatch(taskId, executionId, epoch, now = Date.now()) {
+    // clear the newer recovery, so the epoch identifies the obligation, not only the execution identity. The worker also
+    // reports the admission that is current after handling the RPC: that is the durable record of a continuation admitted
+    // for the same execution, and it becomes the fence, so a settlement from an older admission is refused instead of
+    // ending live work. Reporting the same admission again after a recovery reopens exactly that admission and no other.
+    ackDispatch(taskId, executionId, epoch, now = Date.now(), run) {
       if (!Number.isSafeInteger(epoch)) return false;
-      const changed = db.prepare(`UPDATE tasks SET dispatch_pending=0, dispatch_attempts=0, next_at=0, blocked_reason=NULL, updated_at=?
-        WHERE id=? AND execution_id=? AND status='running' AND dispatch_pending=1 AND dispatch_epoch=?`)
-        .run(iso(now), taskId, executionId, epoch);
-      return changed.changes === 1;
+      return transaction(() => {
+        const changed = db.prepare(`UPDATE tasks SET dispatch_pending=0, dispatch_attempts=0, next_at=0, blocked_reason=NULL, updated_at=?
+          WHERE id=? AND execution_id=? AND status='running' AND dispatch_pending=1 AND dispatch_epoch=?`)
+          .run(iso(now), taskId, executionId, epoch);
+        if (changed.changes !== 1) return false;
+        if (admissionRun(run) !== undefined) {
+          db.prepare('UPDATE tasks SET run_fence=? WHERE id=?').run(run, taskId);
+        }
+        return true;
+      });
     },
 
     // A recoverable refusal (an unavailable profile, a lost worktree, a worker that predates this Task protocol) keeps
     // the Task running but blocks dispatch with a visible reason. It is retried with a bounded backoff; restoring the
     // worker/profile/workspace makes the same execution eligible again. It never substitutes another selection.
-    block(taskId, executionId, reason, now = Date.now(), retryAfterMs = 60_000, { epoch } = {}) {
+    block(taskId, executionId, reason, now = Date.now(), retryAfterMs = 60_000, { epoch, run } = {}) {
       return transaction(() => {
         const task = row.get(taskId);
         if (!task || task.status !== 'running' || task.execution_id !== executionId || task.finish_accepted_at) return false;
         if (epoch !== undefined && task.dispatch_epoch !== epoch) return false;
         const first = task.blocked_reason !== reason;
         // A block schedules a new recovery obligation, so it opens its own epoch: the dispatch or resume RPC that is still
-        // in flight belongs to the previous one and its acknowledgement must not clear this block.
+        // in flight belongs to the previous one and its acknowledgement must not clear this block. It also withdraws the
+        // admission that reported it: the submission behind that run has ended, so only a newer admission (a continuation)
+        // may settle this Task from now on. A settlement from the blocked run that is already in flight is refused below.
+        const runFence = admissionRun(run) === undefined ? 0 : run + 1;
         db.prepare(`UPDATE tasks SET blocked_reason=?, dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1,
-          next_at=?, updated_at=? WHERE id=?`)
-          .run(plain(reason, MAX_NOTE), now + Math.min(Math.max(retryAfterMs, 1_000), 300_000), iso(now), taskId);
+          run_fence=MAX(run_fence,?), next_at=?, updated_at=? WHERE id=?`)
+          .run(plain(reason, MAX_NOTE), runFence, now + Math.min(Math.max(retryAfterMs, 1_000), 300_000), iso(now), taskId);
         if (first) addEvent.run(taskId, task.scope, 'blocked', `Task “${task.title}” is blocked: ${plain(reason, MAX_NOTE)}`, iso(now));
         return true;
       });
@@ -523,7 +544,7 @@ export function openTaskStore(db) {
     // The worker's explicit finish, recorded before it reports the outcome. Replaying the same finish returns the same
     // receipt; a finish from an older or stale execution is refused. Acceptance does not settle the Task: the worker's
     // final turn still has to end, and only `settle` records the terminal outcome.
-    acceptFinish({ taskId, executionId, summary, evidence, key, now = Date.now() }) {
+    acceptFinish({ taskId, executionId, summary, evidence, key, now = Date.now(), run }) {
       return transaction(() => {
         const previous = receipt(key, taskId, 'finish');
         if (previous) return previous;
@@ -534,6 +555,11 @@ export function openTaskStore(db) {
         if (task.finish_accepted_at) {
           return { accepted: true, replay: true, summary: task.finish_summary ?? null,
             ...(task.handoff_evidence && { evidence: JSON.parse(task.handoff_evidence) }) };
+        }
+        // A finish belongs to one admission. A recovery block withdraws the admission that reported it, so a finish from
+        // that run that is already in flight is refused instead of marking a newer continuation complete.
+        if (admissionRun(run) !== undefined && task.run_fence > run) {
+          throw bad(409, 'This finish belongs to a submission that is no longer current');
         }
         // A pull request is mandatory evidence for this Task, whatever the rollout mode says about finish enforcement.
         if (task.requires_pr === 1) {
@@ -550,14 +576,15 @@ export function openTaskStore(db) {
           }
         }
         db.prepare(`UPDATE tasks SET finish_accepted_at=?, finish_summary=?, handoff_evidence=?, blocked_reason=NULL,
-          dispatch_pending=0, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, next_at=0,
+          dispatch_pending=0, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, run_fence=MAX(run_fence,?), next_at=0,
           execution_kind='start', resume_item_id=NULL, updated_at=? WHERE id=?`)
-          .run(iso(now), plain(summary, MAX_SUMMARY), evidence === undefined ? null : JSON.stringify(evidence), iso(now), taskId);
+          .run(iso(now), plain(summary, MAX_SUMMARY), evidence === undefined ? null : JSON.stringify(evidence),
+            admissionRun(run) ?? 0, iso(now), taskId);
         return remember(key, taskId, 'finish', { accepted: true, ...(evidence && { evidence }) }, now);
       });
     },
 
-    settle({ taskId, executionId, outcome, summary, deliveredItems = [], key, now = Date.now() }) {
+    settle({ taskId, executionId, outcome, summary, deliveredItems = [], key, now = Date.now(), run }) {
       return transaction(() => {
         const task = row.get(taskId);
         // Delivery is recorded only from the worker's own receipt for that item. A settle can land while the answer is
@@ -577,6 +604,14 @@ export function openTaskStore(db) {
         if (previous) return previous;
         const fencedTask = fenced(taskId, executionId, { allowQueued: true });
         if (!['done', 'failed'].includes(outcome)) throw bad(400, 'Invalid outcome');
+        // The settlement names the admission it belongs to. A recovery block, or a continuation admitted after one, moves
+        // the fence forward, so a settlement that was already in flight when that happened is refused here: the relay is
+        // authoritative about which submission is live and does not rely on the worker noticing its own staleness. An
+        // accepted finish is exempt, because it is a one-way boundary that no later admission can replace and it still has
+        // to be settled from its own admission.
+        if (admissionRun(run) !== undefined && fencedTask.run_fence > run && !fencedTask.finish_accepted_at) {
+          throw bad(409, 'This settlement belongs to a submission that is no longer current');
+        }
         // A bare final turn is success only for a genuinely legacy assignment: a row that records no pinned snapshot, no
         // profile, no review binding, and no pull-request requirement. Anything structured succeeds only through an
         // accepted finish, whose evidence this ledger validated. This is independent of `finish_required`, so a migrated or
@@ -592,9 +627,10 @@ export function openTaskStore(db) {
           throw bad(409, 'Finish was accepted; this Task cannot be recorded as failed');
         }
         db.prepare(`UPDATE tasks SET status=?, outcome=?, failure=?, execution_kind='start', resume_item_id=NULL, context=NULL,
-          claim_at=NULL, dispatch_pending=0, dispatch_epoch=dispatch_epoch+1, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=?`)
+          claim_at=NULL, dispatch_pending=0, dispatch_epoch=dispatch_epoch+1, run_fence=MAX(run_fence,?), next_at=0,
+          blocked_reason=NULL, updated_at=? WHERE id=?`)
           .run(outcome, outcome === 'done' ? plain(summary, MAX_SUMMARY) : null,
-            outcome === 'failed' ? plain(summary, MAX_SUMMARY) : null, iso(now), taskId);
+            outcome === 'failed' ? plain(summary, MAX_SUMMARY) : null, admissionRun(run) ?? 0, iso(now), taskId);
         addEvent.run(taskId, fencedTask.scope, 'outcome',
           outcome === 'done' ? `Task “${fencedTask.title}” finished.` : `Task “${fencedTask.title}” failed.`, iso(now));
         return remember(key, taskId, 'settle', { status: outcome }, now);

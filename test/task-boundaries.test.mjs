@@ -248,12 +248,12 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
   }]]);
   const submissionFor = id => submissions.get(id) ?? newSubmission(id);
   data.set(`manolo.task-execution:${task.id}`, {
-    taskId: task.id, executionId, conversationId: 'conv', submissionId: 'submission-0', state: 'running', finishRequired,
+    taskId: task.id, executionId, conversationId: 'conv', submissionId: 'submission-0', state: 'running', run: 1, finishRequired,
     workspace: { kind: 'worktree', path: '/tmp/task-workspace' },
   });
   data.set('manolo.task-run:conv', { taskId: task.id, executionId, state: 'running' });
   data.set('manolo.task-index:all', { ids: [task.id] });
-  const calls = { block: 0, settle: 0, state: 0, heartbeat: 0 };
+  const calls = { block: 0, settle: 0, state: 0, heartbeat: 0, workspace: 0, workspaceHeld: 0, cleanup: 0 };
   const controls = { lost: workspaceLost, holdBlock: undefined, refuseBlock: false, holdStateAt: undefined, holdState: undefined };
   const relay = async (url, options = {}) => {
     const path = new URL(url).pathname;
@@ -261,7 +261,7 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     if (path.endsWith('/block')) {
       calls.block += 1;
       if (controls.refuseBlock) return new Response(null, { status: 503 });
-      store.block(task.id, executionId, body.reason, Date.now(), 60_000);
+      store.block(task.id, executionId, body.reason, Date.now(), 60_000, { run: body.run });
       if (controls.holdBlock) await controls.holdBlock.promise;
       return Response.json({ ok: true });
     }
@@ -274,11 +274,18 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     if (path.endsWith('/heartbeat')) { calls.heartbeat += 1; return Response.json({ ok: true }); }
     if (path.endsWith('/settle')) {
       calls.settle += 1;
-      const receipt = store.settle({
-        taskId: task.id, executionId, outcome: body.outcome, summary: body.summary,
-        deliveredItems: body.deliveredItems ?? [], key: options.headers['idempotency-key'],
-      });
-      return Response.json({ status: receipt.status });
+      // A settlement can be held after it was issued and before the ledger sees it: that is the window in which a recovery
+      // can make a newer admission current, and the ledger must refuse the settlement that was already on the wire.
+      if (controls.holdSettleAt === calls.settle && controls.settleGate) await controls.settleGate.promise;
+      try {
+        const receipt = store.settle({
+          taskId: task.id, executionId, outcome: body.outcome, summary: body.summary,
+          deliveredItems: body.deliveredItems ?? [], key: options.headers['idempotency-key'], run: body.run,
+        });
+        return Response.json({ status: receipt.status });
+      } catch (error) {
+        return Response.json({ error: 'Request rejected' }, { status: error.statusCode ?? 500 });
+      }
     }
     throw new Error(`unexpected relay path ${path}`);
   };
@@ -287,10 +294,17 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     settleRetryMs: [1], heartbeatMs: 5, blockRecoveryBackoffMs,
     taskGit: {
       assertWorkspace: async () => {
+        // The workspace check is the asynchronous step a dispatch retry can be stalled in while the execution changes
+        // underneath it: it is counted so a test can hold exactly one call and release it afterwards.
+        calls.workspace += 1;
+        if (controls.holdWorkspaceAt === calls.workspace && controls.workspaceGate) {
+          calls.workspaceHeld += 1;
+          await controls.workspaceGate.promise;
+        }
         if (controls.lost) throw Object.assign(new Error('The Task worktree is missing.'), { code: 'worktree_missing' });
         return {};
       },
-      cleanup: async () => ({ removed: false }),
+      cleanup: async () => { calls.cleanup += 1; return { removed: false }; },
     },
   });
   tasks.attach({
@@ -569,4 +583,150 @@ test('a stale watcher whose relay read resolves after a newer continuation never
   assert.equal(race.calls.settle, 0, 'the stale watcher never settles the newer continuation');
   assert.equal(race.state().status, 'running');
   assert.equal(race.document().state, 'running');
+});
+
+// 3. A dispatch retry that stalls in its asynchronous workspace check used to reattach a watcher to a submission the
+//    original watcher had already blocked and ended. The record is read again underneath the check, so the retry never
+//    watches dead work and answers the relay truthfully about the block.
+
+test('a dispatch retry stalled in the workspace check never reattaches to a submission a block already ended', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store });
+  globalThis.fetch = race.relay;
+  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+
+  // The lost start acknowledgement makes the relay retry the dispatch while the first submission is still current.
+  await race.tasks.start();
+  const gate = deferred();
+  race.controls.workspaceGate = gate;
+  race.controls.holdWorkspaceAt = race.calls.workspace + 1;
+  const retry = race.tasks.dispatch(request);
+  await untilTrue(() => race.calls.workspace === race.controls.holdWorkspaceAt, 'the retry waits in the workspace check');
+
+  // While it waits, the submission ends and the workspace disappears, so the original watcher blocks and exits.
+  race.controls.lost = true;
+  race.submissionFor('submission-0').settle({ status: 'unanswered', conversationId: 'conv' });
+  await untilTrue(() => race.document().state === 'blocked', 'the original watcher reports its block');
+  assert.equal(store.meta(race.taskId).blocked, 'The Task worktree is missing.');
+  assert.equal(race.calls.workspaceHeld, 1, 'the retry is still inside its stalled check');
+
+  // The workspace comes back before the stalled check returns. Reading that as a runnable execution would attach a
+  // watcher to a submission that has already ended and report an outcome for the work it no longer owns.
+  race.controls.lost = false;
+  gate.resolve();
+  const answer = await retry;
+  assert.equal(answer.status, 'blocked', JSON.stringify(answer));
+  assert.equal(race.document().submissionId, 'submission-0');
+  assert.equal(race.document().run, 1, 'no admission is invented by a retry');
+  // A watcher for the ended submission would report its outcome here; the retry attached none.
+  await sleep(40);
+  assert.equal(race.calls.settle, 0, 'no outcome is reported for the submission the block already ended');
+  assert.equal(race.state().status, 'running', 'the ended submission is not allowed to end the Task');
+  assert.equal(race.calls.cleanup, 0, 'no workspace is cleaned under the recovery obligation');
+  assert.notEqual(store.meta(race.taskId).blocked, null, 'the relay keeps its retry obligation');
+
+  // The relay's recorded retry admits the continuation, which is the only settlement.
+  store.db.prepare('UPDATE tasks SET next_at=0').run();
+  const epoch = store.db.prepare('SELECT dispatch_epoch FROM tasks WHERE id=?').get(race.taskId).dispatch_epoch;
+  const continued = await race.tasks.dispatch(request);
+  assert.equal(continued.status, 'running', JSON.stringify(continued));
+  assert.equal(continued.run, 2);
+  assert.equal(store.ackDispatch(race.taskId, race.executionId, epoch, undefined, continued.run), true);
+  assert.equal(race.document().submissionId, 'submission-1');
+  race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished after the stalled retry', conversationId: 'conv' });
+  await untilTrue(() => race.state().status === 'done', 'the recovered execution settles');
+  assert.equal(race.calls.settle, 1);
+  assert.equal(race.state().outcome, 'from the child');
+});
+
+// 4. The reviewer's ordering: a settlement is already on the wire when a newer recovery admission becomes current. No
+//    local recheck can help (the report left the worker before the continuation existed), so the ledger itself refuses
+//    it: it carries the admission it reports for, and the block and the continuation moved that fence forward.
+
+test('a settlement already on the wire when a newer recovery admission becomes current is refused by the ledger', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store });
+  globalThis.fetch = race.relay;
+  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const epoch = () => store.db.prepare('SELECT dispatch_epoch FROM tasks WHERE id=?').get(race.taskId).dispatch_epoch;
+
+  // The first submission ends while the workspace is lost, so its watcher blocks and exits: admission 1 is withdrawn.
+  await race.tasks.start();
+  race.controls.lost = true;
+  race.submissionFor('submission-0').settle({ status: 'unanswered', conversationId: 'conv' });
+  await untilTrue(() => race.document().state === 'blocked', 'the watcher reports its block');
+  assert.equal(store.meta(race.taskId).blocked, 'The Task worktree is missing.');
+  assert.equal(race.document().run, 1);
+
+  // A settlement for admission 1 is already on the wire before any of that became durable. It cannot be un-sent, and no
+  // worker-side check can retract it, so the ledger is the layer that has to refuse it.
+  const gate = deferred();
+  race.controls.settleGate = gate;
+  race.controls.holdSettleAt = race.calls.settle + 1;
+  const inFlight = race.relay(`http://in-process.invalid/v1/tasks/${race.taskId}/settle`, {
+    method: 'POST',
+    headers: { 'idempotency-key': 'settle-stale-admission' },
+    body: JSON.stringify({ executionId: race.executionId, outcome: 'failed', summary: 'The Task execution ended without an answer.', deliveredItems: [], run: 1 }),
+  });
+  await untilTrue(() => race.calls.settle === 1, 'the settlement is in flight');
+
+  // The restored workspace makes the relay's recorded retry admit a continuation: admission 2 is now the current one.
+  race.controls.lost = false;
+  store.db.prepare('UPDATE tasks SET next_at=0').run();
+  const continued = await race.tasks.dispatch(request);
+  assert.equal(continued.status, 'running', JSON.stringify(continued));
+  assert.equal(continued.run, 2);
+  assert.equal(store.ackDispatch(race.taskId, race.executionId, epoch(), undefined, continued.run), true);
+  assert.equal(race.document().submissionId, 'submission-1');
+  assert.equal(race.document().run, 2);
+
+  // Release the settlement for admission 1. The ledger refuses it, so the live continuation is never failed and the
+  // workspace is not cleaned under it.
+  gate.resolve();
+  const refused = await inFlight;
+  assert.equal(refused.status, 409, 'the ledger refuses an outcome for a withdrawn admission');
+  await sleep(20);
+  assert.equal(race.state().status, 'running', 'the stale settlement never fails the live Task');
+  assert.equal(race.state().failure, undefined);
+  assert.equal(race.document().state, 'running');
+  assert.equal(race.calls.cleanup, 0, 'a refused settlement never cleans the workspace');
+
+  // The continuation is the authority, and its own admission settles the Task.
+  race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished after the refused settlement', conversationId: 'conv' });
+  await untilTrue(() => race.state().status === 'done', 'the continuation settles the Task');
+  assert.equal(race.calls.settle, 2);
+  assert.equal(race.state().outcome, 'from the child');
+  assert.equal(race.document().state, 'settled');
+});
+
+// 5. The fence is a one-way contract: an accepted finish still settles from its own admission, a withdrawn admission is
+//    refused, and a worker that reports no admission at all keeps the unversioned behaviour instead of being downgraded.
+
+test('the admission fence still settles an acknowledged finish and stays optional for an unversioned worker', () => {
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const finished = taskFixture(store);
+  store.acceptFinish({ taskId: finished.taskId, executionId: finished.executionId, summary: 'accepted', key: 'finish-admission', run: 1 });
+  assert.equal(store.meta(finished.taskId).finishAccepted, true);
+  // The acknowledged finish is the durable boundary, so its own settlement is accepted.
+  assert.deepEqual(store.settle({ taskId: finished.taskId, executionId: finished.executionId, outcome: 'done', summary: 'accepted', key: 'settle-admission', run: 1 }), { status: 'done' });
+  assert.equal(store.status(finished.taskId), 'done');
+
+  // A block withdraws the admission that reported it: its settlement is refused, and only a newer admission may end the
+  // Task. A worker that predates the field keeps the old contract, so a mixed upgrade never strands a Task.
+  const blocked = taskFixture(store);
+  assert.equal(store.block(blocked.taskId, blocked.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1 }), true);
+  assert.throws(() => store.settle({ taskId: blocked.taskId, executionId: blocked.executionId, outcome: 'failed', summary: 'stale', key: 'settle-fenced', run: 1 }), { statusCode: 409 });
+  assert.equal(store.status(blocked.taskId), 'running');
+  assert.throws(() => store.acceptFinish({ taskId: blocked.taskId, executionId: blocked.executionId, summary: 'stale finish', key: 'finish-fenced', run: 1 }), { statusCode: 409 });
+  assert.equal(store.meta(blocked.taskId).finishAccepted, false);
+  assert.deepEqual(store.settle({ taskId: blocked.taskId, executionId: blocked.executionId, outcome: 'failed', summary: 'unversioned', key: 'settle-unversioned' }), { status: 'failed' });
+
+  const recovered = taskFixture(store);
+  assert.equal(store.block(recovered.taskId, recovered.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1 }), true);
+  assert.throws(() => store.settle({ taskId: recovered.taskId, executionId: recovered.executionId, outcome: 'failed', summary: 'stale', key: 'settle-old-run', run: 1 }), { statusCode: 409 });
+  assert.deepEqual(store.settle({ taskId: recovered.taskId, executionId: recovered.executionId, outcome: 'failed', summary: 'newer admission', key: 'settle-new-run', run: 2 }), { status: 'failed' });
 });

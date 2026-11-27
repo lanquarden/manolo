@@ -1004,9 +1004,12 @@ async function internal(req, res, path) {
     if (req.method === 'POST' && action === 'finish') {
       const operationKey = idempotencyKey();
       const body = await readJson(req);
-      if (!ownFields(body, 'executionId', 'summary') && !ownFields(body, 'executionId', 'summary', 'evidence')) throw fail(400);
+      const finishFields = ['executionId', 'summary',
+        ...(body?.evidence === undefined ? [] : ['evidence']), ...(body?.run === undefined ? [] : ['run'])];
+      if (!ownFields(body, ...finishFields)) throw fail(400);
       if (typeof body.executionId !== 'string' || !TASK_ID.test(body.executionId) || typeof body.summary !== 'string' ||
           body.summary.length > 2500 ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
           (body.evidence !== undefined && (typeof body.evidence !== 'object' || body.evidence === null ||
             Object.keys(body.evidence).some(field => !['commit', 'base', 'branch', 'handoff', 'review', 'pullRequest'].includes(field)) ||
             ['commit', 'branch', 'handoff'].some(field => body.evidence[field] !== undefined &&
@@ -1018,7 +1021,7 @@ async function internal(req, res, path) {
               typeof body.evidence.pullRequest.url !== 'string' || !/^https:\/\/github\.com\//.test(body.evidence.pullRequest.url) ||
               typeof body.evidence.pullRequest.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.evidence.pullRequest.commit)))))) throw fail(400);
       return respond(res, 200, store.tasks.acceptFinish({
-        taskId, executionId: body.executionId, summary: body.summary, evidence: body.evidence, key: operationKey,
+        taskId, executionId: body.executionId, summary: body.summary, evidence: body.evidence, key: operationKey, run: body.run,
       }));
     }
     if (req.method === 'POST' && action === 'settle') {
@@ -1027,24 +1030,30 @@ async function internal(req, res, path) {
       // The worker's own delivery receipts ride along with the outcome. They are the only evidence that an Inbox answer
       // reached the child; the ledger never infers a delivery from the settle itself.
       const delivered = body?.deliveredItems ?? [];
-      const fields = body?.deliveredItems === undefined
-        ? ['executionId', 'outcome', 'summary'] : ['executionId', 'outcome', 'summary', 'deliveredItems'];
+      // The settlement names the admission it belongs to. The ledger refuses one for a submission a recovery has already
+      // replaced, so an outcome that was in flight when the relay opened a block or a continuation landed cannot end the
+      // live work that replaced it. The field is optional, so a worker that predates it keeps the unversioned contract.
+      const fields = ['executionId', 'outcome', 'summary',
+        ...(body?.deliveredItems === undefined ? [] : ['deliveredItems']), ...(body?.run === undefined ? [] : ['run'])];
       if (!ownFields(body, ...fields) || typeof body.executionId !== 'string' ||
           !TASK_ID.test(body.executionId) || !['done', 'failed'].includes(body.outcome) ||
           typeof body.summary !== 'string' || body.summary.length > MAX_TASK_INPUT ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
           !Array.isArray(delivered) || delivered.length > 10 ||
           !delivered.every(id => typeof id === 'string' && TASK_ID.test(id))) throw fail(400);
       return respond(res, 200, store.tasks.settle({
         taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary,
-        deliveredItems: delivered, key: operationKey,
+        deliveredItems: delivered, key: operationKey, run: body.run,
       }));
     }
     // The child reports a recoverable workspace loss mid-run instead of spending a corrective turn or failing the Task.
     if (req.method === 'POST' && action === 'block') {
       const body = await readJson(req);
-      if (!ownFields(body, 'executionId', 'reason') || typeof body.executionId !== 'string' ||
-          !TASK_ID.test(body.executionId) || !isTaskNote(body.reason)) throw fail(400);
-      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason) });
+      const blockFields = ['executionId', 'reason', ...(body?.run === undefined ? [] : ['run'])];
+      if (!ownFields(body, ...blockFields) || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !isTaskNote(body.reason) ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1))) throw fail(400);
+      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason, Date.now(), 60_000, { run: body.run }) });
     }
     if (req.method === 'POST' && action === 'heartbeat') {
       const body = await readJson(req);
@@ -1349,13 +1358,17 @@ async function runTask(task) {
     return;
   }
   if (result.ok && result.body?.status === 'blocked') {
-    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, { epoch });
+    // A blocked answer names the admission that reported it, so the block fences out a settlement from that admission
+    // that is still in flight. A worker that does not report one keeps the unversioned behaviour.
+    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, { epoch, run: result.body.run });
     return;
   }
   if (result.ok && START_ACK.has(result.body?.status)) {
     // Only a parsed acknowledgement naming a state the worker reports: the child is admitted, and a later restart must
-    // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity.
-    store.tasks.ackDispatch(task.id, executionId, epoch);
+    // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity. The worker
+    // also returns the admission run it made current, so a continuation it admitted while handling this RPC fences out a
+    // settlement from the admission it replaced.
+    store.tasks.ackDispatch(task.id, executionId, epoch, Date.now(), result.body.run);
     return;
   }
   if (result.body?.reason === 'task_cancelled') {
@@ -1370,7 +1383,7 @@ async function runTask(task) {
   }
   const blocking = BLOCKING_START.get(result.body?.reason);
   if (blocking) {
-    store.tasks.block(task.id, executionId, blocking, Date.now(), 60_000, { epoch });
+    store.tasks.block(task.id, executionId, blocking, Date.now(), 60_000, { epoch, run: result.body?.run });
     return;
   }
   store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.', { epoch });
