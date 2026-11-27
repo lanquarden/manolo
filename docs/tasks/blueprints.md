@@ -111,7 +111,8 @@ Tasks created before this protocol keep the legacy settle behavior so a queued o
 Settlement is confirmed from the relay, not assumed. A 409, timeout, or exhausted retry budget leaves the local
 execution non-terminal and preserves the workspace; a restart replays the same settle. Cleanup runs only after an
 authoritative done/failed/cancelled state, and only a successfully handed-off or untouched tree is removed. Clean
-detached work, unhanded commits, dirty work, and local-only scratch files are preserved with recovery metadata.
+detached work, worktrees switched to another branch, unhanded commits, dirty work, and local-only scratch files are
+preserved with recovery metadata.
 
 ## Repository Tasks and worktrees
 
@@ -145,7 +146,8 @@ binaries and read credentials the pod exposes. No external worktree setup hook r
 `finish` is read-only. It rejects a dirty worktree, including untracked files. An unchanged worktree may finish without
 a handoff. A commit beyond base must already be on the configured handoff remote at the Task branch and match `HEAD`
 exactly; the check runs `ls-remote`, it never commits, pushes, resets, or deletes. After a terminal outcome, cleanup
-removes only a clean worktree and leaves a tombstone; dirty or local-only work is preserved.
+removes only a clean worktree that is still on its recorded Task branch and leaves a tombstone; dirty, switched, or
+local-only work is preserved with the recorded branch and commit.
 
 Review handoff targets the exact Task branch commit, not a mutable branch. A pull request is created only when the owner
 asks; this slice has no automated PR creation or live GitHub verification.

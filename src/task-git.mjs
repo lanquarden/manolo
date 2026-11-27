@@ -245,6 +245,17 @@ export function openTaskGit({ dataDir }) {
     return { dirty: files.length > 0, files: files.slice(0, 20) };
   }
 
+  // Read-only recovery hint: the recorded Task branch may still hold unpublished commits after the worktree moved away.
+  async function taskBranchHead(meta) {
+    if (!BRANCH.test(meta.branch ?? '') || !meta.mirror || !existsSync(meta.mirror)) return null;
+    try {
+      const sha = (await git(['rev-parse', '--verify', `refs/heads/${meta.branch}^{commit}`], meta.mirror)).trim();
+      return SHA.test(sha) ? sha : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function remoteHandoff(meta, head) {
     if (!meta.handoff || !BRANCH.test(meta.branch)) return false;
     try {
@@ -337,18 +348,26 @@ export function openTaskGit({ dataDir }) {
         return preserve('identity_mismatch', { preservedHead: null });
       }
       let branch;
+      // Recovery data for a workspace that is no longer on its recorded Task branch: name both branches and, read-only,
+      // the commit the Task branch still holds so the unpublished work is findable by ref and SHA.
+      const switched = async actual => ({
+        preservedHead: head, preservedBranch: actual, taskBranch: meta.branch, taskCommit: await taskBranchHead(meta),
+        handoff: meta.handoff ?? null,
+      });
       try {
         branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], meta.path)).trim();
       } catch {
-        return preserve('detached_or_switched_branch', { preservedHead: head, preservedBranch: null, handoff: meta.handoff ?? null });
+        return preserve('detached_or_switched_branch', await switched(null));
       }
       const state = await status(meta);
       if (state.dirty) return preserve('dirty_worktree', { preservedHead: head, preservedBranch: branch, files: state.files });
+      // A named branch other than the recorded one is not the Task workspace, whatever HEAD happens to be: the Task's own
+      // branch may still carry unpublished commits. Checked before `safe`, so an expected HEAD cannot authorize removal.
+      if (branch !== meta.branch) return preserve('detached_or_switched_branch', await switched(branch));
       const handedOff = await remoteHandoff(meta, head).catch(() => false);
       const safe = head === meta.expectedHead || (successful && handedOff);
       if (!safe) {
-        const reason = branch !== meta.branch ? 'detached_or_switched_branch' : 'unhanded_work';
-        return preserve(reason, { preservedHead: head, preservedBranch: branch, handoff: meta.handoff ?? null });
+        return preserve('unhanded_work', { preservedHead: head, preservedBranch: branch, taskBranch: meta.branch, handoff: meta.handoff ?? null });
       }
       const mirror = meta.mirror;
       if (existsSync(mirror)) await git(['worktree', 'remove', meta.path], mirror);

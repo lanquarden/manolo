@@ -116,6 +116,45 @@ test('repository Tasks get independent worktrees, isolated handoffs, restart reu
   await assert.rejects(restarted.prepare(a, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }), error => error.code === 'worktree_missing');
 });
 
+test('cleanup preserves a worktree that moved to another named branch at the initial head', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const taskId = id();
+  const prepared = await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  // Unpublished Task work: a commit exists only on the recorded Task branch, not on the handoff remote.
+  await writeFile(join(prepared.path, 'work.txt'), 'unpublished\n');
+  await git(prepared.path, 'add', 'work.txt');
+  await git(prepared.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'unpublished task work');
+  const taskCommit = await git(prepared.path, 'rev-parse', 'HEAD');
+  assert.notEqual(taskCommit, repo.baseSha);
+  // Park a different named branch at the initial expected HEAD: the tree is clean and HEAD equals expectedHead,
+  // so only the branch mismatch distinguishes this from an untouched workspace.
+  await git(prepared.path, 'checkout', '-b', 'elsewhere', repo.baseSha);
+  assert.equal(await git(prepared.path, 'rev-parse', 'HEAD'), repo.baseSha);
+  assert.equal(await git(prepared.path, 'symbolic-ref', '--short', 'HEAD'), 'elsewhere');
+  assert.equal(await git(prepared.path, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+
+  // Even a relay-confirmed success must not remove a workspace that was switched to another branch.
+  const result = await taskGit.cleanup(taskId, { terminal: true, successful: true });
+  assert.equal(result.removed, false);
+  assert.equal(result.reason, 'detached_or_switched_branch');
+  assert.equal(result.preservedHead, repo.baseSha);
+  assert.equal(result.preservedBranch, 'elsewhere');
+  assert.equal(result.taskBranch, `task/${taskId}`);
+  assert.equal(result.taskCommit, taskCommit);
+  assert.equal(existsSync(prepared.path), true);
+
+  const preserved = await taskGit.readMeta(taskId);
+  assert.equal(preserved.kind, 'preserved');
+  assert.equal(preserved.preserveReason, 'detached_or_switched_branch');
+  assert.equal(preserved.branch, `task/${taskId}`);
+  assert.equal(preserved.taskCommit, taskCommit);
+  await assert.rejects(taskGit.assertWorkspace(taskId), error => error.code === 'worktree_missing');
+
+  // The recorded Task branch still holds the unpublished commit, so recovery has a named ref and an exact SHA.
+  assert.equal(await git(prepared.mirror, 'rev-parse', `refs/heads/task/${taskId}`), taskCommit);
+});
+
 test('a replaced or missing worktree is reported and never accepted as the recorded workspace', async t => {
   const repo = await repository(t);
   const taskGit = openTaskGit({ dataDir: repo.dataDir });
