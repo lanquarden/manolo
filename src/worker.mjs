@@ -576,7 +576,8 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
         }
         const body = await readJsonBody(req, MAX_TASK_BODY_BYTES);
         const executionId = body?.executionId;
-        if (typeof executionId !== 'string' || !/^[0-9a-f]{32}$/.test(executionId)) throw new RequestError(400, 'invalid execution');
+        if (typeof executionId !== 'string' || !/^[0-9a-f]{32}$/.test(executionId) ||
+            (body.admission !== undefined && !Number.isSafeInteger(body.admission))) throw new RequestError(400, 'invalid execution');
         try {
           if (action === 'executions' || action === 'executions/v2') {
             const assignment = body.task;
@@ -601,13 +602,16 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
                     assignment.blueprint.snapshot === null))))) {
               throw new RequestError(400, 'invalid task');
             }
-            return reply(res, 200, await tasks.dispatch({ taskId, executionId, task: assignment }));
+            return reply(res, 200, await tasks.dispatch({ taskId, executionId, task: assignment, admission: body.admission }));
           }
           if (action === 'resume') {
             if (typeof body.itemId !== 'string' || !/^[0-9a-f]{32}$/.test(body.itemId) ||
                 !['answered', 'declined'].includes(body.status) ||
-                (body.response !== undefined && typeof body.response !== 'string')) throw new RequestError(400, 'invalid resume');
-            return reply(res, 200, await tasks.resume({ taskId, executionId, itemId: body.itemId, status: body.status, response: body.response }));
+                (body.response !== undefined && typeof body.response !== 'string') ||
+                (body.admission !== undefined && !Number.isSafeInteger(body.admission))) throw new RequestError(400, 'invalid resume');
+            return reply(res, 200, await tasks.resume({
+              taskId, executionId, itemId: body.itemId, status: body.status, response: body.response, admission: body.admission,
+            }));
           }
           if (action === 'cancel') return reply(res, 200, await tasks.cancel({ taskId, executionId }));
         } catch (error) {

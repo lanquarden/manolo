@@ -92,21 +92,37 @@ One durable path, end to end, for flagged web conversations. Everything below is
   claimed twice, a dispatch retry cannot mint a second execution, and a claim committed just before a crash is re-driven
   after a restart with the same IDs.
 - **Park:** item insert, `waiting` transition, claim release, pending-dispatch clear, and notice in one transaction. A
-  replayed park returns the same item; a second open item is refused.
+  replayed park returns the same item; a second open item is refused, and once the execution has negotiated the admission
+  contract a park that names no admission, or names a withdrawn one, is refused so a stale park cannot suspend live work.
 - **Response:** item close, stored response, `queued` resume transition, and notice in one transaction. Retries are
   receipts; conflicts are refused.
 - **Resume delivery:** the item's `delivered_at` is the durable receipt, written with the delivery acknowledgement; a
   settle after a resume also records it. The worker keeps its own receipt in the execution record.
 - **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID and by the worker's
   admission run. The initial admission of an execution is run 1 and every new child submission of the same execution (a
-  corrective turn, a continuation after a recoverable block) is one higher; the run travels with `finish`, `block`, and
-  `settle`, and the ledger records the lowest admission that may still write as `run_fence`. A block withdraws the
-  admission that reported it (`fence = run + 1`), and the acknowledgement of a dispatch or resume records the admission
-  the worker made current, so a settlement that was already in flight for a replaced admission is refused instead of
-  ending live work. Reporting the same admission again after its recovery reopens exactly that admission. The field is
-  optional on every route, so a worker that predates it keeps the older execution-ID-only contract; an accepted finish
-  always settles from its own admission. A valid finish that lands while a dispatch or resume acknowledgement is still
-  owed is accepted instead of being rejected.
+  corrective turn, a continuation after a recoverable block) is one higher. The run travels with `finish`, `park`,
+  `block`, and `settle`, and the ledger records the lowest admission that may still write as `run_fence`; the fence only
+  ever moves forward. The acknowledgement of a dispatch or resume records the admission the worker made current, so a
+  settlement that was already in flight for a replaced admission is refused instead of ending live work, and a late
+  acknowledgement that repeats an older admission can never reopen one a takeover already withdrew.
+- **Observation or retirement:** a `block` says which of the two it is. A retirement (`withdrawn: true`) comes from a
+  submission that has ended: it withdraws that admission (`fence = run + 1`), and only a newer admission may write
+  afterwards. An observation reports a temporary condition on a submission that is still live — a dispatch retry that
+  cannot reach the workspace while the child is still running: it is visible and it schedules the retry, it records that
+  admission as current, and it never withdraws it, so restoring the condition lets the very same run settle instead of
+  stranding it behind a fence that no later admission will ever move.
+- **Admission contract:** negotiated, never assumed. The relay offers the contract it speaks (`admission: 2`) on every
+  dispatch and resume; a worker that was not offered it keeps the older runless reports, so an older relay is never fed a
+  field it rejects and a fenced mutation is never retried in a weaker legacy shape. The ledger records the contract on the
+  row from the first versioned report — before that report is applied, so a finish that lands before its dispatch
+  acknowledgement, or whose acknowledgement was lost, still marks it. Once the row is versioned, a `finish`, `settle`, or
+  `park` that names no admission is refused (409): after a takeover the ledger cannot tell it apart from the admission a
+  takeover replaced, and applying it would end or suspend the live work. A row that never negotiated keeps the runless
+  contract, so a pre-upgrade execution and a pre-upgrade worker still complete; an accepted finish remains authoritative
+  for its own admission, a valid finish that lands while a dispatch or resume acknowledgement is still owed is accepted,
+  and cancellation remains a separate decision. A `block` is the one route that a runless report may still use: it is a
+  condition report, it never names an outcome, and at worst it schedules a retry for an admission that is not current.
+  `progress` is a note on a running Task and carries no terminal or takeover authority.
 - **Cancellation:** the ledger transition and the worker stop are separate facts. `stop_pending` is retried with a
   backoff and `stop_confirmed_at` records the confirmation; until then the Task reports the stop as unconfirmed. A
   pending dispatch is cleared, so a dispatch that has not been sent is never sent, and the worker writes a cancelled
@@ -119,7 +135,14 @@ the next-turn notice exposure. Delivery is not exactly-once transport.
 ### Rollout and reversal
 
 - The ledger lives in the relay's existing SQLite database. Tables are created on startup with `CREATE TABLE IF NOT
-  EXISTS`, so an older database gains them in place and an older relay ignores them.
+  EXISTS`, and the later columns (`run_fence`, `admission_contract`, …) are added in place, so an older database gains
+  them and an older relay ignores them.
+- The admission contract is forwarded compatible and rolls out relay first. The relay offers it on every dispatch and
+  resume; an older worker ignores the offer and keeps writing the runless reports this ledger still accepts for a row it
+  never negotiated, and a newer worker only starts naming admissions after it was offered the contract. Deploy the relay
+  before the worker. Rolling the worker back while a negotiated execution is in flight is refused rather than
+  downgraded: the ledger answers 409 to its runless results and the worker leaves the execution visibly running, so let
+  those Tasks finish or cancel them before rolling the worker back, and roll the relay back last.
 - The slice is gated by the existing `MANOLO_WORK_SESSION_AGENT` list: without it, `/api/tasks` is 404, the internal
   task routes are 404, and no turn is flagged for orchestration tools. No chart change is required.
 - Reversal: drop `MANOLO_WORK_SESSION_AGENT` (or the agent from it) and the Task surfaces disappear while existing rows

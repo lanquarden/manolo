@@ -248,7 +248,11 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
   }]]);
   const submissionFor = id => submissions.get(id) ?? newSubmission(id);
   data.set(`manolo.task-execution:${task.id}`, {
+    // The relay offers the versioned admission contract on every dispatch, so an execution that was admitted under this
+    // worker has already negotiated it. A dispatch in a test negotiates the same way; the field is recorded here because
+    // the fixture creates the record it would have written.
     taskId: task.id, executionId, conversationId: 'conv', submissionId: 'submission-0', state: 'running', run: 1, finishRequired,
+    admission: 2,
     workspace: { kind: 'worktree', path: '/tmp/task-workspace' },
   });
   data.set('manolo.task-run:conv', { taskId: task.id, executionId, state: 'running' });
@@ -261,7 +265,7 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     if (path.endsWith('/block')) {
       calls.block += 1;
       if (controls.refuseBlock) return new Response(null, { status: 503 });
-      store.block(task.id, executionId, body.reason, Date.now(), 60_000, { run: body.run });
+      store.block(task.id, executionId, body.reason, Date.now(), 60_000, { run: body.run, withdraw: body.withdrawn === true });
       if (controls.holdBlock) await controls.holdBlock.promise;
       return Response.json({ ok: true });
     }
@@ -311,9 +315,20 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     snapshot: async (...args) => get(...args), commit,
     conversation: async id => conversations.get(id),
     submission: async id => submissionFor(id),
+    // The Inbox wake the child's parked call is waiting on, resolved through the same durable run record the tool writes.
+    signal: async (toolTaskId, _signal, itemId) => {
+      const run = data.get('manolo.task-run:conv');
+      if (toolTaskId !== run?.yielded || itemId !== run.itemId) throw new Error('wrong Inbox target');
+      delete run.yielded;
+      delete run.itemId;
+      run.resumedItem = itemId;
+      run.state = 'running';
+      return 'delivered';
+    },
   });
   return {
     relay, controls, calls, admitted, submissionFor, tasks,
+    data, documentData: () => data.get('manolo.task-run:conv'),
     taskId: task.id, executionId,
     document: () => data.get(`manolo.task-execution:${task.id}`),
     state: () => store.get(scope, task.id),
@@ -339,7 +354,7 @@ test('a dispatch retry during a delayed block report is answered blocked, never 
 
   // A dispatch retry arrives in that window. Answering "running" would let the relay clear the retry obligation for a
   // submission that has already ended, leaving a local block behind with no relay obligation.
-  const retry = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const retry = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(retry.status, 'blocked', JSON.stringify(retry));
   assert.equal(race.document().state, 'blocked', 'the durable intent is promoted, not discarded');
   assert.equal(race.document().blockIntent, undefined);
@@ -353,7 +368,7 @@ test('a dispatch retry during a delayed block report is answered blocked, never 
   // Restoring the workspace and driving the recorded retry continues the same execution and settles it once.
   race.controls.lost = false;
   store.db.prepare('UPDATE tasks SET next_at=0').run();
-  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(continued.status, 'running', JSON.stringify(continued));
   assert.equal(race.admitted.length, 1);
   assert.equal(race.document().submissionId, 'submission-1');
@@ -377,7 +392,7 @@ test('a continuation admitted before the old watcher tears down owns its own wat
   await race.tasks.start();
   race.document().state = 'blocked';
   race.document().blockedReason = 'The Task worktree is missing.';
-  const repaired = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const repaired = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(repaired.status, 'running', JSON.stringify(repaired));
   assert.equal(race.admitted.length, 1, 'the repaired execution admits one continuation');
   assert.equal(race.document().submissionId, 'submission-1');
@@ -413,14 +428,14 @@ test('a restart re-reports a durable block intent whose acknowledgement was lost
 
   // With the workspace back, a dispatch retry must not acknowledge this execution as running: it promotes the intent and
   // keeps the relay's obligation alive instead of clearing it.
-  const retry = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const retry = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(retry.status, 'blocked', JSON.stringify(retry));
   assert.equal(document.state, 'blocked');
   store.db.prepare('UPDATE tasks SET dispatch_pending=1, next_at=0').run();
   assert.equal(store.dueDispatch(Date.now()).length, 1, 'the ledger still owes a retry');
 
   // The next retry continues the same execution to a terminal outcome.
-  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(continued.status, 'running', JSON.stringify(continued));
   race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished after restart', conversationId: 'conv' });
   await untilTrue(() => race.state().status === 'done', 'the restarted execution settles');
@@ -437,7 +452,7 @@ test('an unacknowledged block intent recovers while the worker stays alive, with
   const store = openTaskStore(new DatabaseSync(':memory:'));
   const race = taskRaceHarness({ store, blockRecoveryBackoffMs: [1] });
   globalThis.fetch = race.relay;
-  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const request = { taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } };
 
   await race.tasks.start();
   // The start acknowledgement was lost and the relay retried the dispatch. Its acknowledgement clears the only retry
@@ -475,7 +490,7 @@ test('an unacknowledged block intent recovers while the worker stays alive, with
   race.controls.lost = false;
   store.db.prepare('UPDATE tasks SET next_at=0').run();
   assert.equal(store.dueDispatch(Date.now()).length, 1);
-  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } });
   assert.equal(continued.status, 'running', JSON.stringify(continued));
   assert.equal(race.document().submissionId, 'submission-1');
   assert.equal(race.admitted.length, 1, 'the recovery did not start a second execution');
@@ -517,7 +532,7 @@ test('a lost start ACK during the corrective handoff never installs a second wat
   const store = openTaskStore(new DatabaseSync(':memory:'));
   const race = taskRaceHarness({ store, finishRequired: true });
   globalThis.fetch = race.relay;
-  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const request = { taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } };
   const outcome = { status: 'done', answer: 'bare result', conversationId: 'conv' };
 
   await race.tasks.start();
@@ -552,7 +567,7 @@ test('a lost start ACK during the corrective handoff never installs a second wat
   assert.equal(race.state().status, 'running');
 
   // The continuation finishes normally and is the only settlement.
-  store.acceptFinish({ taskId: race.taskId, executionId: race.executionId, summary: 'finished after recovery', key: 'finish-recovery' });
+  store.acceptFinish({ taskId: race.taskId, executionId: race.executionId, summary: 'finished after recovery', key: 'finish-recovery', run: race.document().run });
   race.document().finishAccepted = true;
   race.document().finishSummary = 'finished after recovery';
   race.submissionFor('submission-2').settle(outcome);
@@ -595,7 +610,7 @@ test('a dispatch retry stalled in the workspace check never reattaches to a subm
   const store = openTaskStore(new DatabaseSync(':memory:'));
   const race = taskRaceHarness({ store });
   globalThis.fetch = race.relay;
-  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const request = { taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } };
 
   // The lost start acknowledgement makes the relay retry the dispatch while the first submission is still current.
   await race.tasks.start();
@@ -651,7 +666,7 @@ test('a settlement already on the wire when a newer recovery admission becomes c
   const store = openTaskStore(new DatabaseSync(':memory:'));
   const race = taskRaceHarness({ store });
   globalThis.fetch = race.relay;
-  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const request = { taskId: race.taskId, executionId: race.executionId, admission: 2, task: { title: 'race', input: 'do it' } };
   const epoch = () => store.db.prepare('SELECT dispatch_epoch FROM tasks WHERE id=?').get(race.taskId).dispatch_epoch;
 
   // The first submission ends while the workspace is lost, so its watcher blocks and exits: admission 1 is withdrawn.
@@ -703,11 +718,13 @@ test('a settlement already on the wire when a newer recovery admission becomes c
   assert.equal(race.document().state, 'settled');
 });
 
-// 5. The fence is a one-way contract: an accepted finish still settles from its own admission, a withdrawn admission is
-//    refused, and a worker that reports no admission at all keeps the unversioned behaviour instead of being downgraded.
+// 5. The fence is a one-way contract: an accepted finish still settles from its own admission, a retired admission is
+//    refused, an observation of a still-live submission keeps its authority, and a row that never negotiated the versioned
+//    contract keeps completing from unversioned reports.
 
-test('the admission fence still settles an acknowledged finish and stays optional for an unversioned worker', () => {
+test('the admission fence settles an acknowledged finish, tells a withdrawal from an observation, and keeps legacy rows', () => {
   const store = openTaskStore(new DatabaseSync(':memory:'));
+  const fenceOf = taskId => store.db.prepare('SELECT run_fence, admission_contract FROM tasks WHERE id=?').get(taskId);
   const finished = taskFixture(store);
   store.acceptFinish({ taskId: finished.taskId, executionId: finished.executionId, summary: 'accepted', key: 'finish-admission', run: 1 });
   assert.equal(store.meta(finished.taskId).finishAccepted, true);
@@ -715,18 +732,209 @@ test('the admission fence still settles an acknowledged finish and stays optiona
   assert.deepEqual(store.settle({ taskId: finished.taskId, executionId: finished.executionId, outcome: 'done', summary: 'accepted', key: 'settle-admission', run: 1 }), { status: 'done' });
   assert.equal(store.status(finished.taskId), 'done');
 
-  // A block withdraws the admission that reported it: its settlement is refused, and only a newer admission may end the
-  // Task. A worker that predates the field keeps the old contract, so a mixed upgrade never strands a Task.
-  const blocked = taskFixture(store);
-  assert.equal(store.block(blocked.taskId, blocked.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1 }), true);
-  assert.throws(() => store.settle({ taskId: blocked.taskId, executionId: blocked.executionId, outcome: 'failed', summary: 'stale', key: 'settle-fenced', run: 1 }), { statusCode: 409 });
-  assert.equal(store.status(blocked.taskId), 'running');
-  assert.throws(() => store.acceptFinish({ taskId: blocked.taskId, executionId: blocked.executionId, summary: 'stale finish', key: 'finish-fenced', run: 1 }), { statusCode: 409 });
-  assert.equal(store.meta(blocked.taskId).finishAccepted, false);
-  assert.deepEqual(store.settle({ taskId: blocked.taskId, executionId: blocked.executionId, outcome: 'failed', summary: 'unversioned', key: 'settle-unversioned' }), { status: 'failed' });
+  // An observation reports a condition, not a retirement: the workspace is temporarily unavailable while the submission is
+  // still live, so the run keeps the authority to settle once it is restored. It never lowers the fence either.
+  const observed = taskFixture(store);
+  assert.equal(store.block(observed.taskId, observed.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1 }), true);
+  assert.deepEqual([fenceOf(observed.taskId).run_fence, fenceOf(observed.taskId).admission_contract], [1, 2]);
+  assert.deepEqual(store.settle({ taskId: observed.taskId, executionId: observed.executionId, outcome: 'failed', summary: 'same admission', key: 'settle-observation', run: 1 }), { status: 'failed' });
 
+  // A retirement withdraws the admission that reported it: its settlement and its finish are refused, a runless result
+  // cannot be attributed to the live one, and only a newer admission may end the Task.
+  const retired = taskFixture(store);
+  assert.equal(store.block(retired.taskId, retired.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1, withdraw: true }), true);
+  assert.equal(fenceOf(retired.taskId).run_fence, 2);
+  assert.throws(() => store.settle({ taskId: retired.taskId, executionId: retired.executionId, outcome: 'failed', summary: 'stale', key: 'settle-fenced', run: 1 }), { statusCode: 409 });
+  assert.equal(store.status(retired.taskId), 'running');
+  assert.throws(() => store.acceptFinish({ taskId: retired.taskId, executionId: retired.executionId, summary: 'stale finish', key: 'finish-fenced', run: 1 }), { statusCode: 409 });
+  assert.equal(store.meta(retired.taskId).finishAccepted, false);
+  // A delayed result from before the takeover names no admission and cannot be attributed to the one that is live now.
+  assert.throws(() => store.settle({ taskId: retired.taskId, executionId: retired.executionId, outcome: 'failed', summary: 'runless', key: 'settle-runless' }), { statusCode: 409 });
+  assert.throws(() => store.acceptFinish({ taskId: retired.taskId, executionId: retired.executionId, summary: 'runless finish', key: 'finish-runless' }), { statusCode: 409 });
+  assert.throws(() => store.park({ taskId: retired.taskId, executionId: retired.executionId, kind: 'question', prompt: 'again?', key: 'park-runless' }), { statusCode: 409 });
+  assert.throws(() => store.park({ taskId: retired.taskId, executionId: retired.executionId, kind: 'question', prompt: 'again?', key: 'park-stale', run: 1 }), { statusCode: 409 });
+
+  // A row that never negotiated the versioned contract keeps the older contract: a pre-upgrade worker's runless report
+  // still settles it, so a mixed upgrade never strands a Task.
+  const legacy = taskFixture(store);
+  assert.deepEqual(store.settle({ taskId: legacy.taskId, executionId: legacy.executionId, outcome: 'failed', summary: 'legacy final', key: 'settle-legacy' }), { status: 'failed' });
+  assert.equal(fenceOf(legacy.taskId).admission_contract, 0);
+  const legacyFinish = taskFixture(store);
+  assert.equal(store.acceptFinish({ taskId: legacyFinish.taskId, executionId: legacyFinish.executionId, summary: 'legacy finish', key: 'finish-legacy' }).accepted, true);
+  assert.deepEqual(store.settle({ taskId: legacyFinish.taskId, executionId: legacyFinish.executionId, outcome: 'done', summary: 'legacy finish', key: 'settle-legacy-finish' }), { status: 'done' });
+
+  // The superseded admission stays refused after the continuation is current, and the continuation settles from its own.
   const recovered = taskFixture(store);
-  assert.equal(store.block(recovered.taskId, recovered.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1 }), true);
+  assert.equal(store.block(recovered.taskId, recovered.executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1, withdraw: true }), true);
   assert.throws(() => store.settle({ taskId: recovered.taskId, executionId: recovered.executionId, outcome: 'failed', summary: 'stale', key: 'settle-old-run', run: 1 }), { statusCode: 409 });
   assert.deepEqual(store.settle({ taskId: recovered.taskId, executionId: recovered.executionId, outcome: 'failed', summary: 'newer admission', key: 'settle-new-run', run: 2 }), { status: 'failed' });
+});
+
+// 6. The reviewer's ordering, end to end. A lost start acknowledgement makes the relay retry the dispatch while the
+//    submission is still live; that retry cannot reach the workspace, and answering "blocked" used to be read as a
+//    retirement. The fence then moved past the very admission that was still working, so the Inbox answer woke the same
+//    run into a Task that refused its finish and its settlement: parked forever, with the relay owing no retry either.
+
+test('a dispatch retry that only observes an unavailable workspace never retires the live run that later finishes', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, finishRequired: true });
+  const { taskId, executionId } = race;
+  const request = { taskId, executionId, admission: 2, task: { title: 'race', input: 'do it' } };
+  const settles = [];
+  globalThis.fetch = async (...args) => {
+    const result = await race.relay(...args);
+    if (new URL(args[0]).pathname.endsWith('/settle')) settles.push(result.status);
+    return result;
+  };
+  const row = () => store.db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
+
+  await race.tasks.start();
+  // The workspace is gone when the lost acknowledgement makes the relay retry the dispatch, and the submission is live.
+  race.controls.lost = true;
+  const refusal = await race.tasks.dispatch(request);
+  assert.deepEqual([refusal.status, refusal.run, refusal.withdrawn], ['blocked', 1, false], 'observed, not retired');
+  assert.equal(race.document().state, 'running', 'the execution keeps its live submission');
+  assert.equal(race.document().blockIntent, undefined, 'no block intent is invented for a run that is still working');
+
+  // The relay records the observation exactly as its scheduler does: a visible reason and a retry, no withdrawal.
+  assert.equal(store.block(taskId, executionId, refusal.message, Date.now(), 60_000, {
+    epoch: row().dispatch_epoch, run: refusal.run, withdraw: refusal.withdrawn === true,
+  }), true);
+  assert.equal(row().run_fence, 1, 'the live admission keeps its authority');
+  assert.equal(row().admission_contract, 2, 'the observation recorded the negotiated contract');
+
+  // The workspace comes back and the live run parks for one Inbox answer before the relay's next retry.
+  race.controls.lost = false;
+  const { itemId } = store.park({ taskId, executionId, kind: 'question', prompt: 'Proceed?', key: 'park', run: 1 });
+  Object.assign(race.documentData(), { state: 'parked', yielded: 'inbox-tool', itemId });
+  assert.equal(store.dueDispatch(Date.now()).length, 0, 'parking released the dispatch obligation');
+
+  const resumed = (store.respond('scope', itemId, 'yes'), store.claim(Date.now()));
+  const receipt = await race.tasks.resume({ taskId, executionId, itemId, status: 'answered', response: 'yes', admission: 2 });
+  assert.equal(receipt.delivered, true, JSON.stringify(receipt));
+  assert.equal(receipt.run, 1, 'the answer resumes the same admission');
+  store.resumeDelivered({ taskId, executionId, itemId, epoch: resumed.dispatch_epoch, run: receipt.run });
+  assert.ok(store.inboxItem(itemId).delivered_at, 'the answer reached the child');
+  assert.equal(race.document().submissionId, 'submission-0');
+  assert.equal(race.document().run, 1);
+
+  // The same live run finishes: its finish and its settlement are accepted, and no continuation was ever admitted.
+  assert.equal(store.acceptFinish({ taskId, executionId, run: 1, summary: 'finished after the workspace came back', key: 'actual-finish' }).accepted, true);
+  Object.assign(race.document(), { finishAccepted: true, finishSummary: 'finished after the workspace came back' });
+  race.submissionFor('submission-0').settle({ status: 'done', answer: 'finished', conversationId: 'conv' });
+  await untilTrue(() => race.state().status === 'done', 'the same live run settles the Task');
+  assert.deepEqual(settles, [200], 'the settlement of the live run was accepted, not refused');
+  assert.equal(race.calls.settle, 1);
+  assert.equal(race.admitted.length, 0, 'no continuation was invented for a live run');
+  assert.equal(row().run_fence, 1);
+  assert.equal(race.document().state, 'settled');
+  assert.equal(race.state().outcome, 'finished after the workspace came back');
+});
+
+// 7. A genuinely live submission is still retired when it really ends, and a result from before that is refused. The
+//    boundary between the two is the worker's own durable knowledge of whether the submission ended, not the scheduler's
+//    reading of a temporary condition.
+
+test('a retirement still fences the run it ends, while an observation leaves the same run able to settle', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, workspaceLost: true });
+  const { taskId, executionId } = race;
+  globalThis.fetch = race.relay;
+  const row = () => store.db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
+
+  // The submission ends while the workspace is lost, so the execution is blocked and the published block retires run 1.
+  await race.tasks.start();
+  race.submissionFor('submission-0').settle({ status: 'unanswered', conversationId: 'conv' });
+  await untilTrue(() => race.document().state === 'blocked', 'the watcher reports its block');
+  assert.equal(row().run_fence, 2, 'a real retirement withdraws the admission that ended');
+
+  // A result from that retired admission that was already on the wire is refused, whichever shape it has.
+  assert.throws(() => store.settle({ taskId, executionId, outcome: 'failed', summary: 'stale', key: 'stale-run', run: 1 }), { statusCode: 409 });
+  assert.throws(() => store.settle({ taskId, executionId, outcome: 'failed', summary: 'runless', key: 'stale-runless' }), { statusCode: 409 });
+  assert.throws(() => store.acceptFinish({ taskId, executionId, summary: 'stale finish', key: 'stale-finish' }), { statusCode: 409 });
+  assert.equal(store.status(taskId), 'running');
+
+  // The dispatch retry continues the same execution from a newer admission, which settles it.
+  race.controls.lost = false;
+  store.db.prepare('UPDATE tasks SET next_at=0').run();
+  const continued = await race.tasks.dispatch({ taskId, executionId, admission: 2, task: { title: 'race', input: 'do it' } });
+  assert.equal(continued.status, 'running');
+  assert.equal(continued.run, 2);
+  race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished', conversationId: 'conv' });
+  await untilTrue(() => race.state().status === 'done', 'the continuation settles');
+  assert.equal(race.state().outcome, 'from the child');
+});
+
+// 8. The versioned contract is marked on the row by the first versioned report, before it is applied. A finish that
+//    arrives before the dispatch acknowledgement — because that acknowledgement was lost — still records it, so an older
+//    message that names no admission can never be attributed to the admission that is live now.
+
+test('a versioned finish that lands before the dispatch acknowledgement still refuses a later runless result', () => {
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const row = id => store.db.prepare('SELECT * FROM tasks WHERE id=?').get(id);
+
+  const task = taskFixture(store);
+  assert.equal(row(task.taskId).admission_contract, 0, 'a claimed row has not negotiated anything yet');
+  // No acknowledgement ever landed: the finish itself is the first versioned report.
+  assert.equal(store.acceptFinish({ taskId: task.taskId, executionId: task.executionId, summary: 'done', key: 'finish-before-ack', run: 1 }).accepted, true);
+  assert.equal(row(task.taskId).admission_contract, 2);
+  // A delayed result from an older message names no admission, so the ledger cannot attribute it and refuses it.
+  assert.throws(() => store.settle({ taskId: task.taskId, executionId: task.executionId, outcome: 'failed', summary: 'old', key: 'runless-after-finish' }), { statusCode: 409 });
+  // The finish's own admission is authoritative and still settles the Task.
+  assert.deepEqual(store.settle({ taskId: task.taskId, executionId: task.executionId, outcome: 'done', summary: 'done', key: 'own-admission', run: 1 }), { status: 'done' });
+
+  // A worker that never negotiates keeps writing the older shape and still completes a pre-upgrade execution.
+  const legacy = taskFixture(store);
+  assert.equal(store.acceptFinish({ taskId: legacy.taskId, executionId: legacy.executionId, summary: 'legacy finish', key: 'legacy-finish' }).accepted, true);
+  assert.deepEqual(store.settle({ taskId: legacy.taskId, executionId: legacy.executionId, outcome: 'done', summary: 'legacy finish', key: 'legacy-settle' }), { status: 'done' });
+  assert.equal(row(legacy.taskId).admission_contract, 0);
+
+  // A fresh execution starts unnegotiated, so a relay that is rolled back before the worker still completes it, and the
+  // first versioned acknowledgement records the contract without lowering a fence the row never had.
+  const fresh = store.create({ owner: 'owner', agent: 'agent', scope: 'scope', originTurnId: 'turn', title: 'again', input: 'demo', key: 'again' });
+  const claim = store.claim(Date.now());
+  assert.deepEqual([claim.admission_contract, claim.run_fence], [0, 0]);
+  assert.equal(store.ackDispatch(fresh.id, claim.execution_id, claim.dispatch_epoch, Date.now(), 1), true);
+  assert.deepEqual([row(fresh.id).run_fence, row(fresh.id).admission_contract], [1, 2]);
+  // A late acknowledgement that repeats an older admission never lowers a fence a takeover already moved.
+  assert.equal(store.block(fresh.id, claim.execution_id, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1, withdraw: true }), true);
+  store.db.prepare('UPDATE tasks SET dispatch_pending=1, dispatch_epoch=dispatch_epoch+1 WHERE id=?').run(fresh.id);
+  assert.equal(store.ackDispatch(fresh.id, claim.execution_id, row(fresh.id).dispatch_epoch, Date.now(), 1), true);
+  assert.equal(row(fresh.id).run_fence, 2, 'the withdrawn admission is not reopened by a late acknowledgement');
+});
+
+// 9. A fenced mutation is never silently retried in a weaker legacy form. The relay refuses a settlement that names a
+//    withdrawn admission, and the worker repeats exactly that report; it must not fall back to a runless shape that an
+//    older relay would accept and that could end the live work the fence protects.
+
+test('a refused versioned settlement is never retried without its admission', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store });
+  const { taskId, executionId } = race;
+  const bodies = [];
+  globalThis.fetch = async (...args) => {
+    const result = await race.relay(...args);
+    if (new URL(args[0]).pathname.endsWith('/settle')) bodies.push(JSON.parse(args[1].body));
+    return result;
+  };
+  const row = () => store.db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId);
+
+  // Run 1 is retired before its watcher reports, so every settlement it sends names a withdrawn admission.
+  assert.equal(store.block(taskId, executionId, 'The Task worktree is missing.', Date.now(), 60_000, { run: 1, withdraw: true }), true);
+  assert.equal(row().run_fence, 2);
+  await race.tasks.start();
+  race.submissionFor('submission-0').settle({ status: 'unanswered', conversationId: 'conv' });
+  await untilTrue(() => race.calls.settle === 2, 'the settlement retry budget is exhausted');
+  assert.equal(bodies.length, 2);
+  // Every attempt carries the admission it reports for, and no attempt drops it to slip past the fence.
+  assert.deepEqual(bodies.map(body => body.run), [1, 1]);
+  assert.equal(row().status, 'running', 'the Task is not failed by a fenced settlement');
+  assert.equal(race.calls.cleanup, 0, 'a refused settlement never cleans the workspace');
+  assert.equal(race.document().state, 'running', 'the execution stays live for a restart to reattach');
 });

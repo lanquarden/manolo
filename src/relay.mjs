@@ -990,9 +990,13 @@ async function internal(req, res, path) {
     if (req.method === 'POST' && action === 'inbox') {
       const operationKey = idempotencyKey();
       const body = await readJson(req);
-      if (!ownFields(body, 'executionId', 'kind', 'prompt') || typeof body.executionId !== 'string' ||
-          !TASK_ID.test(body.executionId) || !['question', 'report'].includes(body.kind) || !isTaskPrompt(body.prompt)) throw fail(400);
-      return respond(res, 200, store.tasks.park({ taskId, executionId: body.executionId, kind: body.kind, prompt: body.prompt, key: operationKey }));
+      const inboxFields = ['executionId', 'kind', 'prompt', ...(body?.run === undefined ? [] : ['run'])];
+      if (!ownFields(body, ...inboxFields) || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !['question', 'report'].includes(body.kind) || !isTaskPrompt(body.prompt) ||
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1))) throw fail(400);
+      return respond(res, 200, store.tasks.park({
+        taskId, executionId: body.executionId, kind: body.kind, prompt: body.prompt, key: operationKey, run: body.run,
+      }));
     }
     if (req.method === 'POST' && action === 'progress') {
       const operationKey = idempotencyKey();
@@ -1047,13 +1051,20 @@ async function internal(req, res, path) {
       }));
     }
     // The child reports a recoverable workspace loss mid-run instead of spending a corrective turn or failing the Task.
+    // It names its admission when the versioned contract is negotiated, and it says whether that admission is retired: a
+    // dispatch retry that only observes an unavailable workspace for a submission that is still live must not fence the
+    // run out, or the child could never finish it once the workspace came back.
     if (req.method === 'POST' && action === 'block') {
       const body = await readJson(req);
-      const blockFields = ['executionId', 'reason', ...(body?.run === undefined ? [] : ['run'])];
+      const blockFields = ['executionId', 'reason',
+        ...(body?.run === undefined ? [] : ['run']), ...(body?.withdrawn === undefined ? [] : ['withdrawn'])];
       if (!ownFields(body, ...blockFields) || typeof body.executionId !== 'string' ||
           !TASK_ID.test(body.executionId) || !isTaskNote(body.reason) ||
-          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1))) throw fail(400);
-      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason, Date.now(), 60_000, { run: body.run }) });
+          (body.run !== undefined && (!Number.isSafeInteger(body.run) || body.run < 1)) ||
+          (body.withdrawn !== undefined && typeof body.withdrawn !== 'boolean')) throw fail(400);
+      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason, Date.now(), 60_000, {
+        run: body.run, withdraw: body.withdrawn === true,
+      }) });
     }
     if (req.method === 'POST' && action === 'heartbeat') {
       const body = await readJson(req);
@@ -1237,6 +1248,11 @@ const BLOCKING_START = new Map([
   ['worker_protocol', 'The worker does not support this Task protocol. Upgrade it; the Task will resume.'],
 ]);
 const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
+// The versioned admission contract this relay speaks. It is offered in every dispatch and resume request, so a worker can
+// negotiate it before it writes anything under it: a worker that is not told this relay speaks it keeps the older
+// unversioned reports, which an older relay accepts and which this ledger still accepts for a row that never negotiated.
+// The offer is additive on the request, so an older worker ignores it and keeps working exactly as before.
+const TASK_ADMISSION = 2;
 // A start is acknowledged only by a parsed worker reply naming a state a worker reports for an admitted execution. A 200
 // with an empty or unfamiliar body does not prove the child was admitted, so the dispatch stays owed.
 const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled']);
@@ -1267,14 +1283,19 @@ async function runTask(task) {
     try {
       result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/resume`, {
         method: 'POST',
-        body: { executionId, itemId: item.id, status: item.status, response: item.response ?? '' },
+        body: {
+          executionId, itemId: item.id, status: item.status, response: item.response ?? '',
+          // A resume can admit a continuation of the same execution; the offer lets the worker report which admission it
+          // made current, so a settlement from the admission it replaced is fenced out.
+          admission: TASK_ADMISSION,
+        },
       });
     } catch {
       store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.', { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === true) {
-      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch });
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch, run: result.body.run });
       return;
     }
     if (result.ok && result.body?.delivered === false && result.body.reason === 'not_yet_parked') {
@@ -1324,6 +1345,9 @@ async function runTask(task) {
       method: 'POST',
       body: {
         executionId,
+        // The versioned admission contract is offered on both routes: it is about how a result names the submission that
+        // wrote it, not about the shape of the assignment. A worker that is not offered it keeps the older reports.
+        admission: TASK_ADMISSION,
         // The two routes carry two contracts. The versioned route carries the explicit protocol, pinned snapshot,
         // profile, review binding, and finish/PR requirements; the plain route carries only the legacy shape, so a worker
         // holding either contract cannot misread the other.
@@ -1358,9 +1382,13 @@ async function runTask(task) {
     return;
   }
   if (result.ok && result.body?.status === 'blocked') {
-    // A blocked answer names the admission that reported it, so the block fences out a settlement from that admission
-    // that is still in flight. A worker that does not report one keeps the unversioned behaviour.
-    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, { epoch, run: result.body.run });
+    // A blocked answer names the admission that reported it and whether that admission is retired. Only a withdrawal
+    // fences the run out; an observation of a temporarily unavailable workspace on a submission that is still live keeps
+    // the run's authority so it can finish once the workspace is back. A worker that reports neither keeps the older
+    // execution-ID-only behaviour.
+    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, {
+      epoch, run: result.body.run, withdraw: result.body.withdrawn === true,
+    });
     return;
   }
   if (result.ok && START_ACK.has(result.body?.status)) {

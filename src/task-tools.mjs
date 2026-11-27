@@ -126,6 +126,15 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   // execution record and travels with every settlement, so the relay can refuse an outcome for a submission that a newer
   // recovery already replaced, even when that report was already in flight when it happened.
   const admissionRun = execution => Number.isSafeInteger(execution?.run) && execution.run >= 1 ? execution.run : 1;
+  // The versioned admission contract is negotiated, never assumed. The relay offers the contract it speaks on every dispatch
+  // and resume; the execution records that offer durably, and from then on every report it writes names its admission. A
+  // worker that was not offered it keeps the older unversioned reports, so a relay that predates the field is never fed one
+  // it would reject, and a fenced mutation is never silently retried in a weaker legacy form.
+  const ADMISSION_CONTRACT = 2;
+  const offersAdmission = offered => Number.isSafeInteger(offered) && offered >= ADMISSION_CONTRACT;
+  const speaksAdmission = execution => Number.isSafeInteger(execution?.admission) && execution.admission >= ADMISSION_CONTRACT;
+  // The fields that name the admission, or nothing at all for an execution that never negotiated the contract.
+  const runFields = (execution, run = admissionRun(execution)) => speaksAdmission(execution) ? { run } : {};
   // A submission is only live while its execution is running. A blocked execution has ended its submission and is waiting
   // for the relay's recovery obligation; a settled, failed or cancelled one is terminal. None of them has an owner left.
   const liveState = state => state === undefined || state === 'running' || state === 'parked';
@@ -379,9 +388,12 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       if (run.yielded !== undefined && run.yielded !== api.taskId) {
         return toolResult({ error: 'This execution already yielded; no Inbox item was opened.' }, true);
       }
+      // An Inbox item suspends the Task, so it names its admission once the versioned contract is negotiated: a park
+      // from a withdrawn submission must not suspend the live one.
+      const execution = await harness.snapshot(TaskExecution, run.taskId, context).catch(() => undefined);
       const result = await relay(`/v1/tasks/${run.taskId}/inbox`, {
         key: idempotency('inbox', run.taskId, api.taskId),
-        body: { executionId: run.executionId, kind, prompt },
+        body: { executionId: run.executionId, kind, prompt, ...runFields(execution) },
       });
       if (!result.ok) {
         return toolResult({ error: result.status === 409 ? 'This Task already has an open Inbox item or is no longer running.' : 'The relay did not open an Inbox item.' }, true);
@@ -489,7 +501,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       };
       const result = await relay(`/v1/tasks/${run.taskId}/finish`, {
         key: idempotency('finish', run.taskId, run.executionId),
-        body: { executionId: run.executionId, summary, ...(evidence.commit && { evidence }), run: admissionRun(execution) },
+        body: { executionId: run.executionId, summary, ...(evidence.commit && { evidence }), ...runFields(execution) },
       });
       if (result.ok) return remember({ summary, evidence });
       // A rejection or transport ambiguity after the commit is reconciled from state, never guessed from the failure.
@@ -577,7 +589,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       try {
         result = await relay(`/v1/tasks/${taskId}/settle`, {
           key: idempotency('settle', taskId, executionId, desired),
-          body: { executionId, outcome: desired, summary: text, deliveredItems, run: admissionRun(current) },
+          body: { executionId, outcome: desired, summary: text, deliveredItems, ...runFields(current) },
         });
       } catch {
         result = { ok: false, status: 0 };
@@ -709,9 +721,12 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       const intent = current.blockIntent;
       if (intent === undefined) return 'stale';
       const reason = boundedPlain(intent.message ?? intent.reason ?? 'The Task workspace is unavailable.', MAX_NOTE);
+      // The submission this intent belongs to has ended, so the report declares the admission retired: only a newer
+      // admission may settle this execution afterwards. A dispatch retry that only observes an unavailable workspace for
+      // a still-live submission answers without that declaration instead.
       const result = await relay(`/v1/tasks/${taskId}/block`, {
         key: idempotency('block', taskId, executionId, intent.reason),
-        body: { executionId, reason, run: admissionRun(current) },
+        body: { executionId, reason, ...runFields(current), ...(speaksAdmission(current) && { withdrawn: true }) },
       }).catch(() => ({ ok: false }));
       if (!result.ok) return 'retry';
       return await promoteBlocked(taskId, executionId, submissionId, intent) ? 'reported' : 'stale';
@@ -952,22 +967,41 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     return `Task: ${title}\n\n${input}${extra ? `\n\n${extra}` : ''}`;
   }
 
-  async function dispatch({ taskId, executionId, task }) {
+  // Record the admission contract the relay offered, before anything is answered or written under it. The record is
+  // durable, so a restart keeps speaking the same contract for executions it already negotiated.
+  async function negotiate(taskId, executionId, offered) {
+    if (!offersAdmission(offered)) return false;
+    const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+    if (!current || current.executionId !== executionId || speaksAdmission(current)) return false;
+    await harness.commit(async tx => {
+      const record = await tx.doc(TaskExecution, taskId, null);
+      if (record.executionId === executionId) record.admission = ADMISSION_CONTRACT;
+    }, context).catch(() => {});
+    return true;
+  }
+
+  async function dispatch({ taskId, executionId, task, admission: offered }) {
     if (!ID.test(taskId) || !EXECUTION_ID.test(executionId)) throw Object.assign(new Error('Invalid execution'), { status: 400 });
     if (!task || typeof task.title !== 'string' || typeof task.input !== 'string') throw Object.assign(new Error('Invalid task'), { status: 400 });
-    const existing = await harness.snapshot(TaskExecution, taskId, context);
+    let existing = await harness.snapshot(TaskExecution, taskId, context);
     if (existing?.executionId === executionId) {
+      // The relay offers the admission contract on every dispatch. Record it first, so this answer and every later report
+      // for this execution name their admission; a retry that lost the original acknowledgement negotiates the same way.
+      if (await negotiate(taskId, executionId, offered)) {
+        existing = await harness.snapshot(TaskExecution, taskId, context).catch(() => existing);
+      }
       // A dispatch retry reuses the execution ID: the same child submission, never a second one.
       if (existing.state === 'blocked') {
         const continued = await continueExecution(taskId, executionId);
-        if (continued.ok) return { status: 'running', run: continued.run };
+        if (continued.ok) return { status: 'running', ...runFields(existing, continued.run) };
         // A competing dispatch already continued it; that dispatch owns the watcher, so this retry only acknowledges.
         if (continued.reason === 'not_blocked') {
           const latest = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
-          return { status: 'running', ...(latest && { run: admissionRun(latest) }) };
+          return { status: 'running', ...runFields(latest ?? existing) };
         }
+        // A blocked execution ended its submission: the admission stays withdrawn, so only a newer one may settle it.
         return {
-          status: 'blocked', reason: continued.reason ?? 'worktree_missing', run: admissionRun(existing),
+          status: 'blocked', reason: continued.reason ?? 'worktree_missing', withdrawn: true, ...runFields(existing),
           message: continued.reason === 'continuation_limit'
             ? 'The Task workspace was lost repeatedly; the Task was not resumed. Restore it and start a new Task, or finish it explicitly.'
             : continued.message ?? 'The blocked Task execution could not be resumed; restore its workspace.',
@@ -980,7 +1014,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         const intent = existing.blockIntent;
         await promoteBlocked(taskId, executionId, existing.submissionId, intent);
         return {
-          status: 'blocked', reason: intent.reason ?? 'worktree_missing', run: admissionRun(existing),
+          status: 'blocked', reason: intent.reason ?? 'worktree_missing', withdrawn: true, ...runFields(existing),
           message: intent.message ?? 'The Task workspace is unavailable.',
         };
       }
@@ -995,7 +1029,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       // An unreadable record reports no admission: the relay keeps whatever fence it has instead of being told about one
       // this retry could not verify.
       if (!current) return { status: 'running' };
-      if (current.executionId !== executionId) return { status: 'running', run: admissionRun(current) };
+      if (current.executionId !== executionId) return { status: 'running', ...runFields(current) };
       if (current.state === 'cancelled') {
         throw Object.assign(new Error('Task is cancelled'), { status: 409, reason: 'task_cancelled' });
       }
@@ -1005,26 +1039,33 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         const intent = current.blockIntent;
         await promoteBlocked(taskId, executionId, current.submissionId, intent);
         return {
-          status: 'blocked', reason: intent.reason ?? 'worktree_missing', run: admissionRun(current),
+          status: 'blocked', reason: intent.reason ?? 'worktree_missing', withdrawn: true, ...runFields(current),
           message: intent.message ?? 'The Task workspace is unavailable.',
         };
       }
       if (current.state === 'blocked') {
         return {
-          status: 'blocked', reason: 'worktree_missing', run: admissionRun(current),
+          status: 'blocked', reason: 'worktree_missing', withdrawn: true, ...runFields(current),
           message: current.blockedReason ?? 'The Task execution is blocked; restore its workspace.',
         };
       }
       if (!workspace.ok) {
-        return { status: 'blocked', reason: workspace.reason, run: admissionRun(current), message: workspace.message };
+        // A live submission with a temporarily unavailable workspace is an observation, not a retirement: the child is
+        // still running in its conversation and may finish once the workspace is restored, so its admission must keep the
+        // authority to do so. Retiring it here would fence out a settlement no later admission would ever override and
+        // strand the Task. Only an execution with no live submission left is withdrawn.
+        return {
+          status: 'blocked', reason: workspace.reason, message: workspace.message,
+          withdrawn: !isLiveOwner(current, executionId, current.submissionId), ...runFields(current),
+        };
       }
       if (isLiveOwner(current, executionId, current.submissionId)) {
         watch(taskId, executionId, current.submissionId);
-        return { status: current.state ?? 'running', run: admissionRun(current) };
+        return { status: current.state ?? 'running', ...runFields(current) };
       }
       // The execution is terminal locally, so there is no submission left to watch; the relay already knows the outcome.
-      if (current.state === 'settled' || current.state === 'failed') return { status: current.state, run: admissionRun(current) };
-      return { status: 'running', run: admissionRun(current) };
+      if (current.state === 'settled' || current.state === 'failed') return { status: current.state, ...runFields(current) };
+      return { status: 'running', ...runFields(current) };
     }
     // These two checks are repeated inside the admission commit below. Here they only avoid creating a conversation for
     // a dispatch that is already known to be refused.
@@ -1121,6 +1162,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         taskId, executionId, conversationId, submissionId: admitted, state: 'running', run: 1,
         title: boundedPlain(redact(task.title), MAX_TITLE), input: text,
         finishRequired, protocol,
+        ...(offersAdmission(offered) && { admission: ADMISSION_CONTRACT }),
         ...(task.review && { review: task.review }),
         ...(task.requiresPullRequest === true && { requiresPullRequest: true }),
         ...(task.profile && { profile: task.profile }),
@@ -1148,7 +1190,10 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       );
     }
     watch(taskId, executionId, admission.submissionId);
-    return { status: 'running', run: admission.run };
+    // The record was just written with the contract this dispatch negotiated, so the answer names the same admission every
+    // later report for it will name. An unreadable record reports none instead of one this reply cannot verify.
+    const record = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+    return { status: 'running', ...(record ? runFields(record) : {}) };
   }
 
   // Record the delivery in the execution's own durable receipt before reporting it, so a replay after the park marker is
@@ -1163,14 +1208,19 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     }, context);
   }
 
-  async function resume({ taskId, executionId, itemId, status, response }) {
+  async function resume({ taskId, executionId, itemId, status, response, admission: offered }) {
     if (!ID.test(taskId) || !EXECUTION_ID.test(executionId) || !ID.test(itemId)) {
       throw Object.assign(new Error('Invalid resume'), { status: 400 });
     }
-    const execution = await harness.snapshot(TaskExecution, taskId, context);
+    let execution = await harness.snapshot(TaskExecution, taskId, context);
     if (!execution || execution.executionId !== executionId) return { delivered: false, reason: 'unknown_execution' };
+    // The relay offers the admission contract on every resume too, and a resume can admit a continuation of this same
+    // execution. Negotiating here keeps every later report for it attributable.
+    if (await negotiate(taskId, executionId, offered)) {
+      execution = await harness.snapshot(TaskExecution, taskId, context).catch(() => execution);
+    }
     if (execution.state === 'cancelled') return { delivered: false, reason: 'no_parked_call' };
-    if ((execution.deliveredItems ?? []).includes(itemId)) return { delivered: true, replay: true };
+    if ((execution.deliveredItems ?? []).includes(itemId)) return { delivered: true, replay: true, ...runFields(execution) };
     // A lost worktree is not recreated under a resumed Task. Stop with an explicit recovery reason instead.
     try {
       if (taskGit && execution.workspace) await taskGit.assertWorkspace(taskId);
@@ -1186,7 +1236,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       const continued = await continueExecution(taskId, executionId, { note: value, itemId });
       if (continued.ok) {
         await recordDelivery(taskId, executionId, itemId);
-        return { delivered: true };
+        return { delivered: true, ...runFields(execution, continued.run) };
       }
       return {
         delivered: false,
@@ -1203,7 +1253,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (run.resumedItem === itemId) {
       // The child already consumed this item; the acknowledgement was lost. This is a delivery, not a missing call.
       await recordDelivery(taskId, executionId, itemId);
-      return { delivered: true, replay: true };
+      return { delivered: true, replay: true, ...runFields(execution) };
     }
     const toolTaskId = run.yielded;
     // The relay only learns about an item from this execution's own park RPC, and the park marker is stored after that
@@ -1221,13 +1271,13 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     }
     if (result === 'delivered' || result === 'duplicate') {
       await recordDelivery(taskId, executionId, itemId);
-      return { delivered: true };
+      return { delivered: true, ...runFields(execution) };
     }
     // The signal was refused. The child may have consumed it just before this call, so check the durable marker once.
     const after = await harness.snapshot(TaskRun, execution.conversationId, context);
     if (after?.resumedItem === itemId) {
       await recordDelivery(taskId, executionId, itemId);
-      return { delivered: true, replay: true };
+      return { delivered: true, replay: true, ...runFields(execution) };
     }
     return { delivered: false, reason: result === 'closed' || result === 'not_found' ? 'no_parked_call' : result };
   }

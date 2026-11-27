@@ -1645,3 +1645,111 @@ test('a cf21513 ledger with a delivered resume and no item left migrates to a st
     store.db.close();
   }
 });
+
+// The versioned admission contract is negotiated with the relay, not assumed by either side, and the ledger marks the row
+// the first time an execution reports under it. That is what makes a delayed result from an older message attributable:
+// before the negotiation, a runless report is the legacy contract and still completes a pre-upgrade Task; after it, a
+// runless report can no longer be told apart from the admission a takeover withdrew, so it is refused.
+test('the relay offers the admission contract and refuses runless results only after an execution negotiates it', { timeout: 90_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-admission-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  const offers = [];
+  const dispatches = new Map();
+  const resumes = [];
+  const fake = createServer(async (req, res) => {
+    const json = (value, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const body = raw ? JSON.parse(raw) : {};
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(\/v2)?$/.exec(req.url);
+    if (dispatch) {
+      offers.push({ path: dispatch[2] ?? '', admission: body.admission });
+      const count = (dispatches.get(dispatch[1]) ?? 0) + 1;
+      dispatches.set(dispatch[1], count);
+      // An older worker ignores the offer and keeps the runless reports it always wrote; a newer one answers with the
+      // admission it made current.
+      return json(body.task?.title === 'old-worker' ? { status: 'running' } : { status: 'running', run: count });
+    }
+    if (req.url === '/resume' || req.url.endsWith('/resume')) {
+      resumes.push({ admission: body.admission, executionId: body.executionId });
+      return json({ delivered: true, run: 1 });
+    }
+    return json({ ok: true });
+  }).listen(0, '127.0.0.1');
+  await once(fake, 'listening');
+  t.after(() => { fake.closeAllConnections(); fake.close(); });
+  const dataDir = join(root, 'relay');
+  const relay = await launchTaskRelay(t, {
+    root, dataDir, stubUrl: addr(fake.address().port), token, password, extraEnv: { MANOLO_TASK_FINISH: 'legacy' },
+  });
+  const auth = basic('owner', password);
+  const workerAuth = { authorization: `Bearer ${token}` };
+  const call = (id, action, body, key) => request(relay.internal, `/v1/tasks/${id}/${action}`, workerAuth, 'POST', body, { 'idempotency-key': key });
+  const db = new DatabaseSync(join(dataDir, 'relay.sqlite'));
+  t.after(() => db.close());
+  const read = id => db.prepare('SELECT status, run_fence, admission_contract, dispatch_pending, dispatch_epoch, execution_id, blocked_reason FROM tasks WHERE id=?').get(id);
+
+  // A pre-upgrade worker is still offered the contract (it ignores it) and its runless reports keep completing the Task.
+  const old = await createTaskForTest(relay.web, relay.internal, token, auth, { id: 'old-worker-origin', title: 'old-worker' });
+  await until(() => read(old.id).dispatch_pending === 0 && dispatches.get(old.id) === 1, 'the legacy worker acknowledges');
+  assert.equal(offers.at(-1).admission, 2, 'the relay offers the contract on the dispatch request');
+  assert.deepEqual([read(old.id).admission_contract, read(old.id).run_fence], [0, 0], 'a runless worker never negotiates it');
+  const oldSettle = await call(old.id, 'settle', { executionId: read(old.id).execution_id, outcome: 'done', summary: 'legacy final' }, 'legacy-settle');
+  assert.equal(oldSettle.status, 200, await oldSettle.clone().text());
+  assert.equal(read(old.id).status, 'done');
+
+  // A worker that answers with its admission negotiates it. From then on a result that names no admission is refused:
+  // after a retirement an outstanding older message cannot be told apart from the live admission.
+  const current = await createTaskForTest(relay.web, relay.internal, token, auth, { id: 'new-worker-origin', title: 'new-worker' });
+  await until(() => read(current.id).dispatch_pending === 0 && read(current.id).run_fence === 1, 'the versioned worker acknowledges');
+  assert.deepEqual([read(current.id).admission_contract, read(current.id).run_fence], [2, 1]);
+  const { execution_id: executionId } = read(current.id);
+  // A block that only observes a temporary condition, on a submission that is still live, keeps the run's authority: it
+  // is recorded with a retry and never fences the run out.
+  const observed = await call(current.id, 'block', { executionId, reason: 'The Task worktree is missing.', run: 1 }, 'observe-run-1');
+  assert.equal(observed.status, 200, await observed.clone().text());
+  assert.equal(read(current.id).run_fence, 1, 'an observation does not withdraw the live admission');
+  assert.notEqual(read(current.id).blocked_reason, null);
+  // A retirement from the same admission does fence it: only a newer admission may write afterwards.
+  const retired = await call(current.id, 'block', { executionId, reason: 'The Task worktree is missing.', run: 1, withdrawn: true }, 'retire-run-1');
+  assert.equal(retired.status, 200, await retired.clone().text());
+  assert.equal(read(current.id).run_fence, 2, 'a retirement withdraws the admission that reported it');
+  db.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(current.id);
+  await until(() => dispatches.get(current.id) === 2 && read(current.id).dispatch_pending === 0 && read(current.id).run_fence === 2, 'the continuation is acknowledged');
+  assert.equal(offers.at(-1).admission, 2);
+  assert.equal(offers.at(-1).path, '', 'the contract is offered on the legacy assignment route too');
+  const runless = await call(current.id, 'settle', { executionId, outcome: 'failed', summary: 'old result' }, 'runless-settle');
+  const runlessFinish = await call(current.id, 'finish', { executionId, summary: 'old finish' }, 'runless-finish');
+  const staleRun = await call(current.id, 'settle', { executionId, outcome: 'failed', summary: 'old run', run: 1 }, 'stale-run-settle');
+  const staleFinish = await call(current.id, 'finish', { executionId, summary: 'old run finish', run: 1 }, 'stale-run-finish');
+  const runlessPark = await call(current.id, 'inbox', { executionId, kind: 'question', prompt: 'Still there?' }, 'runless-park');
+  const stalePark = await call(current.id, 'inbox', { executionId, kind: 'question', prompt: 'Still there?', run: 1 }, 'stale-park');
+  assert.deepEqual([runless.status, runlessFinish.status, staleRun.status, staleFinish.status, runlessPark.status, stalePark.status],
+    [409, 409, 409, 409, 409, 409]);
+  assert.equal(read(current.id).status, 'running', 'none of them touched the live Task');
+  // The live admission completes normally.
+  assert.equal((await call(current.id, 'finish', { executionId, summary: 'live finish', run: 2 }, 'live-finish')).status, 200);
+  assert.equal((await call(current.id, 'settle', { executionId, outcome: 'done', summary: 'live finish', run: 2 }, 'live-settle')).status, 200);
+  assert.equal(read(current.id).status, 'done');
+
+  // A resume is offered the contract as well, and the delivery names the admission the worker made current.
+  const parked = await createTaskForTest(relay.web, relay.internal, token, auth, { id: 'resume-worker-origin', title: 'resume-worker' });
+  await until(() => read(parked.id).dispatch_pending === 0 && read(parked.id).run_fence === 1, 'the resuming worker acknowledges');
+  const { execution_id: parkedExecution } = read(parked.id);
+  const item = await call(parked.id, 'inbox', { executionId: parkedExecution, kind: 'question', prompt: 'Proceed?', run: 1 }, 'park-run-1');
+  assert.equal(item.status, 200, await item.clone().text());
+  const { itemId } = await item.json();
+  assert.equal(read(parked.id).status, 'waiting');
+  assert.equal((await request(relay.web, `/api/tasks/${parked.id}/inbox/${itemId}/respond`, auth, 'POST', { answer: 'yes' }, mutation)).status, 200);
+  await until(() => resumes.length === 1 && db.prepare('SELECT delivered_at FROM task_inbox_items WHERE id=?').get(itemId).delivered_at, 'the answer is delivered');
+  assert.equal(resumes[0].admission, 2, 'the relay offers the contract on the resume request');
+  assert.equal(read(parked.id).run_fence, 1, 'the resume reports the same admission and does not withdraw it');
+  assert.equal((await call(parked.id, 'finish', { executionId: parkedExecution, summary: 'answered', run: 1 }, 'parked-finish')).status, 200);
+  assert.equal((await call(parked.id, 'settle', { executionId: parkedExecution, outcome: 'done', summary: 'answered', run: 1 }, 'parked-settle')).status, 200);
+  assert.equal(read(parked.id).status, 'done');
+  await relay.relay.end();
+});

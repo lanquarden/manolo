@@ -64,7 +64,7 @@ test('the selected profile reaches the model request and explicitly listed defer
         throw new Error(`unexpected ${path}`);
       };
       assert.deepEqual(await tasks.dispatch({
-        taskId: assignment.id, executionId,
+        taskId: assignment.id, executionId, admission: 2,
         task: { protocol: 2, finishRequired: true, title: 'probe', input: directive, blueprint: { id: 'general', revision: snapshot.revision, snapshot } },
       }), { status: 'running', run: 1 });
       const result = await settled.promise;
@@ -128,7 +128,7 @@ test('a saved snapshot keeps its pinned provider, model, reasoning, tools, and t
         throw new Error(`unexpected ${path}`);
       };
       assert.deepEqual(await tasks.dispatch({
-        taskId: assignment.id, executionId,
+        taskId: assignment.id, executionId, admission: 2,
         task: { protocol: 2, finishRequired: true, title: label, input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
       }), { status: 'running', run: 1 });
       assert.equal((await settled.promise).summary, expected, label);
@@ -154,7 +154,7 @@ test('a saved snapshot keeps its pinned provider, model, reasoning, tools, and t
       throw new Error(`unexpected ${path}`);
     };
     assert.deepEqual(await retargeted.dispatch({
-      taskId: assignment.id, executionId,
+      taskId: assignment.id, executionId, admission: 2,
       task: { protocol: 2, finishRequired: true, title: 'edited alias', input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
     }), { status: 'running', run: 1 });
     assert.equal((await settled.promise).summary, 'selected:fixture-deep:high');

@@ -1068,6 +1068,7 @@ test('a pinned model profile keeps resolving from the trusted proxy catalog afte
     method: 'POST', headers: { ...auth, 'content-type': 'application/json' },
     body: JSON.stringify({
       executionId: execution,
+      admission: 2,
       task: {
         protocol: 2, finishRequired: true, title: 'Pinned', input: 'Do the work.',
         blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned },

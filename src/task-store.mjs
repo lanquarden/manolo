@@ -35,6 +35,12 @@ const delay = attempts => Math.min(2 ** Math.min(attempts, 8) * 1000, 120_000);
 // same execution is one higher. It is optional on every route, so a worker that predates it keeps writing unversioned
 // reports; when it is present the ledger fences on it.
 const admissionRun = run => Number.isSafeInteger(run) && run >= 1 ? run : undefined;
+// The versioned admission contract, number 2. A worker negotiates it with the relay before it writes anything under it,
+// and the ledger records the first versioned report on the row. From then on a result that names no admission is refused
+// instead of being attributed to whatever admission happens to be current: after a takeover a late runless result may
+// belong to the submission that takeover replaced, and accepting it would end live work. A row that never negotiated
+// keeps the older runless contract, so a pre-upgrade Task and a pre-upgrade worker still complete.
+const ADMISSION_CONTRACT = 2;
 
 // A Task is "scheduled" while it is queued and its not-before time is still ahead. That is a view of one row, not a
 // second state: the scheduler only ever claims `queued` rows whose time has come.
@@ -121,6 +127,7 @@ export function openTaskStore(db) {
       dispatch_pending INTEGER NOT NULL DEFAULT 0,
       dispatch_epoch INTEGER NOT NULL DEFAULT 0,
       run_fence INTEGER NOT NULL DEFAULT 0,
+      admission_contract INTEGER NOT NULL DEFAULT 0,
       stop_pending INTEGER NOT NULL DEFAULT 0,
       stop_attempts INTEGER NOT NULL DEFAULT 0,
       stop_next_at INTEGER NOT NULL DEFAULT 0,
@@ -183,6 +190,7 @@ export function openTaskStore(db) {
       ['dispatch_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['dispatch_epoch', 'INTEGER NOT NULL DEFAULT 0'],
       ['run_fence', 'INTEGER NOT NULL DEFAULT 0'],
+      ['admission_contract', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_pending', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_attempts', 'INTEGER NOT NULL DEFAULT 0'],
       ['stop_next_at', 'INTEGER NOT NULL DEFAULT 0'],
@@ -277,6 +285,24 @@ export function openTaskStore(db) {
   function remember(key, taskId, kind, value, now) {
     addOperation.run(key, taskId, kind, JSON.stringify(value), iso(now));
     return value;
+  }
+
+  // A report that names its admission marks the row as writing under the versioned contract, before anything else is done
+  // with it: a finish that lands before the dispatch acknowledgement, or whose acknowledgement was lost, still records
+  // that this execution speaks the contract. Returns true when the report was versioned at all.
+  function markAdmission(taskId, run) {
+    if (admissionRun(run) === undefined) return false;
+    db.prepare('UPDATE tasks SET admission_contract=? WHERE id=? AND admission_contract<?')
+      .run(ADMISSION_CONTRACT, taskId, ADMISSION_CONTRACT);
+    return true;
+  }
+
+  // Once an execution has negotiated the versioned contract, a result that names no admission cannot be attributed: after
+  // a takeover it may belong to the admission the takeover withdrew. It is refused rather than applied to the live one.
+  function requireAdmission(task, versioned, what) {
+    if (!versioned && task.admission_contract >= ADMISSION_CONTRACT) {
+      throw bad(409, `This execution reports versioned admissions; this ${what} does not name one`);
+    }
   }
 
   // The current execution is the only writer allowed to change a non-terminal Task. The Task stays `running` while the
@@ -377,17 +403,20 @@ export function openTaskStore(db) {
         // A retry of a dispatch that may already have reached the worker keeps its execution identity, so the worker
         // admits the same child submission instead of starting a second one. Only a Task without one mints a new ID.
         const executionId = next.execution_id ?? newId();
-        // A new execution identity starts a new admission sequence, so its fence starts over. A retry of the same
-        // execution keeps the fence it already earned: an older admission of that execution stays fenced out.
+        // A new execution identity starts a new admission sequence, so its fence starts over, and it has not negotiated
+        // the versioned admission contract yet: a fresh execution may legitimately run on a worker that was rolled back.
+        // A retry of the same execution keeps both what it already earned.
         const runFence = next.execution_id == null ? 0 : next.run_fence ?? 0;
+        const admissionContract = next.execution_id == null ? 0 : next.admission_contract ?? 0;
         // `dispatch_pending` is the durable marker that an outbound RPC is owed for this execution identity. It survives
         // a relay restart, so a claim committed just before a crash is re-driven with the same IDs instead of being lost.
         // The claim is not an acknowledgement: a visible block stays until the matching dispatch/resume ACK clears it.
         // Each claim opens a new dispatch obligation. Its epoch travels with the RPC the relay sends, so a late
         // acknowledgement of an older obligation can never clear a newer one.
         const changed = db.prepare(`UPDATE tasks SET status='running', execution_id=?, claim_at=?, heartbeat_at=?, next_at=0,
-          dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, run_fence=?, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
-          .run(executionId, now, now, runFence, iso(now), next.id, now);
+          dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1, run_fence=?, admission_contract=?,
+          updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
+          .run(executionId, now, now, runFence, admissionContract, iso(now), next.id, now);
         if (changed.changes !== 1) return undefined;
         return row.get(next.id);
       });
@@ -437,7 +466,8 @@ export function openTaskStore(db) {
     // clear the newer recovery, so the epoch identifies the obligation, not only the execution identity. The worker also
     // reports the admission that is current after handling the RPC: that is the durable record of a continuation admitted
     // for the same execution, and it becomes the fence, so a settlement from an older admission is refused instead of
-    // ending live work. Reporting the same admission again after a recovery reopens exactly that admission and no other.
+    // ending live work. The fence only ever moves forward, so an acknowledgement that repeats an admission keeps it
+    // current but never reopens one that a block or a takeover already withdrew.
     ackDispatch(taskId, executionId, epoch, now = Date.now(), run) {
       if (!Number.isSafeInteger(epoch)) return false;
       return transaction(() => {
@@ -445,8 +475,8 @@ export function openTaskStore(db) {
           WHERE id=? AND execution_id=? AND status='running' AND dispatch_pending=1 AND dispatch_epoch=?`)
           .run(iso(now), taskId, executionId, epoch);
         if (changed.changes !== 1) return false;
-        if (admissionRun(run) !== undefined) {
-          db.prepare('UPDATE tasks SET run_fence=? WHERE id=?').run(run, taskId);
+        if (markAdmission(taskId, run)) {
+          db.prepare('UPDATE tasks SET run_fence=MAX(run_fence,?) WHERE id=?').run(run, taskId);
         }
         return true;
       });
@@ -455,17 +485,23 @@ export function openTaskStore(db) {
     // A recoverable refusal (an unavailable profile, a lost worktree, a worker that predates this Task protocol) keeps
     // the Task running but blocks dispatch with a visible reason. It is retried with a bounded backoff; restoring the
     // worker/profile/workspace makes the same execution eligible again. It never substitutes another selection.
-    block(taskId, executionId, reason, now = Date.now(), retryAfterMs = 60_000, { epoch, run } = {}) {
+    block(taskId, executionId, reason, now = Date.now(), retryAfterMs = 60_000, { epoch, run, withdraw = false } = {}) {
       return transaction(() => {
         const task = row.get(taskId);
         if (!task || task.status !== 'running' || task.execution_id !== executionId || task.finish_accepted_at) return false;
         if (epoch !== undefined && task.dispatch_epoch !== epoch) return false;
         const first = task.blocked_reason !== reason;
+        const versioned = markAdmission(taskId, run);
         // A block schedules a new recovery obligation, so it opens its own epoch: the dispatch or resume RPC that is still
-        // in flight belongs to the previous one and its acknowledgement must not clear this block. It also withdraws the
-        // admission that reported it: the submission behind that run has ended, so only a newer admission (a continuation)
-        // may settle this Task from now on. A settlement from the blocked run that is already in flight is refused below.
-        const runFence = admissionRun(run) === undefined ? 0 : run + 1;
+        // in flight belongs to the previous one and its acknowledgement must not clear this block.
+        //
+        // The run it names is only withdrawn when the worker says that admission is retired: its submission has ended and
+        // nothing will write from it again. Then only a newer admission may settle this Task, and a settlement from the
+        // retired run that is already in flight is refused. A block that reports a temporary condition on a submission
+        // that is still live is an observation: it is visible and it schedules the retry, but it leaves that submission's
+        // authority alone, so restoring the condition lets the very same run finish instead of stranding it behind a fence
+        // that no later admission will ever move.
+        const runFence = versioned ? (withdraw ? run + 1 : run) : 0;
         db.prepare(`UPDATE tasks SET blocked_reason=?, dispatch_pending=1, dispatch_attempts=0, dispatch_epoch=dispatch_epoch+1,
           run_fence=MAX(run_fence,?), next_at=?, updated_at=? WHERE id=?`)
           .run(plain(reason, MAX_NOTE), runFence, now + Math.min(Math.max(retryAfterMs, 1_000), 300_000), iso(now), taskId);
@@ -474,11 +510,16 @@ export function openTaskStore(db) {
       });
     },
 
-    park({ taskId, executionId, kind, prompt, key, now = Date.now() }) {
+    park({ taskId, executionId, kind, prompt, key, now = Date.now(), run }) {
       return transaction(() => {
         const previous = receipt(key, taskId, 'inbox');
         if (previous) return previous;
         const task = fenced(taskId, executionId);
+        // An Inbox item is a durable suspension of the Task, so it belongs to exactly one admission: a park that cannot name
+        // it after the versioned contract is negotiated may be a withdrawn submission's, and it would suspend the live one.
+        const versioned = markAdmission(taskId, run);
+        requireAdmission(task, versioned, 'Inbox item');
+        if (versioned && task.run_fence > run) throw bad(409, 'This Inbox item belongs to a submission that is no longer current');
         if (task.finish_accepted_at) throw bad(409, 'Finish was accepted; this execution cannot open another Inbox item');
         if (openItem.get(taskId)) throw bad(409, 'This task already has an open Inbox item');
         const id = newId();
@@ -557,8 +598,12 @@ export function openTaskStore(db) {
             ...(task.handoff_evidence && { evidence: JSON.parse(task.handoff_evidence) }) };
         }
         // A finish belongs to one admission. A recovery block withdraws the admission that reported it, so a finish from
-        // that run that is already in flight is refused instead of marking a newer continuation complete.
-        if (admissionRun(run) !== undefined && task.run_fence > run) {
+        // that run that is already in flight is refused instead of marking a newer continuation complete. The report also
+        // records the versioned contract on the row, before acceptance, so a lost dispatch acknowledgement cannot leave a
+        // negotiated execution looking legacy to a later runless result.
+        const versioned = markAdmission(taskId, run);
+        requireAdmission(task, versioned, 'finish');
+        if (versioned && task.run_fence > run) {
           throw bad(409, 'This finish belongs to a submission that is no longer current');
         }
         // A pull request is mandatory evidence for this Task, whatever the rollout mode says about finish enforcement.
@@ -608,8 +653,11 @@ export function openTaskStore(db) {
         // the fence forward, so a settlement that was already in flight when that happened is refused here: the relay is
         // authoritative about which submission is live and does not rely on the worker noticing its own staleness. An
         // accepted finish is exempt, because it is a one-way boundary that no later admission can replace and it still has
-        // to be settled from its own admission.
-        if (admissionRun(run) !== undefined && fencedTask.run_fence > run && !fencedTask.finish_accepted_at) {
+        // to be settled from its own admission. The versioned contract is recorded before the decision, so a settle that
+        // arrives before the dispatch acknowledgement still makes every later runless result attributable.
+        const versioned = markAdmission(taskId, run);
+        requireAdmission(fencedTask, versioned, 'settlement');
+        if (versioned && fencedTask.run_fence > run && !fencedTask.finish_accepted_at) {
           throw bad(409, 'This settlement belongs to a submission that is no longer current');
         }
         // A bare final turn is success only for a genuinely legacy assignment: a row that records no pinned snapshot, no
@@ -673,11 +721,17 @@ export function openTaskStore(db) {
 
     // The durable resume receipt: an item's `delivered_at` records that its response reached the child. A retried
     // delivery checks this first, so a lost acknowledgement never becomes a second delivery or a replacement child.
-    resumeDelivered({ taskId, executionId, itemId, epoch, now = Date.now() }) {
+    resumeDelivered({ taskId, executionId, itemId, epoch, now = Date.now(), run }) {
       return transaction(() => {
         const task = row.get(taskId);
         if (!task || task.execution_id !== executionId) return false;
         if (task.status === 'cancelled') return false;
+        // A delivery that continues the same execution from a newer admission is the same kind of takeover as a dispatch
+        // acknowledgement: recording the run it made current fences out a settlement from the admission it replaced. The
+        // fence only moves forward, so an older report can never reopen a withdrawn admission.
+        if (markAdmission(taskId, run)) {
+          db.prepare('UPDATE tasks SET run_fence=MAX(run_fence,?) WHERE id=?').run(run, taskId);
+        }
         // A fast finish can settle the Task before this report lands; the delivery still happened and is recorded.
         db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND task_id=? AND delivered_at IS NULL`).run(iso(now), itemId, taskId);
         // Clearing the resume slot also returns the Task to a plain execution obligation. The answer has reached the
