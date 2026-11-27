@@ -13,7 +13,7 @@ turn's placed input; no tool accepts an owner, scope, or delivery destination.
 | --- | --- | --- |
 | `create_task` | **Shipped** | Queue one task with a title, task text, optional pinned blueprint (from `inspect_manolo`), and optional `notBefore` ISO time. Returns the Task ID and current status without waiting. A future time makes it Scheduled until due. |
 | `list_tasks` / `get_task` | **Shipped** | List or read this conversation's Tasks, including blueprint, latest progress, the open or answered Inbox item, and the terminal outcome. Filter by state, blueprint, or text. |
-| `cancel_task` | **Shipped** | Cancel a non-terminal Task, close its pending Inbox item, and fence late execution updates. Does not undo external effects. |
+| `cancel_task` | **Shipped** | Cancel a non-terminal Task, close its pending Inbox item, and fence late execution updates. The ledger cancellation and the retried worker stop are reported separately. Does not undo external effects. |
 | `list_blueprints` | **Proposed** | Blueprint discovery stays on `inspect_manolo` for now. |
 | `create_trigger` / `list_triggers` / `disable_trigger` | **Proposed** | No trigger engine ships in this slice. |
 

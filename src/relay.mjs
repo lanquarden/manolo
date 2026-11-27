@@ -700,7 +700,24 @@ async function web(req, res, path, search = '') {
   }
   if (req.method === 'GET' && path === '/api/tasks') {
     if (!workSessionsEnabled(owner.agent)) throw fail(404);
-    return respond(res, 200, { tasks: store.tasks.list(store.webSession(owner.name, owner.agent), {}) });
+    // Active work and History are separate reads: terminal traffic can never crowd active Tasks out of the view, and
+    // History is filtered and paged by the ledger rather than by the browser.
+    const query = new URLSearchParams(search);
+    const status = query.get('status') ?? 'history';
+    if (!['history', 'done', 'failed', 'cancelled'].includes(status)) throw fail(400);
+    const blueprint = query.get('blueprint') ?? undefined;
+    if (blueprint !== undefined && !BLUEPRINT_ID.test(blueprint)) throw fail(400);
+    const text = query.get('text')?.slice(0, 120) || undefined;
+    const cursor = query.get('cursor') ?? undefined;
+    if (cursor !== undefined && !/^[0-9]{1,16}$/.test(cursor)) throw fail(400);
+    const scope = store.webSession(owner.name, owner.agent);
+    const history = store.tasks.history(scope, { status, blueprint, text, cursor });
+    return respond(res, 200, {
+      active: store.tasks.active(scope),
+      history: history.tasks,
+      ...(history.nextCursor && { historyCursor: history.nextCursor }),
+      blueprints: store.tasks.blueprints(scope),
+    });
   }
   const taskDetail = /^\/api\/tasks\/([0-9a-f]{32})$/.exec(path);
   if (req.method === 'GET' && taskDetail) {
@@ -749,10 +766,9 @@ async function web(req, res, path, search = '') {
     if (req.method === 'POST' && taskCancel) {
       if (!workSessionsEnabled(owner.agent)) throw fail(404);
       const result = store.tasks.cancel(store.webSession(owner.name, owner.agent), taskCancel[1]);
-      if (result.executionId) {
-        void workerTaskRequest(owner.agent, `/v1/tasks/${taskCancel[1]}/cancel`, {
-          method: 'POST', body: { executionId: result.executionId },
-        }).catch(() => {});
+      // The ledger cancellation is final; stopping the worker is a durable, retried step reported separately.
+      if (result.stopPending) {
+        void runStop({ id: taskCancel[1], agent: owner.agent, execution_id: result.executionId });
       }
       return respond(res, 200, result.task);
     }
@@ -866,10 +882,8 @@ async function internal(req, res, path) {
       if (!ownFields(body, 'turnId')) throw fail(400);
       const { scope } = taskTurnScope(body.turnId, agent);
       const result = store.tasks.cancel(scope, taskId);
-      if (result.executionId) {
-        void workerTaskRequest(agent, `/v1/tasks/${taskId}/cancel`, {
-          method: 'POST', body: { executionId: result.executionId },
-        }).catch(() => {});
+      if (result.stopPending) {
+        void runStop({ id: taskId, agent, execution_id: result.executionId });
       }
       return respond(res, 200, result.task);
     }
@@ -1060,34 +1074,61 @@ async function runWebTurn(job) {
   }
 }
 
+// Only a well-formed refusal that no retry can fix is definitive. Anything else - a transport error, a 5xx, a timeout,
+// a missing or malformed acknowledgement - is ambiguous and is retried under the same execution identity.
+const DEFINITIVE_START = new Map([
+  ['blueprint_revision_unavailable', 'The pinned blueprint revision is no longer available.'],
+  ['unknown_blueprint', 'The pinned blueprint is no longer configured for this worker.'],
+  ['another_execution_current', 'The worker already has a different execution for this Task.'],
+  ['invalid_task', 'The worker refused the Task assignment as invalid.'],
+]);
+const DEFINITIVE_RESUME = new Set(['unknown_execution', 'no_parked_call']);
+
 // One scheduler pass per Task: a claimed row is either a fresh execution or the delivery of an Inbox response to the
 // parked one. Nothing here starts a second execution while the previous one can still be live.
 async function runTask(task) {
   const executionId = task.execution_id;
-  let result;
-  try {
-    if (task.execution_kind === 'resume') {
-      const item = store.tasks.inboxItem(task.resume_item_id);
-      if (!item) {
-        store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: task.resume_item_id, delivered: false });
-        return;
-      }
+  if (task.execution_kind === 'resume') {
+    const item = store.tasks.inboxItem(task.resume_item_id);
+    if (!item) {
+      store.tasks.resumeUnavailable({
+        taskId: task.id, executionId, itemId: task.resume_item_id,
+        reason: 'The Inbox item for this resume is missing; the Task was stopped.',
+      });
+      return;
+    }
+    // The item's delivery time is the durable resume receipt. A retried delivery reads it instead of calling again.
+    if (item.delivered_at !== null) {
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      return;
+    }
+    let result;
+    try {
       result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/resume`, {
         method: 'POST',
         body: { executionId, itemId: item.id, status: item.status, response: item.response ?? '' },
       });
-      if (result.ok && result.body?.delivered === true) {
-        store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: item.id, delivered: true });
-        return;
-      }
-      if (!result.ok && ![400, 404, 409].includes(result.status)) {
-        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the resume.');
-        return;
-      }
-      // The parked execution is gone. The answer is not lost: a fresh execution carries it in its input.
-      store.tasks.deliveryResult({ taskId: task.id, executionId, itemId: item.id, delivered: false });
+    } catch {
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.');
       return;
     }
+    if (result.ok && result.body?.delivered === true) {
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      return;
+    }
+    if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
+      // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
+      store.tasks.resumeUnavailable({
+        taskId: task.id, executionId, itemId: item.id,
+        reason: 'The execution that asked for your input is no longer available. Your response is saved in the Task.',
+      });
+      return;
+    }
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.');
+    return;
+  }
+  let result;
+  try {
     result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/executions`, {
       method: 'POST',
       body: {
@@ -1103,25 +1144,61 @@ async function runTask(task) {
     store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
     return;
   }
-  if (result.ok) return;
-  if ([400, 404, 409].includes(result.status)) {
-    const reason = result.body?.reason === 'blueprint_revision_unavailable'
-      ? 'The pinned blueprint revision is no longer available.' : `The worker refused this execution (${result.status}).`;
-    store.tasks.failExecution(task.id, executionId, reason);
+  if (result.ok) {
+    store.tasks.ackDispatch(task.id, executionId);
+    return;
+  }
+  if (result.body?.reason === 'task_cancelled') {
+    // The Task was cancelled while the dispatch was in flight; the ledger already decided.
+    store.tasks.ackDispatch(task.id, executionId);
+    return;
+  }
+  const definitive = DEFINITIVE_START.get(result.body?.reason);
+  if (definitive) {
+    store.tasks.failExecution(task.id, executionId, definitive);
     return;
   }
   store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.');
 }
 
+// Cancelling is a ledger decision; this is the separate, retried step that asks the worker to stop. A dispatch that was
+// never sent is already stopped by the cleared pending marker, and a dispatch that races this stop is refused by the
+// worker's cancelled-execution tombstone. Neither step rolls back work already done outside Manolo.
+async function runStop(task) {
+  const executionId = task.execution_id;
+  if (!executionId) {
+    store.tasks.ackStop(task.id);
+    return;
+  }
+  let result;
+  try {
+    result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/cancel`, {
+      method: 'POST', body: { executionId },
+    });
+  } catch {
+    store.tasks.retryStop(task.id);
+    return;
+  }
+  if (result.ok && result.body?.ok === true) {
+    store.tasks.ackStop(task.id);
+    return;
+  }
+  store.tasks.retryStop(task.id);
+}
+
 async function runTasks() {
   while (!stop.signal.aborted) {
+    const now = Date.now();
+    // Snapshot pending work before claiming, so a freshly claimed row is driven once by this pass, not twice.
+    const pending = store.tasks.dueDispatch(now);
+    const stops = store.tasks.dueStop(now);
     const claimed = [];
     for (let slot = 0; slot < 4; slot++) {
-      const task = store.tasks.claim(Date.now());
+      const task = store.tasks.claim(now);
       if (!task) break;
       claimed.push(task);
     }
-    await Promise.all(claimed.map(task => runTask(task)));
+    await Promise.all([...pending.map(runTask), ...claimed.map(runTask), ...stops.map(runStop)]);
     await sleep(300, undefined, { signal: stop.signal });
   }
 }

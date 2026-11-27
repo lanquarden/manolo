@@ -1233,11 +1233,16 @@ const taskProgressList = byId('task-progress');
 const taskTranscriptList = byId('task-transcript');
 const taskOutcome = byId('task-outcome');
 const cancelTaskButton = byId('cancel-task');
-let tasks;
+let activeTasks;
+let historyTasks;
+let historyCursor;
+let taskBlueprints = [];
 let selectedTask;
 let tasksError = '';
 let tasksBlocked = false;
 let tasksRefreshTimer;
+let historyTimer;
+let historyRequest;
 let renderedTreeKey;
 
 function validTaskId(value) {
@@ -1267,6 +1272,9 @@ function taskSummary(raw) {
     failure: typeof raw.failure === 'string' ? raw.failure : undefined,
     progress: typeof raw.progress === 'string' ? raw.progress : undefined,
     inboxItem,
+    // Cancelling the ledger row and stopping the worker are separate facts.
+    stopPending: raw.stopPending === true,
+    stopConfirmedAt: typeof raw.stopConfirmedAt === 'string' ? raw.stopConfirmedAt : undefined,
   };
 }
 
@@ -1289,6 +1297,12 @@ function taskMeta(task) {
     ...(task.progress ? [textNode('span', `Latest: ${task.progress}`, 'plain-text')] : []),
     ...(task.status === 'waiting' && task.inboxItem?.status === 'open'
       ? [textNode('span', task.inboxItem.kind === 'question' ? 'Waiting for your answer' : 'Waiting for your review', 'plain-text')]
+      : []),
+    ...(task.status === 'cancelled'
+      ? [textNode('span', task.stopPending
+        ? 'Worker stop not confirmed yet'
+        : task.stopConfirmedAt ? `Worker stopped ${new Date(task.stopConfirmedAt).toLocaleString()}` : 'Cancelled before dispatch',
+      'plain-text')]
       : []),
     ...(task.outcome ? [textNode('span', `Outcome: ${task.outcome}`, 'plain-text')] : []),
     ...(task.failure ? [textNode('span', `Failed: ${task.failure}`, 'plain-text')] : []),
@@ -1314,7 +1328,7 @@ function taskRow(task) {
 
 function renderTaskTree() {
   const groups = new Map(TASK_GROUPS.map(([id, label]) => [id, { label, byBlueprint: new Map() }]));
-  for (const task of tasks ?? []) {
+  for (const task of activeTasks ?? []) {
     const group = taskGroup(task);
     if (!group) continue;
     const entry = groups.get(group);
@@ -1352,65 +1366,73 @@ function renderTaskTree() {
     const button = [...taskTree.querySelectorAll('button')].find(row => row.dataset.taskId === focused);
     button?.focus();
   }
-  if (sections.length === 0 && tasks) {
+  if (sections.length === 0 && activeTasks) {
     taskTree.append(textNode('p', 'No active tasks.', 'status'));
   }
 }
 
-function taskMatches(task) {
-  const status = taskFilterStatus.value;
-  if (status === 'history' ? !TASK_TERMINAL.has(task.status) : status !== 'all' && task.status !== status) return false;
-  const blueprint = taskFilterBlueprint.value;
-  if (blueprint && blueprintLabel(task) !== blueprint) return false;
-  const text = taskFilterText.value.trim().toLowerCase();
-  if (text && !`${task.title} ${task.progress ?? ''} ${task.outcome ?? ''}`.toLowerCase().includes(text)) return false;
-  return true;
-}
-
 function renderTaskHistory() {
-  const history = (tasks ?? []).filter(task => (TASK_TERMINAL.has(task.status) || taskFilterStatus.value === 'all') && taskMatches(task));
-  taskHistory.replaceChildren(...history.map(taskRow));
-  taskHistoryEmpty.hidden = history.length > 0 || !tasks;
+  const rows = (historyTasks ?? []).map(taskRow);
+  taskHistory.replaceChildren(...rows);
+  byId('task-history-more').hidden = !historyCursor;
+  taskHistoryEmpty.hidden = rows.length > 0 || !historyTasks;
 }
 
 function renderTaskFilters() {
-  const blueprints = [...new Set((tasks ?? []).map(blueprintLabel))].sort();
   const current = taskFilterBlueprint.value;
   const options = [new Option('All', '')];
-  for (const blueprint of blueprints) options.push(new Option(blueprint, blueprint));
+  for (const blueprint of taskBlueprints) options.push(new Option(blueprint, blueprint));
   taskFilterBlueprint.replaceChildren(...options);
-  taskFilterBlueprint.value = blueprints.includes(current) ? current : '';
+  taskFilterBlueprint.value = taskBlueprints.includes(current) ? current : '';
 }
 
 function renderTasks() {
   renderTaskTree();
   renderTaskFilters();
   renderTaskHistory();
-  const message = tasksError || (!tasks ? 'Loading tasks…' : '');
+  const message = tasksError || (!activeTasks ? 'Loading tasks…' : '');
   if (tasksStatus.textContent !== message) tasksStatus.textContent = message;
 }
 
 function scheduleTasksRefresh() {
   clearTimeout(tasksRefreshTimer);
   if (tasksBlocked || tasksPanel.hidden) return;
-  const active = (tasks ?? []).some(task => !TASK_TERMINAL.has(task.status));
-  if (!active) return;
+  if (!(activeTasks ?? []).some(task => !TASK_TERMINAL.has(task.status))) return;
   tasksRefreshTimer = setTimeout(() => {
     if (!tasksPanel.hidden) void refreshTasks();
   }, 4000);
 }
 
-async function refreshTasks() {
+function historyQuery({ append = false } = {}) {
+  const params = new URLSearchParams({ status: taskFilterStatus.value });
+  if (taskFilterBlueprint.value) params.set('blueprint', taskFilterBlueprint.value);
+  const text = taskFilterText.value.trim();
+  if (text) params.set('text', text);
+  if (append && historyCursor) params.set('cursor', historyCursor);
+  return params;
+}
+
+// Active work and History are separate server reads. History is filtered and paged by the ledger, so a long run of
+// terminal Tasks can never push active work out of the view or force the browser to hold every record.
+async function refreshTasks({ append = false } = {}) {
+  const request = Symbol();
+  historyRequest = request;
   try {
-    const result = await api(TASKS_PATH);
-    if (!Array.isArray(result.tasks)) throw new Error('Unexpected task list');
-    tasks = result.tasks.map(taskSummary);
+    const result = await api(`${TASKS_PATH}?${historyQuery({ append })}`);
+    if (historyRequest !== request) return;
+    if (!Array.isArray(result.active) || !Array.isArray(result.history)) throw new Error('Unexpected task list');
+    activeTasks = result.active.map(taskSummary);
+    const page = result.history.map(taskSummary);
+    historyTasks = append ? [...(historyTasks ?? []), ...page] : page;
+    historyCursor = typeof result.historyCursor === 'string' ? result.historyCursor : undefined;
+    taskBlueprints = Array.isArray(result.blueprints) ? result.blueprints.filter(name => typeof name === 'string') : [];
     tasksBlocked = false;
     tasksError = '';
     renderTasks();
     if (selectedTask) void refreshTaskDetail();
     scheduleTasksRefresh();
   } catch (error) {
+    if (historyRequest !== request) return;
     const unavailable = [404, 405, 501].includes(error.status);
     const denied = error.status === 401 || error.status === 403;
     tasksBlocked = unavailable || denied;
@@ -1418,7 +1440,8 @@ async function refreshTasks() {
       : denied ? 'Sign in as an owner and try again.'
       : `${failure(error)} Use “Refresh” to try again.`;
     if (tasksBlocked) {
-      tasks = undefined;
+      activeTasks = undefined;
+      historyTasks = undefined;
       renderedTreeKey = undefined;
       if (selectedTask) clearTaskDetail(tasksError);
     }
@@ -1449,17 +1472,17 @@ async function refreshTaskDetail() {
     const task = taskSummary(raw);
     taskDetailTitle.textContent = task.title;
     taskDetailMeta.replaceChildren(...taskMeta(task));
-    const items = Array.isArray(raw.items) ? raw.items : [];
-    const latest = items.at(-1);
-    if (latest && validTaskId(latest.id)) {
+    // The ledger names the item the owner should act on: the newest open item, else the newest item.
+    const active = raw.activeItem && validTaskId(raw.activeItem.id) ? raw.activeItem : undefined;
+    if (active) {
       taskDetailInbox.hidden = false;
-      taskDetailInboxBody.textContent = `${latest.kind === 'question' ? 'Question' : 'Report'} · ${latest.status}: ${latest.prompt}`;
+      taskDetailInboxBody.textContent = `${active.kind === 'question' ? 'Question' : 'Report'} · ${active.status}: ${active.prompt}`;
       taskDetailInboxForm.replaceChildren();
-      if (latest.status === 'open') {
-        taskDetailInboxForm.append(taskItemForm({ id: latest.id, taskId: task.id, taskTitle: task.title, kind: latest.kind, prompt: latest.prompt },
+      if (active.status === 'open') {
+        taskDetailInboxForm.append(taskItemForm({ id: active.id, taskId: task.id, taskTitle: task.title, kind: active.kind, prompt: active.prompt },
           message => { taskDetailStatus.textContent = message; }));
-      } else if (typeof latest.response === 'string') {
-        taskDetailInboxForm.append(textNode('p', `Your response: ${latest.response}`, 'plain-text'));
+      } else if (typeof active.response === 'string') {
+        taskDetailInboxForm.append(textNode('p', `Your response: ${active.response}`, 'plain-text'));
       }
     } else {
       taskDetailInbox.hidden = true;
@@ -1493,18 +1516,14 @@ async function refreshTaskDetail() {
   }
 }
 
+// A notice can name a Task that is no longer on the first History page, so the detail is fetched by ID, not by lookup.
 async function openTaskById(id) {
-  if (!tasks) await refreshTasks();
-  const task = (tasks ?? []).find(entry => entry.id === id);
+  if (!validTaskId(id)) return;
   if (tasksPanel.hidden) showTab(tasksTab);
-  if (!task) {
-    tasksStatus.textContent = 'That task is not in recent history.';
-    return;
-  }
-  selectedTask = task.id;
+  selectedTask = id;
   tasksListView.hidden = true;
   taskDetail.hidden = false;
-  taskDetailTitle.textContent = task.title;
+  taskDetailTitle.textContent = 'Task';
   taskDetailTitle.focus();
   await refreshTaskDetail();
 }
@@ -1520,9 +1539,14 @@ byId('refresh-tasks').addEventListener('click', () => {
   tasksError = '';
   void refreshTasks();
 });
-taskFilterStatus.addEventListener('change', renderTaskHistory);
-taskFilterBlueprint.addEventListener('change', renderTaskHistory);
-taskFilterText.addEventListener('input', renderTaskHistory);
+byId('task-history-more').addEventListener('click', () => void refreshTasks({ append: true }));
+taskFilterStatus.addEventListener('change', () => void refreshTasks());
+taskFilterBlueprint.addEventListener('change', () => void refreshTasks());
+taskFilterText.addEventListener('input', () => {
+  // Server-side text filtering, debounced so typing does not issue a request per keystroke.
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(() => void refreshTasks(), 250);
+});
 cancelTaskButton.addEventListener('click', async () => {
   const id = selectedTask;
   if (!id || cancelTaskButton.disabled) return;
@@ -1530,8 +1554,10 @@ cancelTaskButton.addEventListener('click', async () => {
   cancelTaskButton.disabled = true;
   taskDetailStatus.textContent = 'Cancelling…';
   try {
-    await api(`${TASKS_PATH}/${encodeURIComponent(id)}/cancel`, 'POST', {});
-    taskDetailStatus.textContent = 'Task cancelled.';
+    const result = await api(`${TASKS_PATH}/${encodeURIComponent(id)}/cancel`, 'POST', {});
+    taskDetailStatus.textContent = result?.stopPending
+      ? 'Task cancelled. The worker stop is not confirmed yet; it is retried and shown in the Task.'
+      : 'Task cancelled.';
     await refreshTasks();
     if (selectedTask === id) await refreshTaskDetail();
     void refreshTaskNotices();

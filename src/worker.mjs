@@ -550,7 +550,7 @@ function httpWorker(turns, workSessions, tasks, token, mcp, capabilities) {
           if (action === 'cancel') return reply(res, 200, await tasks.cancel({ taskId, executionId }));
         } catch (error) {
           if (error instanceof RequestError) throw error;
-          const status = [400, 404, 409].includes(error.status) ? error.status : 500;
+          const status = [400, 404, 409, 503].includes(error.status) ? error.status : 500;
           return reply(res, status, { error: 'task request rejected', ...(error.reason && { reason: error.reason }) });
         }
         throw new RequestError(404, 'not found');

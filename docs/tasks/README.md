@@ -54,9 +54,10 @@ One durable path, end to end, for flagged web conversations. Everything below is
    and posts to the relay with a replay-stable operation key. The relay stores one `queued` row with the pinned
    blueprint revision, an optional not-before time, and the originating client turn ID. It returns the Task ID without
    waiting for execution.
-2. The relay scheduler claims one eligible `queued` row at a time, mints an execution ID in the same transaction, and
-   dispatches it to the worker. A retry of that dispatch keeps the execution ID, so the worker admits the same child
-   submission rather than a second one.
+2. The relay scheduler claims one eligible `queued` row at a time and records a **durable pending dispatch** with the
+   execution ID in the same transaction. It then calls the worker. A retry, including one after a relay restart, keeps
+   both IDs, so the worker admits the same child submission rather than a second one; an acknowledged dispatch is never
+   re-driven.
 3. The worker creates one ownerless child conversation, applies the pinned blueprint (refusing a revision it no longer
    has), and admits the task input. The child has only `report_progress` and `post_inbox` on top of its normal pod tools.
 4. `post_inbox` writes the item and parks the Task in one relay transaction: the Task becomes `waiting`, its claim is
@@ -68,8 +69,12 @@ One durable path, end to end, for flagged web conversations. Everything below is
    receipt, a conflicting one is refused, and no chat turn is inserted. The scheduler claims it and delivers the
    response to the parked call by execution ID. The run continues in the same child conversation, and its final message
    settles the Task.
-6. If the parked call is gone (for example a worker volume was lost), the delivery reports `no_parked_call`, the relay
-   queues a fresh execution, and the response travels in the child input instead of being lost.
+6. If the parked call is definitively gone (the worker reports `no_parked_call` or `unknown_execution`), the relay does
+   **not** launch a replacement child. The Task ends `failed` with a clear reason and the owner's response stays recorded
+   on the item, so nothing is silently re-run. A delivery that is only ambiguous — a timeout, a 5xx, a missing or
+   malformed acknowledgement, or a retry after the worker cleared its park marker — is retried under the same execution
+   and item IDs. The worker keeps a durable resume receipt, so a replay is answered from the receipt rather than judged a
+   missing execution.
 7. Every Task event (waiting, response, outcome) is a durable notice scoped to the originating conversation. The chat
    shows them as recorded notices, and the next orchestrator turn receives undelivered ones as data in its instructions,
    once. `list_tasks` and `get_task` remain the authoritative read path; the model never polls to learn that input is
@@ -78,16 +83,25 @@ One durable path, end to end, for flagged web conversations. Everything below is
 ### Atomic boundaries
 
 - **Task creation:** one insert with its operation receipt.
-- **Claim:** `queued → running` with the execution ID in one transaction, so a Task is never claimed twice and a
-  dispatch retry cannot mint a second execution.
-- **Park:** item insert, `waiting` transition, claim release, and notice in one transaction. A replayed park returns the
-  same item; a second open item is refused.
+- **Claim:** `queued → running` with the execution ID and `dispatch_pending` in one transaction, so a Task is never
+  claimed twice, a dispatch retry cannot mint a second execution, and a claim committed just before a crash is re-driven
+  after a restart with the same IDs.
+- **Park:** item insert, `waiting` transition, claim release, pending-dispatch clear, and notice in one transaction. A
+  replayed park returns the same item; a second open item is refused.
 - **Response:** item close, stored response, `queued` resume transition, and notice in one transaction. Retries are
   receipts; conflicts are refused.
-- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID.
+- **Resume delivery:** the item's `delivered_at` is the durable receipt, written with the delivery acknowledgement; a
+  settle after a resume also records it. The worker keeps its own receipt in the execution record.
+- **Settle and cancel:** a terminal transition with its notice, fenced by the current execution ID. A valid finish that
+  lands while a dispatch or resume acknowledgement is still owed is accepted instead of being rejected.
+- **Cancellation:** the ledger transition and the worker stop are separate facts. `stop_pending` is retried with a
+  backoff and `stop_confirmed_at` records the confirmation; until then the Task reports the stop as unconfirmed. A
+  pending dispatch is cleared, so a dispatch that has not been sent is never sent, and the worker writes a cancelled
+  tombstone so a dispatch that races the stop is refused. Cancellation stops further progression; it does not undo work
+  already done outside Manolo.
 
-Everything else is at-least-once and idempotent by operation key: dispatch, resume delivery, progress, settle, and the
-next-turn notice exposure. Delivery is not exactly-once transport.
+Everything else is at-least-once and idempotent by operation key: dispatch, resume delivery, progress, settle, stop, and
+the next-turn notice exposure. Delivery is not exactly-once transport.
 
 ### Rollout and reversal
 
@@ -109,7 +123,8 @@ Not implemented in this slice, and not implied by the UI:
 - Recurring schedules and event Triggers, occurrence admission keys, and catch-up/DST policy.
 - Dependencies between Tasks, fork/auto follow-up creation, and the proposed `propose_follow_up` tool.
 - Multiple concurrent executions of one Task, lease-based recovery of a lost worker (a Task whose worker never returns
-  stays `running` until the owner cancels it), and graph-wide cycle handling.
+  stays `running` until the owner cancels it; a stop that never confirms stays visibly unconfirmed), and graph-wide cycle
+  handling. There is deliberately no replacement child for Inbox input: a definitively lost execution fails the Task.
 - Declined-item policy beyond "the child is told the item was declined and continues".
 - Migrating legacy work sessions into Tasks.
 
@@ -157,7 +172,7 @@ installed elsewhere):
 | Task waits for a web Inbox answer/review and resumes by Task ID | **Shipped.** `post_inbox` parks the child execution; the web response queues the same Task and resumes the same child conversation by execution ID. The legacy parent question still queues a continuation turn in the original chat. | [`post_inbox`](../../src/task-tools.mjs#L230), [`respond`](../../src/task-store.mjs#L355), [`resume`](../../src/task-tools.mjs#L432) |
 | Messaging Orchestrator relays the Task's Inbox item in the originating thread | **Missing.** Message jobs deliver ordinary replies; Task notices reach the web conversation only. | [`src/relay.mjs`](../../src/relay.mjs#L973) |
 | Task scheduler gates claims, applies dependencies, cancels work, admits triggers | **Partial.** Claims, not-before eligibility, one execution at a time, fencing and cancellation ship. Dependencies and triggers do not. | [`claim`](../../src/task-store.mjs#L243), [`runTask`](../../src/relay.mjs#L1065) |
-| Tasks view groups work by blueprint with execution history | **Shipped** as an additive tab: Scheduled/Queued/Running/Waiting for input, blueprint subgroups, History filters, Task detail with progress, Inbox item, transcript and outcome. Sessions stays for legacy work. | [`src/web/app.js`](../../src/web/app.js#L1315), [`src/web/index.html`](../../src/web/index.html) |
+| Tasks view groups work by blueprint with execution history | **Shipped** as an additive tab: Scheduled/Queued/Running/Waiting for input, blueprint subgroups, and a History page that the ledger filters and pages by status, blueprint and text. Task detail shows the newest open item first, progress, transcript, outcome, and whether the worker stop is confirmed. Sessions stays for legacy work. | [`src/web/app.js`](../../src/web/app.js#L1315), [`src/web/index.html`](../../src/web/index.html) |
 | Task outcome reaches the conversation without model polling | **Shipped** as durable notices in chat plus one-shot exposure in the next orchestrator turn. No proactive model turn is started, so a conversation with no later turn sees the notice only in the UI. | [`notices`](../../src/task-store.mjs#L434), [`runWebTurn`](../../src/relay.mjs#L1024), [`refreshTaskNotices`](../../src/web/app.js#L1632) |
 
 `npm test` passes on this checkout, including the fixture relay/worker flow, the ledger unit test, and the Chromium

@@ -255,6 +255,8 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
           const record = await runDoc(api, tx);
           delete record.yielded;
           delete record.itemId;
+          // Durable proof that this execution consumed the item, kept after the park marker is cleared.
+          record.resumedItem = itemId;
           record.state = 'running';
         }, ctx);
         return toolResult(value.status === 'declined'
@@ -319,7 +321,8 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
   async function finish(taskId, executionId, state, summary) {
     await harness.commit(async tx => {
       const execution = await tx.doc(TaskExecution, taskId, null);
-      if (execution.executionId === executionId) {
+      // A cancellation is a tombstone: the aborted run settling afterwards must not relabel it.
+      if (execution.executionId === executionId && execution.state !== 'cancelled') {
         execution.state = state;
         execution.result = summary;
       }
@@ -382,12 +385,14 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
       if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
       return { status: existing.state ?? 'running' };
     }
-    if (existing?.state === 'parked') {
-      // The relay only starts a fresh execution when it could not deliver a response to the parked call. The parked
-      // run holds no process, so abandoning it here is safe and keeps the Task recoverable.
-      await cancel({ taskId, executionId: existing.executionId });
-    } else if (existing && existing.state === 'running') {
-      throw Object.assign(new Error('Another execution is current'), { status: 409 });
+    if (existing?.state === 'cancelled') {
+      // The relay cancelled this Task before this dispatch arrived. Never start work for it.
+      throw Object.assign(new Error('Task is cancelled'), { status: 409, reason: 'task_cancelled' });
+    }
+    if (existing && ['running', 'parked'].includes(existing.state)) {
+      // One Task has one execution identity. A different one here means a stale or conflicting dispatch, and replacing
+      // the live execution would duplicate work.
+      throw Object.assign(new Error('Another execution is current'), { status: 409, reason: 'another_execution_current' });
     }
     let blueprint;
     try {
@@ -429,46 +434,71 @@ export function installTasks(registry, { cfg, model, thinkingLevel, Turns, redac
     return { status: 'running' };
   }
 
+  // Record the delivery in the execution's own durable receipt before reporting it, so a replay after the park marker is
+  // cleared, or after a lost acknowledgement, is answered from the receipt instead of being judged a missing execution.
+  async function recordDelivery(taskId, executionId, itemId) {
+    await harness.commit(async tx => {
+      const record = await tx.doc(TaskExecution, taskId, null);
+      if (record.executionId !== executionId || record.state === 'cancelled') return;
+      const delivered = (record.deliveredItems ?? []).filter(id => id !== itemId);
+      record.deliveredItems = [...delivered, itemId].slice(-10);
+      record.state = 'running';
+    }, context);
+  }
+
   async function resume({ taskId, executionId, itemId, status, response }) {
     if (!ID.test(taskId) || !EXECUTION_ID.test(executionId) || !ID.test(itemId)) {
       throw Object.assign(new Error('Invalid resume'), { status: 400 });
     }
     const execution = await harness.snapshot(TaskExecution, taskId, context);
-    if (!execution || execution.executionId !== executionId || !execution.conversationId) {
-      return { delivered: false, reason: 'unknown_execution' };
-    }
+    if (!execution || execution.executionId !== executionId) return { delivered: false, reason: 'unknown_execution' };
+    if (execution.state === 'cancelled') return { delivered: false, reason: 'no_parked_call' };
+    if ((execution.deliveredItems ?? []).includes(itemId)) return { delivered: true, replay: true };
+    if (!execution.conversationId) return { delivered: false, reason: 'unknown_execution' };
     const run = await harness.snapshot(TaskRun, execution.conversationId, context);
-    const toolTaskId = run?.yielded;
+    if (!run) return { delivered: false, reason: 'unknown_execution' };
+    if (run.resumedItem === itemId) {
+      // The child already consumed this item; the acknowledgement was lost. This is a delivery, not a missing call.
+      await recordDelivery(taskId, executionId, itemId);
+      return { delivered: true, replay: true };
+    }
+    const toolTaskId = run.yielded;
     if (!toolTaskId || run.itemId !== itemId) return { delivered: false, reason: 'no_parked_call' };
     const value = status === 'declined' ? { status: 'declined' } : { status: 'answered', response: boundedPlain(String(response ?? ''), MAX_TASK) };
     let result;
     try {
       result = await harness.signal(toolTaskId, TaskInboxResponse, itemId, value, context);
     } catch {
-      return { delivered: false, reason: 'signal_failed' };
+      // Unknown outcome: the relay retries the same delivery under the same IDs rather than replacing the execution.
+      throw Object.assign(new Error('Resume outcome unknown'), { status: 503 });
     }
     if (result === 'delivered' || result === 'duplicate') {
-      await harness.commit(async tx => {
-        const record = await tx.doc(TaskExecution, taskId, null);
-        if (record.executionId === executionId) record.state = 'running';
-      }, context);
+      await recordDelivery(taskId, executionId, itemId);
       return { delivered: true };
     }
-    return { delivered: false, reason: result };
+    // The signal was refused. The child may have consumed it just before this call, so check the durable marker once.
+    const after = await harness.snapshot(TaskRun, execution.conversationId, context);
+    if (after?.resumedItem === itemId) {
+      await recordDelivery(taskId, executionId, itemId);
+      return { delivered: true, replay: true };
+    }
+    return { delivered: false, reason: result === 'closed' || result === 'not_found' ? 'no_parked_call' : result };
   }
 
   async function cancel({ taskId, executionId }) {
     const execution = await harness.snapshot(TaskExecution, taskId, context);
-    if (!execution) return { ok: true };
-    if (executionId && execution.executionId !== executionId) return { ok: true };
-    const conversation = execution.conversationId && await harness.conversation(execution.conversationId, context);
+    if (execution && executionId && execution.executionId !== executionId) return { ok: true };
+    const conversation = execution?.conversationId && await harness.conversation(execution.conversationId, context);
     // Stop the run and any parked call: a cancelled Task must not keep working on its own.
     await conversation?.abort(context).catch(() => {});
     await harness.commit(async tx => {
       const record = await tx.doc(TaskExecution, taskId, null);
-      if (!executionId || record.executionId === executionId) record.state = 'cancelled';
-      const run = execution.conversationId && await tx.doc(TaskRun, execution.conversationId, null);
-      if (run && run.executionId === execution.executionId) run.state = 'cancelled';
+      // Also a tombstone when the dispatch never arrived: a dispatch that lands after this stop is refused.
+      record.state = 'cancelled';
+      if (execution?.conversationId) {
+        const run = await tx.doc(TaskRun, execution.conversationId, null);
+        if (run.executionId === execution.executionId) run.state = 'cancelled';
+      }
     }, context);
     return { ok: true };
   }

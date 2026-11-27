@@ -430,6 +430,8 @@ body.login-page {
 .task-transcript strong { color: var(--muted); font-size: .82rem; }
 #task-outcome:empty { display: none; }
 #cancel-task { justify-self: start; }
+#task-history-more { margin-top: .7rem; }
+#task-history-more[hidden] { display: none; }
 .task-notices { display: grid; gap: .4rem; margin: .8rem 0 0; padding: 0; list-style: none; }
 .task-notices:empty { display: none; }
 .task-notice { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .7rem; padding: .5rem .8rem; border: 1px dashed var(--line); border-radius: .6rem; color: var(--muted); font-size: .84rem; }

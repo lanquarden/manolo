@@ -16,6 +16,9 @@ const MAX_ITEMS = 20;
 const MAX_PROGRESS = 50;
 const MAX_NOTICES = 8;
 const MAX_DISPATCH_ATTEMPTS = 12;
+const MAX_STOP_ATTEMPTS = 60;
+const HISTORY_PAGE = 25;
+const ACTIVE_LIMIT = 100;
 const unsafe = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/gu;
 
 const bad = (statusCode, message) => Object.assign(new Error(message), { statusCode });
@@ -45,20 +48,30 @@ export function taskView(row, now = Date.now()) {
     ...(row.failure && { failure: row.failure }),
     ...(row.heartbeat_at && { heartbeatAt: iso(row.heartbeat_at) }),
     ...(row.status === 'running' && { executionId: row.execution_id }),
+    // Cancelling is a ledger decision; stopping the worker is a separate, retried step.
+    ...(row.status === 'cancelled' && { stopPending: row.stop_pending === 1 }),
+    ...(row.stop_confirmed_at && { stopConfirmedAt: row.stop_confirmed_at }),
   };
 }
 
+const itemView = item => ({
+  id: item.id, kind: item.kind, prompt: item.prompt, status: item.status,
+  ...(item.response !== null && { response: item.response }),
+  ...(item.responded_at && { respondedAt: item.responded_at }),
+  ...(item.delivered_at && { deliveredAt: item.delivered_at }),
+  createdAt: item.created_at,
+});
+
 function detailView(row, items, progress, now) {
+  const views = items.map(itemView);
+  // Items arrive newest first. The active item is the newest open one, so a Task that paused twice shows the item the
+  // owner can still act on; otherwise it is the newest item, answered, declined or cancelled.
+  const active = views.find(item => item.status === 'open') ?? views[0];
   return {
     ...taskView(row, now),
     input: row.input,
-    items: items.map(item => ({
-      id: item.id, kind: item.kind, prompt: item.prompt, status: item.status,
-      ...(item.response !== null && { response: item.response }),
-      ...(item.responded_at && { respondedAt: item.responded_at }),
-      ...(item.delivered_at && { deliveredAt: item.delivered_at }),
-      createdAt: item.created_at,
-    })),
+    items: views,
+    ...(active && { activeItem: active }),
     progress: progress.map(note => ({ note: note.note, at: note.created_at })),
   };
 }
@@ -85,6 +98,11 @@ export function openTaskStore(db) {
       heartbeat_at INTEGER,
       dispatch_attempts INTEGER NOT NULL DEFAULT 0,
       next_at INTEGER NOT NULL DEFAULT 0,
+      dispatch_pending INTEGER NOT NULL DEFAULT 0,
+      stop_pending INTEGER NOT NULL DEFAULT 0,
+      stop_attempts INTEGER NOT NULL DEFAULT 0,
+      stop_next_at INTEGER NOT NULL DEFAULT 0,
+      stop_confirmed_at TEXT,
       outcome TEXT,
       failure TEXT,
       created_at TEXT NOT NULL,
@@ -133,6 +151,25 @@ export function openTaskStore(db) {
     CREATE INDEX IF NOT EXISTS task_events_scope ON task_events(scope, delivered_at, seq);
   `);
 
+  // A relay database from the first slice keeps its Tasks: add the delivery and stop bookkeeping in place.
+  const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map(column => column.name));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const [name, definition] of [
+      ['dispatch_pending', 'INTEGER NOT NULL DEFAULT 0'],
+      ['stop_pending', 'INTEGER NOT NULL DEFAULT 0'],
+      ['stop_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+      ['stop_next_at', 'INTEGER NOT NULL DEFAULT 0'],
+      ['stop_confirmed_at', 'TEXT'],
+    ]) {
+      if (!taskColumns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
   const row = db.prepare('SELECT * FROM tasks WHERE id=?');
   const scoped = db.prepare('SELECT * FROM tasks WHERE id=? AND scope=?');
   const itemList = db.prepare('SELECT *, rowid AS seqrowid FROM task_inbox_items WHERE task_id=? ORDER BY rowid DESC LIMIT ?');
@@ -145,7 +182,31 @@ export function openTaskStore(db) {
   const openItem = db.prepare(`SELECT * FROM task_inbox_items WHERE task_id=? AND status='open'`);
   const item = db.prepare('SELECT * FROM task_inbox_items WHERE id=?');
   const setStatus = db.prepare(`UPDATE tasks SET status=?, execution_kind=?, resume_item_id=?, context=?, claim_at=?, heartbeat_at=?,
-    next_at=?, updated_at=? WHERE id=?`);
+    next_at=?, dispatch_pending=0, updated_at=? WHERE id=?`);
+
+  const ACTIVE_STATES = ['queued', 'running', 'waiting'];
+  const HISTORY_STATES = ['done', 'failed', 'cancelled'];
+  const summary = (task, now) => ({
+    ...taskView(task, now),
+    ...(lastProgress.get(task.id) && { progress: lastProgress.get(task.id).note }),
+    ...(lastItem.get(task.id) && { inboxItem: lastItem.get(task.id) }),
+  });
+
+  // `order` is a code literal, never caller input. `before` is a rowid keyset for History paging.
+  function taskQuery(scope, { status, blueprint, text, limit = MAX_LIST, before, order = 'rowid DESC' }) {
+    const filters = ['scope=?'];
+    const values = [scope];
+    if (status === 'active') filters.push(`status IN ('queued','running','waiting')`);
+    else if (status === 'history') filters.push(`status IN ('done','failed','cancelled')`);
+    else if (TASK_STATUSES.includes(status)) { filters.push('status=?'); values.push(status); }
+    if (blueprint) { filters.push('blueprint_id=?'); values.push(blueprint); }
+    if (text) { filters.push('(title LIKE ? OR input LIKE ?)'); values.push(`%${text}%`, `%${text}%`); }
+    if (before !== undefined) { filters.push('rowid<?'); values.push(before); }
+    return {
+      sql: `SELECT *, rowid AS seqrowid FROM tasks WHERE ${filters.join(' AND ')} ORDER BY ${order} LIMIT ?`,
+      values: [...values, Math.min(Math.max(limit, 1), MAX_LIST)],
+    };
+  }
 
   function transaction(run) {
     db.exec('BEGIN IMMEDIATE');
@@ -171,14 +232,19 @@ export function openTaskStore(db) {
     return value;
   }
 
-  // The current execution is the only writer allowed to change a non-terminal Task. A stale execution, a cancelled
-  // Task, or one that already yielded gets a conflict and changes nothing.
-  function fenced(taskId, executionId) {
+  // The current execution is the only writer allowed to change a non-terminal Task. The Task stays `running` while the
+  // relay retries an unacknowledged dispatch or resume, so a valid write from that same execution is accepted instead of
+  // being rejected by a transient delivery state. A yielded Task (`waiting`) still refuses progress and new items, and a
+  // stale execution or a terminal Task always conflicts. `allowQueued` is for a settle that legitimately lands while a
+  // response is queued for the same execution, before the scheduler claims it again.
+  function fenced(taskId, executionId, { allowQueued = false } = {}) {
     const task = row.get(taskId);
     if (!task) throw bad(404, 'Task not found');
     if (TERMINAL.has(task.status)) throw bad(409, 'Task is already terminal');
-    if (task.status !== 'running' || task.execution_id !== executionId) throw bad(409, 'Execution is no longer current');
-    return task;
+    if (task.execution_id !== executionId) throw bad(409, 'Execution is no longer current');
+    if (task.status === 'running') return task;
+    if (allowQueued && task.status === 'queued') return task;
+    throw bad(409, 'Execution is not running');
   }
 
   return {
@@ -205,21 +271,32 @@ export function openTaskStore(db) {
       });
     },
 
+    // The Orchestrator's own read. The web view uses active() and history() so terminal traffic can never crowd out
+    // active work and History can page without loading everything.
     list(scope, { status, blueprint, text, limit = MAX_LIST } = {}, now = Date.now()) {
-      const filters = ['scope=?'];
-      const values = [scope];
-      if (status === 'active') filters.push(`status IN ('queued','running','waiting')`);
-      else if (status === 'history') filters.push(`status IN ('done','failed','cancelled')`);
-      else if (TASK_STATUSES.includes(status)) { filters.push('status=?'); values.push(status); }
-      if (blueprint) { filters.push('blueprint_id=?'); values.push(blueprint); }
-      if (text) { filters.push('(title LIKE ? OR input LIKE ?)'); values.push(`%${text}%`, `%${text}%`); }
-      const rows = db.prepare(`SELECT * FROM tasks WHERE ${filters.join(' AND ')} ORDER BY created_at DESC, rowid DESC LIMIT ?`)
-        .all(...values, Math.min(Math.max(limit, 1), MAX_LIST));
-      return rows.map(task => ({
-        ...taskView(task, now),
-        ...(lastProgress.get(task.id) && { progress: lastProgress.get(task.id).note }),
-        ...(lastItem.get(task.id) && { inboxItem: lastItem.get(task.id) }),
-      }));
+      const query = taskQuery(scope, { status, blueprint, text, limit, order: 'created_at DESC, rowid DESC' });
+      return db.prepare(query.sql).all(...query.values).map(task => summary(task, now));
+    },
+
+    active(scope, now = Date.now()) {
+      const query = taskQuery(scope, { status: 'active', limit: ACTIVE_LIMIT, order: 'rowid DESC' });
+      return db.prepare(query.sql).all(...query.values).map(task => summary(task, now));
+    },
+
+    history(scope, { status = 'history', blueprint, text, cursor, limit = HISTORY_PAGE } = {}, now = Date.now()) {
+      const before = typeof cursor === 'string' && /^[0-9]{1,16}$/.test(cursor) ? Number(cursor) : undefined;
+      const query = taskQuery(scope, { status, blueprint, text, limit, before, order: 'rowid DESC' });
+      const rows = db.prepare(query.sql).all(...query.values);
+      const last = rows.at(-1)?.seqrowid;
+      return {
+        tasks: rows.map(task => summary(task, now)),
+        ...(rows.length === Math.min(Math.max(limit, 1), MAX_LIST) && last !== undefined ? { nextCursor: String(last) } : {}),
+      };
+    },
+
+    blueprints(scope) {
+      return db.prepare(`SELECT DISTINCT blueprint_id FROM tasks WHERE scope=? AND blueprint_id IS NOT NULL
+        ORDER BY blueprint_id LIMIT 32`).all(scope).map(row => row.blueprint_id);
     },
 
     get(scope, id, now = Date.now()) {
@@ -248,15 +325,18 @@ export function openTaskStore(db) {
         // A retry of a dispatch that may already have reached the worker keeps its execution identity, so the worker
         // admits the same child submission instead of starting a second one. Only a Task without one mints a new ID.
         const executionId = next.execution_id ?? newId();
+        // `dispatch_pending` is the durable marker that an outbound RPC is owed for this execution identity. It survives
+        // a relay restart, so a claim committed just before a crash is re-driven with the same IDs instead of being lost.
         const changed = db.prepare(`UPDATE tasks SET status='running', execution_id=?, claim_at=?, heartbeat_at=?, next_at=0,
-          updated_at=? WHERE id=? AND status='queued' AND not_before<=?`).run(executionId, now, now, iso(now), next.id, now);
+          dispatch_pending=1, dispatch_attempts=0, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
+          .run(executionId, now, now, iso(now), next.id, now);
         if (changed.changes !== 1) return undefined;
         return row.get(next.id);
       });
     },
 
-    // A dispatch the worker did not accept goes back to the queue with a backoff. The execution identity is kept, so a
-    // later claim of a `start` Task would mint a new one only if it never reached the worker at all.
+    // An unacknowledged dispatch or resume keeps the Task running with the same execution identity and stays pending.
+    // It is retried after a backoff; nothing about the execution is replaced.
     retryDispatch(taskId, executionId, now, reason = null) {
       return transaction(() => {
         const task = row.get(taskId);
@@ -264,15 +344,28 @@ export function openTaskStore(db) {
         const attempts = task.dispatch_attempts + 1;
         if (attempts > MAX_DISPATCH_ATTEMPTS) {
           db.prepare(`UPDATE tasks SET status='failed', failure=?, outcome=NULL, execution_kind='start', resume_item_id=NULL,
-            context=NULL, claim_at=NULL, updated_at=? WHERE id=?`).run(
+            context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`).run(
             plain(reason ?? 'The worker did not accept the execution.', MAX_NOTE), iso(now), taskId);
           addEvent.run(taskId, task.scope, 'outcome', `Task “${task.title}” failed.`, iso(now));
           return 'failed';
         }
-        db.prepare(`UPDATE tasks SET status='queued', dispatch_attempts=?, next_at=?, claim_at=NULL, updated_at=? WHERE id=?`)
+        db.prepare(`UPDATE tasks SET dispatch_pending=1, dispatch_attempts=?, next_at=?, updated_at=? WHERE id=?`)
           .run(attempts, now + delay(attempts), iso(now), taskId);
-        return 'queued';
+        return 'pending';
       });
+    },
+
+    // A running Task whose outbound RPC is owed and due: a dispatch, or the delivery of an Inbox response.
+    dueDispatch(now, limit = 4) {
+      return db.prepare(`SELECT * FROM tasks WHERE status='running' AND dispatch_pending=1 AND next_at<=?
+        ORDER BY claim_at, rowid LIMIT ?`).all(now, Math.min(Math.max(limit, 1), 16));
+    },
+
+    // The worker accepted the RPC. A later restart must not re-drive acknowledged work.
+    ackDispatch(taskId, executionId, now = Date.now()) {
+      const changed = db.prepare(`UPDATE tasks SET dispatch_pending=0, dispatch_attempts=0, next_at=0, updated_at=?
+        WHERE id=? AND execution_id=? AND status='running' AND dispatch_pending=1`).run(iso(now), taskId, executionId);
+      return changed.changes === 1;
     },
 
     park({ taskId, executionId, kind, prompt, key, now = Date.now() }) {
@@ -318,7 +411,7 @@ export function openTaskStore(db) {
         const task = row.get(taskId);
         if (!task || task.status !== 'running' || task.execution_id !== executionId) return false;
         db.prepare(`UPDATE tasks SET status='failed', outcome=NULL, failure=?, execution_kind='start', resume_item_id=NULL,
-          context=NULL, claim_at=NULL, updated_at=? WHERE id=?`).run(plain(reason, MAX_NOTE), iso(now), taskId);
+          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`).run(plain(reason, MAX_NOTE), iso(now), taskId);
         addEvent.run(taskId, task.scope, 'outcome', `Task “${task.title}” failed.`, iso(now));
         return true;
       });
@@ -337,10 +430,15 @@ export function openTaskStore(db) {
       return transaction(() => {
         const previous = receipt(key, taskId, 'settle');
         if (previous) return previous;
-        const task = fenced(taskId, executionId);
+        const task = fenced(taskId, executionId, { allowQueued: true });
         if (!['done', 'failed'].includes(outcome)) throw bad(400, 'Invalid outcome');
+        // A settle after a resume proves the child consumed the response, even when the resume acknowledgement was lost.
+        if (task.resume_item_id) {
+          db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`)
+            .run(iso(now), task.resume_item_id);
+        }
         db.prepare(`UPDATE tasks SET status=?, outcome=?, failure=?, execution_kind='start', resume_item_id=NULL, context=NULL,
-          claim_at=NULL, next_at=0, updated_at=? WHERE id=?`)
+          claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
           .run(outcome, outcome === 'done' ? plain(summary, MAX_SUMMARY) : null,
             outcome === 'failed' ? plain(summary, MAX_SUMMARY) : null, iso(now), taskId);
         addEvent.run(taskId, task.scope, 'outcome',
@@ -375,33 +473,44 @@ export function openTaskStore(db) {
           ? `The owner declined the ${record.kind} “${record.prompt}”. Continue without that input, or finish and explain what is blocked.`
           : `The owner answered the ${record.kind} “${record.prompt}”:\n${response}`;
         db.prepare(`UPDATE tasks SET status='queued', execution_kind='resume', resume_item_id=?, context=?, next_at=0,
-          updated_at=? WHERE id=?`).run(itemId, plain(context, MAX_CONTEXT), iso(now), task.id);
+          dispatch_pending=0, updated_at=? WHERE id=?`).run(itemId, plain(context, MAX_CONTEXT), iso(now), task.id);
         addEvent.run(task.id, task.scope, 'response',
           `Task “${task.title}” received your ${status === 'declined' ? 'decline' : 'answer'} and is queued to resume.`, iso(now));
         return receiptFor();
       });
     },
 
-    // The worker delivers the response to the parked call. A failed delivery means the parked execution is gone, so the
-    // Task is queued for a fresh execution that carries the response in its input instead of losing the answer.
-    deliveryResult({ taskId, executionId, itemId, delivered, now = Date.now() }) {
+    // The durable resume receipt: an item's `delivered_at` records that its response reached the child. A retried
+    // delivery checks this first, so a lost acknowledgement never becomes a second delivery or a replacement child.
+    resumeDelivered({ taskId, executionId, itemId, now = Date.now() }) {
       return transaction(() => {
         const task = row.get(taskId);
         if (!task || task.execution_id !== executionId) return false;
-        // A fast resume can settle the Task before this report lands; the delivery still happened and is recorded.
-        if (task.status !== 'running' && !TERMINAL.has(task.status)) return false;
-        if (delivered) {
-          db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`).run(iso(now), itemId);
-          if (task.status === 'running') {
-            db.prepare(`UPDATE tasks SET resume_item_id=NULL, updated_at=? WHERE id=?`).run(iso(now), taskId);
-          }
-          return true;
+        if (task.status === 'cancelled') return false;
+        // A fast finish can settle the Task before this report lands; the delivery still happened and is recorded.
+        db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`).run(iso(now), itemId);
+        if (task.status === 'running') {
+          db.prepare(`UPDATE tasks SET resume_item_id=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
+            .run(iso(now), taskId);
         }
-        if (task.status !== 'running') return false;
-        db.prepare(`UPDATE tasks SET status='queued', execution_kind='start', execution_id=NULL, resume_item_id=NULL,
-          claim_at=NULL, next_at=0, updated_at=? WHERE id=?`).run(iso(now), taskId);
-        addEvent.run(taskId, task.scope, 'notice',
-          `Task “${task.title}” could not resume its previous execution; it will start again with your response.`, iso(now));
+        return true;
+      });
+    },
+
+    // The worker definitively reports that this execution can no longer receive the response (it was lost, wiped, or
+    // already ended). The first slice never launches a replacement child for Inbox input: the Task ends failed with a
+    // clear reason and the owner's response stays recorded on the item.
+    resumeUnavailable({ taskId, executionId, itemId, reason, now = Date.now() }) {
+      return transaction(() => {
+        const task = row.get(taskId);
+        if (!task || task.execution_id !== executionId || TERMINAL.has(task.status)) return false;
+        const record = item.get(itemId);
+        db.prepare(`UPDATE tasks SET status='failed', outcome=NULL, failure=?, execution_kind='start', resume_item_id=NULL,
+          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
+          .run(plain(reason, MAX_NOTE), iso(now), taskId);
+        addEvent.run(taskId, task.scope, 'outcome',
+          `Task “${task.title}” failed: its execution is no longer available.` +
+          (record && record.response !== null ? ' Your response is saved in the Task.' : ''), iso(now));
         return true;
       });
     },
@@ -411,16 +520,46 @@ export function openTaskStore(db) {
         const task = scoped.get(id, scope);
         if (!task) throw bad(404, 'Task not found');
         if (TERMINAL.has(task.status)) {
-          if (task.status === 'cancelled') return { task: taskView(task, now), executionId: null };
+          if (task.status === 'cancelled') {
+            return { task: taskView(task, now), executionId: task.execution_id ?? null, stopPending: task.stop_pending === 1 };
+          }
           throw bad(409, 'Task is already terminal');
         }
         const open = openItem.get(id);
         if (open) db.prepare(`UPDATE task_inbox_items SET status='cancelled', responded_at=? WHERE id=?`).run(iso(now), open.id);
+        // Cancellation is a ledger decision. Stopping the worker is a separate step, owed while an execution may exist
+        // and retried until the worker confirms. Clearing the pending dispatch marker also stops a dispatch that has not
+        // been sent yet; a dispatch that already reached the worker is stopped by the same step.
+        const stopPending = task.execution_id === null ? 0 : 1;
         db.prepare(`UPDATE tasks SET status='cancelled', execution_kind='start', resume_item_id=NULL, context=NULL, claim_at=NULL,
-          next_at=0, updated_at=? WHERE id=?`).run(iso(now), id);
+          dispatch_pending=0, next_at=0, stop_pending=?, stop_attempts=0, stop_next_at=0, updated_at=? WHERE id=?`)
+          .run(stopPending, iso(now), id);
         addEvent.run(id, task.scope, 'outcome', `Task “${task.title}” was cancelled.`, iso(now));
-        // Report the execution even when the Task was waiting: aborting it ends a parked call instead of leaving it.
-        return { task: taskView(row.get(id), now), executionId: task.execution_id ?? null };
+        return { task: taskView(row.get(id), now), executionId: task.execution_id ?? null, stopPending: stopPending === 1 };
+      });
+    },
+
+    // A cancelled Task whose worker stop is not confirmed yet. Retries are bounded and then leave `stopPending` set as a
+    // visible, durable fact instead of claiming the worker stopped.
+    dueStop(now, limit = 4) {
+      return db.prepare(`SELECT * FROM tasks WHERE status='cancelled' AND stop_pending=1 AND stop_next_at<=?
+        AND stop_attempts<? ORDER BY rowid LIMIT ?`).all(now, MAX_STOP_ATTEMPTS, Math.min(Math.max(limit, 1), 16));
+    },
+
+    ackStop(taskId, now = Date.now()) {
+      const changed = db.prepare(`UPDATE tasks SET stop_pending=0, stop_confirmed_at=?, updated_at=?
+        WHERE id=? AND status='cancelled' AND stop_pending=1`).run(iso(now), iso(now), taskId);
+      return changed.changes === 1;
+    },
+
+    retryStop(taskId, now = Date.now()) {
+      return transaction(() => {
+        const task = row.get(taskId);
+        if (!task || task.status !== 'cancelled' || task.stop_pending !== 1) return false;
+        const attempts = task.stop_attempts + 1;
+        db.prepare(`UPDATE tasks SET stop_attempts=?, stop_next_at=?, updated_at=? WHERE id=?`)
+          .run(attempts, now + delay(attempts), iso(now), taskId);
+        return true;
       });
     },
 

@@ -70,7 +70,7 @@ async function waitFor(run, expression) {
 
 const revision = 'a'.repeat(64);
 const notBefore = new Date(Date.now() + 3_600_000).toISOString();
-const tasks = [
+const active = [
   { id: '1'.repeat(32), title: 'Quarterly review', status: 'queued', scheduled: true, notBefore,
     createdAt: '2026-01-01T08:00:00.000Z', blueprint: { id: 'review', revision }, originTurnId: 'turn-1' },
   { id: '2'.repeat(32), title: 'Kitchen inventory', status: 'queued', scheduled: false,
@@ -80,23 +80,34 @@ const tasks = [
     progress: 'Read three of five pages' },
   { id: '4'.repeat(32), title: 'Pick a moving date', status: 'waiting', scheduled: false,
     createdAt: '2026-01-01T11:00:00.000Z', blueprint: { id: 'moving', revision }, originTurnId: 'turn-4',
-    inboxItem: { id: 'a'.repeat(32), kind: 'question', prompt: 'Which weekday suits you?', status: 'open' } },
-  { id: '5'.repeat(32), title: 'Old report', status: 'done', scheduled: false,
-    createdAt: '2026-01-01T07:00:00.000Z', blueprint: { id: 'review', revision }, originTurnId: 'turn-5',
-    outcome: 'Sent the summary.' },
-  { id: '6'.repeat(32), title: 'Broken import', status: 'failed', scheduled: false,
-    createdAt: '2026-01-01T06:00:00.000Z', originTurnId: 'turn-6', failure: 'The pinned blueprint revision is no longer available.' },
-  { id: '7'.repeat(32), title: 'Abandoned draft', status: 'cancelled', scheduled: false,
-    createdAt: '2026-01-01T05:00:00.000Z', originTurnId: 'turn-7' },
+    inboxItem: { id: 'b'.repeat(32), kind: 'question', prompt: 'Which weekday suits you?', status: 'open' } },
 ];
+const history = [];
+for (let index = 0; index < 30; index++) {
+  history.push({
+    id: (index + 16).toString(16).padStart(32, '0'),
+    title: `Finished ${index}`,
+    status: index % 3 === 0 ? 'failed' : index % 3 === 1 ? 'cancelled' : 'done',
+    scheduled: false,
+    createdAt: `2026-01-${String(index + 1).padStart(2, '0')}T00:00:00.000Z`,
+    blueprint: index % 2 === 0 ? { id: 'review', revision } : undefined,
+    ...(index % 3 === 2 ? { outcome: `Outcome ${index}` } : {}),
+    ...(index % 3 === 0 ? { failure: 'Something failed.' } : {}),
+  });
+}
+history[1].stopPending = true;
+history[2].title = 'Old report';
+history[2].outcome = 'Sent the summary.';
+history[2].status = 'done';
 const events = [
   { taskId: '4'.repeat(32), kind: 'inbox', text: 'Task “Pick a moving date” is waiting for input: Which weekday suits you?', createdAt: '2026-01-01T11:01:00.000Z' },
-  { taskId: '5'.repeat(32), kind: 'outcome', text: 'Task “Old report” finished.', createdAt: '2026-01-01T11:02:00.000Z' },
+  { taskId: history[2].id, kind: 'outcome', text: 'Task “Old report” finished.', createdAt: '2026-01-01T11:02:00.000Z' },
 ];
 const responses = [];
 const cancellations = [];
+const listRequests = [];
 
-test('the Tasks view groups active work, filters history, answers a Task item, and shows durable notices', {
+test('the Tasks view groups active work, filters and pages history, answers the newest Task item, and shows durable notices', {
   skip: missingChromium && 'chromium unavailable (set CHROMIUM_BIN)', timeout: 40_000,
 }, async (t) => {
   const assets = new Map(await Promise.all([
@@ -121,13 +132,31 @@ test('the Tasks view groups active work, filters history, answers a Task item, a
     if (url === '/api/inbox') {
       return json({
         messages: [],
-        taskItems: [{ id: 'a'.repeat(32), taskId: '4'.repeat(32), taskTitle: 'Pick a moving date', kind: 'question',
+        taskItems: [{ id: 'b'.repeat(32), taskId: '4'.repeat(32), taskTitle: 'Pick a moving date', kind: 'question',
           prompt: 'Which weekday suits you?', createdAt: '2026-01-01T11:01:00.000Z' }],
       });
     }
     if (url === '/api/tasks/events') return json({ events });
-    if (url === '/api/tasks' && method === 'GET') return json({ tasks });
-    if (url === '/api/tasks' && method === 'POST') return json({}, 405);
+    if (url.startsWith('/api/tasks?')) {
+      const query = new URL(url, 'http://local.invalid').searchParams;
+      listRequests.push(Object.fromEntries(query));
+      const status = query.get('status') ?? 'history';
+      const blueprint = query.get('blueprint') ?? '';
+      const text = query.get('text') ?? '';
+      const cursor = query.get('cursor');
+      const matches = row => (blueprint ? row.blueprint?.id === blueprint : true) &&
+        (text ? `${row.title} ${row.progress ?? ''} ${row.outcome ?? ''}`.toLowerCase().includes(text.toLowerCase()) : true);
+      const filtered = history.filter(row => (status === 'history' ? true : row.status === status) && matches(row));
+      const page = cursor ? filtered.slice(Number(cursor)) : filtered;
+      const rows = page.slice(0, 25);
+      const next = Number(cursor ?? 0) + rows.length;
+      return json({
+        active,
+        history: rows,
+        ...(next < filtered.length && { historyCursor: String(next) }),
+        blueprints: ['moving', 'review'],
+      });
+    }
     const respond = /^\/api\/tasks\/([0-9a-f]{32})\/inbox\/([0-9a-f]{32})\/respond$/.exec(url);
     if (respond && method === 'POST') {
       let body = '';
@@ -138,19 +167,28 @@ test('the Tasks view groups active work, filters history, answers a Task item, a
     const cancel = /^\/api\/tasks\/([0-9a-f]{32})\/cancel$/.exec(url);
     if (cancel && method === 'POST') {
       cancellations.push({ taskId: cancel[1], headers: req.headers });
-      const task = tasks.find(row => row.id === cancel[1]);
+      const task = active.find(row => row.id === cancel[1]);
       task.status = 'cancelled';
+      task.stopPending = true;
       delete task.progress;
+      active.splice(active.indexOf(task), 1);
+      history.unshift(task);
       return json(task);
     }
     const detail = /^\/api\/tasks\/([0-9a-f]{32})$/.exec(url);
     if (detail && method === 'GET') {
-      const task = tasks.find(row => row.id === detail[1]);
+      const task = [...active, ...history].find(row => row.id === detail[1]);
       if (!task) return json({}, 404);
+      const items = task.id === '4'.repeat(32)
+        ? [
+          { id: 'b'.repeat(32), kind: 'question', prompt: 'Which weekday suits you?', status: 'open', createdAt: '2026-01-01T11:05:00.000Z' },
+          { id: 'a'.repeat(32), kind: 'question', prompt: 'Which month?', status: 'answered', response: 'May', createdAt: '2026-01-01T11:01:00.000Z' },
+        ]
+        : task.inboxItem ? [{ ...task.inboxItem, createdAt: '2026-01-01T11:01:00.000Z' }] : [];
       return json({
-        task: { ...task, input: 'Do the work.', items: task.inboxItem
-          ? [{ ...task.inboxItem, createdAt: '2026-01-01T11:01:00.000Z' }] : [],
-        progress: task.progress ? [{ note: task.progress, at: '2026-01-01T10:05:00.000Z' }] : [] },
+        task: { ...task, input: 'Do the work.', items,
+          activeItem: items.find(item => item.status === 'open') ?? items[0],
+          progress: task.progress ? [{ note: task.progress, at: '2026-01-01T10:05:00.000Z' }] : [] },
         transcript: [{ role: 'user', text: 'Do the work.' }],
       });
     }
@@ -189,21 +227,33 @@ test('the Tasks view groups active work, filters history, answers a Task item, a
   assert.ok(await run(`document.querySelector('.task-group[data-group="running"] .task-link').closest('li').textContent.includes('Read three of five pages')`));
   assert.ok(await run(`document.querySelector('.task-group[data-group="waiting"] .task-link').closest('li').textContent.includes('Waiting for your answer')`));
 
-  // 3. History starts with terminal Tasks and obeys the status, blueprint and text filters.
-  assert.deepEqual(await run(`[...document.querySelectorAll('#task-history .task-link')].map(node => node.textContent)`),
-    ['Old report', 'Broken import', 'Abandoned draft']);
-  await run(`document.querySelector('#task-filter-status').value = 'all'; document.querySelector('#task-filter-status').dispatchEvent(new Event('change'))`);
-  assert.equal(await run(`document.querySelectorAll('#task-history .task-link').length`), 7);
-  await run(`document.querySelector('#task-filter-blueprint').value = 'review'; document.querySelector('#task-filter-blueprint').dispatchEvent(new Event('change'))`);
-  assert.deepEqual(await run(`[...document.querySelectorAll('#task-history .task-link')].map(node => node.textContent)`),
-    ['Quarterly review', 'Draft the lease summary', 'Old report']);
-  await run(`document.querySelector('#task-filter-blueprint').value = ''; document.querySelector('#task-filter-blueprint').dispatchEvent(new Event('change'))`);
-  await run(`document.querySelector('#task-filter-text').value = 'import'; document.querySelector('#task-filter-text').dispatchEvent(new Event('input'))`);
-  assert.deepEqual(await run(`[...document.querySelectorAll('#task-history .task-link')].map(node => node.textContent)`), ['Broken import']);
-  await run(`document.querySelector('#task-filter-text').value = ''; document.querySelector('#task-filter-text').dispatchEvent(new Event('input'))`);
+  // 3. History is the first terminal page and pages server-side.
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 25`);
+  assert.equal(await run(`document.querySelector('#task-history-more').hidden`), false);
+  assert.deepEqual(listRequests.at(-1), { status: 'history' });
+  await run(`document.getElementById('task-history-more').click()`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 30`);
+  assert.equal(await run(`document.querySelector('#task-history-more').hidden`), true);
+  assert.equal(listRequests.at(-1).cursor, '25', 'the next page is requested by cursor');
 
-  // 4. A waiting Task's detail answers its Inbox item, which queues the same Task.
+  // 4. Filters are applied by the relay, not by hiding rows in the browser.
+  await run(`document.querySelector('#task-filter-status').value = 'failed'; document.querySelector('#task-filter-status').dispatchEvent(new Event('change'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 10`);
+  assert.equal(listRequests.at(-1).status, 'failed');
   await run(`document.querySelector('#task-filter-status').value = 'history'; document.querySelector('#task-filter-status').dispatchEvent(new Event('change'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 25`);
+  await run(`document.querySelector('#task-filter-blueprint').value = 'review'; document.querySelector('#task-filter-blueprint').dispatchEvent(new Event('change'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 15`);
+  assert.equal(listRequests.at(-1).blueprint, 'review');
+  await run(`document.querySelector('#task-filter-blueprint').value = ''; document.querySelector('#task-filter-blueprint').dispatchEvent(new Event('change'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 25`);
+  await run(`document.querySelector('#task-filter-text').value = 'Finished 7'; document.querySelector('#task-filter-text').dispatchEvent(new Event('input'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 1`);
+  assert.equal(listRequests.at(-1).text, 'Finished 7');
+  await run(`document.querySelector('#task-filter-text').value = ''; document.querySelector('#task-filter-text').dispatchEvent(new Event('input'))`);
+  await waitFor(run, `document.querySelectorAll('#task-history .task-link').length === 25`);
+
+  // 5. A waiting Task's detail answers the newest open item, not the oldest one.
   await run(`document.querySelector('.task-group[data-group="waiting"] .task-link').click()`);
   await waitFor(run, `document.getElementById('task-detail').hidden === false && document.getElementById('task-detail-inbox-body').textContent.includes('Which weekday suits you?')`);
   assert.equal(await run(`document.getElementById('task-detail-title').textContent`), 'Pick a moving date');
@@ -213,21 +263,22 @@ test('the Tasks view groups active work, filters history, answers a Task item, a
   await waitFor(run, `document.getElementById('task-detail-status').textContent.includes('Answer sent')`);
   assert.equal(responses.length, 1);
   assert.equal(responses[0].taskId, '4'.repeat(32));
-  assert.equal(responses[0].itemId, 'a'.repeat(32));
+  assert.equal(responses[0].itemId, 'b'.repeat(32), 'the newest open item is answered');
   assert.deepEqual(responses[0].body, { answer: 'Tuesday' });
   assert.equal(responses[0].headers['x-manolo-request'], '1');
 
-  // 5. Cancelling from the detail stops a running Task without a dialog.
+  // 6. Cancelling from the detail reports the ledger cancellation and an unconfirmed worker stop.
   await run(`document.getElementById('back-to-tasks').click()`);
   await waitFor(run, `document.getElementById('tasks-list-view').hidden === false`);
   await run(`document.querySelector('.task-group[data-group="running"] .task-link').click()`);
   await waitFor(run, `document.getElementById('cancel-task').hidden === false`);
   await run(`document.getElementById('cancel-task').click()`);
-  await waitFor(run, `document.getElementById('task-detail-status').textContent.includes('cancelled')`);
+  await waitFor(run, `document.getElementById('task-detail-status').textContent.includes('worker stop is not confirmed')`);
   assert.deepEqual(cancellations.map(entry => entry.taskId), ['3'.repeat(32)]);
   assert.equal(cancellations[0].headers['x-manolo-request'], '1');
+  await waitFor(run, `document.getElementById('task-detail-meta').textContent.includes('Worker stop not confirmed yet')`);
 
-  // 6. The Inbox tab lists the same Task item and answers it from there.
+  // 7. The Inbox tab lists the same Task item and answers it from there.
   await run(`document.getElementById('inbox-tab').click()`);
   await waitFor(run, `document.querySelectorAll('#inbox-tasks .inbox-question').length === 1`);
   assert.ok(await run(`document.getElementById('inbox-tasks').textContent.includes('Pick a moving date')`));
@@ -238,7 +289,7 @@ test('the Tasks view groups active work, filters history, answers a Task item, a
   assert.equal(responses.length, 2);
   assert.deepEqual(responses[1].body, { answer: 'Wednesday' });
 
-  // 7. A notice opens its Task.
+  // 8. A notice opens its Task even when it is not on the loaded History page.
   await run(`document.getElementById('chat-tab').click()`);
   await run(`[...document.querySelectorAll('#task-notices .task-notice button')].at(-1).click()`);
   await waitFor(run, `document.getElementById('tasks-panel').hidden === false && document.getElementById('task-detail-title').textContent === 'Old report'`);

@@ -153,7 +153,6 @@
                 <label for="task-filter-status">Status
                   <select id="task-filter-status">
                     <option value="history">Finished</option>
-                    <option value="all">All</option>
                     <option value="done">Done</option>
                     <option value="failed">Failed</option>
                     <option value="cancelled">Cancelled</option>
@@ -168,6 +167,7 @@
               </div>
               <p id="task-history-empty" class="status" hidden>No tasks match these filters.</p>
               <ul id="task-history" aria-labelledby="task-history-heading"></ul>
+              <button id="task-history-more" type="button" hidden>Load more</button>
             </section>
           </div>
           <div id="task-detail" hidden>
