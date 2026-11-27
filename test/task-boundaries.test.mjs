@@ -217,7 +217,7 @@ async function untilTrue(check, label, timeout = 5_000) {
   assert.fail(`Timed out: ${label}`);
 }
 
-function taskRaceHarness({ store, scope = 'scope', finishRequired = false, workspaceLost = false } = {}) {
+function taskRaceHarness({ store, scope = 'scope', finishRequired = false, workspaceLost = false, blockRecoveryBackoffMs = [1] } = {}) {
   const { data, get } = docs();
   // The child's final answer is read from its own assistant entry.
   const commit = async run => run({
@@ -244,16 +244,17 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
       newSubmission(id);
       return id;
     },
+    abort: async () => {},
   }]]);
   const submissionFor = id => submissions.get(id) ?? newSubmission(id);
   data.set(`manolo.task-execution:${task.id}`, {
-    taskId: task.id, executionId, conversationId: 'conv', submissionId: 'submission-0', state: 'running',
+    taskId: task.id, executionId, conversationId: 'conv', submissionId: 'submission-0', state: 'running', finishRequired,
     workspace: { kind: 'worktree', path: '/tmp/task-workspace' },
   });
   data.set('manolo.task-run:conv', { taskId: task.id, executionId, state: 'running' });
   data.set('manolo.task-index:all', { ids: [task.id] });
   const calls = { block: 0, settle: 0, state: 0, heartbeat: 0 };
-  const controls = { lost: workspaceLost, holdBlock: undefined, refuseBlock: false };
+  const controls = { lost: workspaceLost, holdBlock: undefined, refuseBlock: false, holdStateAt: undefined, holdState: undefined };
   const relay = async (url, options = {}) => {
     const path = new URL(url).pathname;
     const body = options.body ? JSON.parse(options.body) : {};
@@ -266,6 +267,7 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
     }
     if (path.endsWith('/state')) {
       calls.state += 1;
+      if (controls.holdStateAt === calls.state && controls.holdState) await controls.holdState.promise;
       const meta = store.meta(task.id);
       return Response.json({ status: meta.status, executionId: meta.executionId, finishAccepted: meta.finishAccepted });
     }
@@ -282,12 +284,13 @@ function taskRaceHarness({ store, scope = 'scope', finishRequired = false, works
   };
   const tasks = installTasks(createRegistry(), {
     cfg: { relay: 'http://in-process.invalid', token: 'fixture' }, redact: text => text,
-    settleRetryMs: [1], heartbeatMs: 5,
+    settleRetryMs: [1], heartbeatMs: 5, blockRecoveryBackoffMs,
     taskGit: {
       assertWorkspace: async () => {
         if (controls.lost) throw Object.assign(new Error('The Task worktree is missing.'), { code: 'worktree_missing' });
         return {};
       },
+      cleanup: async () => ({ removed: false }),
     },
   });
   tasks.attach({
@@ -408,4 +411,162 @@ test('a restart re-reports a durable block intent whose acknowledgement was lost
   race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished after restart', conversationId: 'conv' });
   await untilTrue(() => race.state().status === 'done', 'the restarted execution settles');
   assert.equal(race.calls.settle, 1);
+});
+
+// --- Release audit regressions -----------------------------------------------------------------------------------
+// 1. A block intent whose report never reached the relay used to need a dispatch retry or a worker restart. A live
+//    worker now keeps publishing it, so the relay regains its retry obligation without either.
+
+test('an unacknowledged block intent recovers while the worker stays alive, without a restart', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, blockRecoveryBackoffMs: [1] });
+  globalThis.fetch = race.relay;
+  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+
+  await race.tasks.start();
+  // The start acknowledgement was lost and the relay retried the dispatch. Its acknowledgement clears the only retry
+  // obligation the relay had, and then the workspace disappears while the submission ends.
+  const first = store.dueDispatch(Date.now())[0];
+  assert.equal((await race.tasks.dispatch(request)).status, 'running');
+  assert.equal(store.ackDispatch(race.taskId, race.executionId, first.dispatch_epoch), true);
+  assert.equal(store.dueDispatch(Date.now()).length, 0, 'the acknowledgement cleared the relay retry');
+  race.controls.refuseBlock = true;
+  race.controls.lost = true;
+  race.submissionFor('submission-0').settle({ status: 'done', answer: 'ended', conversationId: 'conv' });
+  // The inline burst is exhausted past its old limit: every report failed, the intent is durable, and the relay has no
+  // block and no retry obligation for this Task.
+  await untilTrue(() => race.calls.block >= 6, 'the inline report burst is exhausted');
+  assert.notEqual(race.document().blockIntent, undefined, 'the intent survives the failed burst');
+  assert.equal(race.document().state, 'running');
+  assert.equal(store.meta(race.taskId).blocked, null, 'the relay never learned about the block');
+  assert.equal(store.dueDispatch(Date.now()).length, 0, 'the relay owes no retry yet');
+  assert.equal(race.calls.settle, 0, 'no outcome is invented for the ended submission');
+
+  // Transport comes back in the same process: no dispatch, no start(), no restart.
+  race.controls.refuseBlock = false;
+  const attempts = race.calls.block;
+  await untilTrue(() => race.document().state === 'blocked', 'the driver publishes the durable intent');
+  assert.equal(store.meta(race.taskId).blocked, 'The Task worktree is missing.', 'the relay records the block');
+  assert.ok(race.calls.block > attempts);
+  // The acknowledged intent is dropped: one publication per intent, and no duplicate obligation afterwards.
+  const published = race.calls.block;
+  await sleep(30);
+  assert.equal(race.calls.block, published, 'no further report once the intent is promoted');
+  assert.equal(store.meta(race.taskId).blocked, 'The Task worktree is missing.');
+  assert.equal(store.dueDispatch(Date.now()).length, 0, 'the block schedules its own bounded retry');
+
+  // The relay's recorded retry continues the same execution and settles it once.
+  race.controls.lost = false;
+  store.db.prepare('UPDATE tasks SET next_at=0').run();
+  assert.equal(store.dueDispatch(Date.now()).length, 1);
+  const continued = await race.tasks.dispatch({ taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } });
+  assert.equal(continued.status, 'running', JSON.stringify(continued));
+  assert.equal(race.document().submissionId, 'submission-1');
+  assert.equal(race.admitted.length, 1, 'the recovery did not start a second execution');
+  race.submissionFor('submission-1').settle({ status: 'done', answer: 'finished after recovery', conversationId: 'conv' });
+  await untilTrue(() => race.state().status === 'done', 'the recovered execution settles');
+  assert.equal(race.calls.settle, 1);
+  assert.equal(race.state().outcome, 'from the child');
+});
+
+test('a cancelled Task stops the recovery driver instead of publishing a dead intent', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, workspaceLost: true, blockRecoveryBackoffMs: [1] });
+  race.controls.refuseBlock = true;
+  globalThis.fetch = race.relay;
+
+  await race.tasks.start();
+  race.submissionFor('submission-0').settle({ status: 'done', answer: 'ended', conversationId: 'conv' });
+  await untilTrue(() => race.document().blockIntent !== undefined, 'the intent is durable');
+  assert.equal((await race.tasks.cancel({ taskId: race.taskId, executionId: race.executionId })).ok, true);
+  assert.equal(race.document().state, 'cancelled');
+
+  // A transport that comes back afterwards must not resurrect the block for a stopped Task.
+  race.controls.refuseBlock = false;
+  const attempts = race.calls.block;
+  await sleep(40);
+  assert.equal(race.calls.block, attempts, 'no block is published after cancellation');
+  assert.equal(store.meta(race.taskId).blocked, null);
+  assert.equal(race.calls.settle, 0, 'a cancellation is not a settlement');
+});
+
+// 2. A lost start ACK re-drives the dispatch inside the corrective handoff window. One submission must still have exactly
+// one watcher: two owners raced into a block and a terminal failure for work that was live again.
+
+test('a lost start ACK during the corrective handoff never installs a second watcher for one submission', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, finishRequired: true });
+  globalThis.fetch = race.relay;
+  const request = { taskId: race.taskId, executionId: race.executionId, task: { title: 'race', input: 'do it' } };
+  const outcome = { status: 'done', answer: 'bare result', conversationId: 'conv' };
+
+  await race.tasks.start();
+  race.submissionFor('submission-0').settle(outcome);
+  await untilTrue(() => race.document().submissionId === 'submission-1', 'the first watcher admits its corrective');
+  assert.equal(race.calls.state, 1);
+
+  // The original start ACK was lost, so the relay retries the dispatch while the corrective handoff is in progress.
+  const first = store.dueDispatch(Date.now())[0];
+  assert.equal(first.id, race.taskId);
+  assert.equal((await race.tasks.dispatch(request)).status, 'running');
+  assert.equal(store.ackDispatch(race.taskId, race.executionId, first.dispatch_epoch), true);
+
+  // The corrective ends without a finish exactly while the workspace is lost.
+  race.controls.lost = true;
+  race.submissionFor('submission-1').settle(outcome);
+  await untilTrue(() => race.document().state === 'blocked', 'the corrective watcher reports its block');
+  await sleep(20);
+  assert.equal(race.calls.block, 1, 'one watcher reported for submission-1');
+  assert.equal(race.calls.state, 2, 'one reconciliation read per finished submission');
+  assert.equal(race.calls.settle, 0, 'the bare corrective final is not a settlement');
+
+  // The relay retries the blocked dispatch and admits the continuation. The old watcher must never fail it afterwards.
+  race.controls.lost = false;
+  const blocked = store.dueDispatch(Date.now() + 60_000)[0];
+  assert.equal(blocked.id, race.taskId);
+  assert.equal((await race.tasks.dispatch(request)).status, 'running');
+  assert.equal(store.ackDispatch(race.taskId, race.executionId, blocked.dispatch_epoch), true);
+  assert.equal(race.document().submissionId, 'submission-2');
+  await sleep(30);
+  assert.equal(race.calls.settle, 0, 'no stale watcher settled the live continuation');
+  assert.equal(race.state().status, 'running');
+
+  // The continuation finishes normally and is the only settlement.
+  store.acceptFinish({ taskId: race.taskId, executionId: race.executionId, summary: 'finished after recovery', key: 'finish-recovery' });
+  race.document().finishAccepted = true;
+  race.document().finishSummary = 'finished after recovery';
+  race.submissionFor('submission-2').settle(outcome);
+  await untilTrue(() => race.state().status === 'done', 'the continuation settles the Task');
+  assert.equal(race.calls.settle, 1);
+  assert.equal(race.document().state, 'settled');
+});
+
+test('a stale watcher whose relay read resolves after a newer continuation never settles the Task', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  const race = taskRaceHarness({ store, finishRequired: true });
+  globalThis.fetch = race.relay;
+  race.controls.holdStateAt = 1;
+  race.controls.holdState = deferred();
+
+  await race.tasks.start();
+  race.submissionFor('submission-0').settle({ status: 'done', answer: 'bare result', conversationId: 'conv' });
+  await untilTrue(() => race.calls.state === 1, 'the stale watcher is inside its relay read');
+
+  // A newer continuation becomes current while that read is still held. The watcher's snapshot is now stale, and only a
+  // check after the yield prevents a terminal report for a Task that is live again.
+  race.document().submissionId = 'submission-7';
+  race.document().correctives = 1;
+  race.controls.holdState.resolve();
+  await sleep(40);
+  assert.equal(race.calls.settle, 0, 'the stale watcher never settles the newer continuation');
+  assert.equal(race.state().status, 'running');
+  assert.equal(race.document().state, 'running');
 });

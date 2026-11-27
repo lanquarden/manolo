@@ -23,6 +23,9 @@ const RELAY_TIMEOUT_MS = 8_000;
 const HEARTBEAT_MS = 15_000;
 const SETTLE_RETRY_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 const BLOCK_REPORT_ATTEMPTS = 6;
+// After the inline burst, an unacknowledged block intent is driven by a live recovery loop: bounded backoff, one
+// publication per intent, and no busy loop. The last step repeats for as long as the intent is current.
+const BLOCK_RECOVERY_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 const MAX_CONTINUATIONS = 5;
 const CONTINUE_TEXT = 'Your Task workspace was unavailable and is available again. Continue this Task in the same execution; call the finish tool when the work is complete and verified.';
 const EXECUTION_ID = /^[0-9a-f]{32}$/;
@@ -74,13 +77,19 @@ function toolResult(value, isError = false) {
 
 const idempotency = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 
-export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit, settleRetryMs = SETTLE_RETRY_MS, heartbeatMs = HEARTBEAT_MS }) {
+export function installTasks(registry, { cfg, model, thinkingLevel, models, profiles = new Map(), Turns, redact, blueprints = new Map(), taskGit, settleRetryMs = SETTLE_RETRY_MS, heartbeatMs = HEARTBEAT_MS, blockRecoveryBackoffMs = BLOCK_RECOVERY_BACKOFF_MS }) {
   let harness;
   // A watcher belongs to one admitted submission, not to an execution identity. A repaired execution that admits a
   // continuation therefore always gets its own watcher even while the previous one is still tearing down, and the stale
   // watcher is fenced by the submission it was admitted for.
   const watchers = new Map();
   const watcherKey = (executionId, submissionId) => `${executionId}:${submissionId}`;
+  // Durable block intents that the relay has not acknowledged yet. Their driver is not an execution: it publishes one
+  // report per intent, never admits work, and stops as soon as the submission it belongs to is no longer current.
+  const recoveries = new Map();
+  const publishing = new Set();
+  let draining = false;
+  const waitFor = ms => new Promise(resolve => { const timer = setTimeout(resolve, Math.max(1, ms)); timer.unref?.(); });
 
   async function relay(path, { method = 'POST', body, key, timeout = RELAY_TIMEOUT_MS } = {}) {
     if (!cfg.relay) throw new Error('Task orchestration needs a relay URL.');
@@ -110,6 +119,16 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
 
   async function relayState(taskId, executionId, timeout = RELAY_TIMEOUT_MS) {
     return relay(`/v1/tasks/${taskId}/state?executionId=${encodeURIComponent(executionId)}`, { method: 'GET', timeout });
+  }
+
+  // Only the owner of the current submission may report a block or a terminal outcome for it. The durable record is read
+  // again at the moment of the report, so a continuation admitted while a slow report was in flight keeps the execution it
+  // already owns and the stale reporter stops instead of settling work that is live again.
+  async function ownsSubmission(taskId, executionId, submissionId) {
+    if (submissionId === undefined) return false;
+    const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
+    return Boolean(current && current.executionId === executionId && current.submissionId === submissionId &&
+      current.state !== 'cancelled');
   }
 
   // Authority comes from the placed input of this exact tool run, as in work sessions: the current turn must be a
@@ -528,11 +547,14 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   // Settle returns only an authoritative terminal state. A rejection, a timeout, or an exhausted retry budget is
   // ambiguous: the local execution stays running, no workspace is cleaned, and a later restart reattaches the same
   // watcher. An accepted finish is authoritative even when a failure report races it.
-  async function settle(taskId, executionId, outcome, summary) {
+  async function settle(taskId, executionId, outcome, summary, { submissionId } = {}) {
     let desired = outcome;
     let text = summary;
     const deliveredItems = await deliveryEvidence(taskId, executionId).catch(() => []);
     for (let attempt = 0; ; attempt++) {
+      // Re-checked before every attempt, not once before the first: a continuation admitted while an earlier attempt was
+      // in flight owns this execution now, and the relay only knows the execution identity.
+      if (!(await ownsSubmission(taskId, executionId, submissionId))) return { state: undefined };
       let result;
       try {
         result = await relay(`/v1/tasks/${taskId}/settle`, {
@@ -638,26 +660,85 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       return true;
     }, context).catch(() => false);
     if (!written) return false;
-    // A block report that lands after a relay restart or a transient failure still has to create its obligation, so it is
-    // retried past the first few attempts; only a worker restart ends the retries, and the durable intent covers that.
-    let reported = false;
-    for (let attempt = 0; attempt < BLOCK_REPORT_ATTEMPTS && !reported; attempt += 1) {
+    // The first publications happen inline, so a brief transport window is covered without waiting for the driver. Whatever
+    // is still unacknowledged after that burst is handed to the recovery driver, which keeps publishing while this worker
+    // is alive: the relay has already cleared its retry obligation and would not ask again on its own.
+    for (let attempt = 0; attempt < BLOCK_REPORT_ATTEMPTS; attempt += 1) {
+      const outcome = await publishBlock(taskId, executionId, submissionId).catch(() => 'retry');
+      if (outcome === 'reported') return true;
+      // The submission is no longer current, or the block already became authoritative: nothing left to publish.
+      if (outcome === 'stale') return false;
+      if (attempt + 1 < BLOCK_REPORT_ATTEMPTS) await sleep(settleRetryMs[Math.min(attempt, settleRetryMs.length - 1)]).catch(() => {});
+    }
+    // An unacknowledged report keeps its durable intent, leaves the execution running, and is re-published by the driver
+    // (or by a dispatch retry or a restart), so the Task is never stranded with no relay obligation.
+    scheduleRecovery(taskId, executionId, submissionId);
+    return false;
+  }
+
+  // Exactly one publication of one intent at a time. The intent and the submission it belongs to are re-read inside the
+  // attempt, so a continuation, a cancellation, or an accepted finish can never be reported as blocked afterwards.
+  async function publishBlock(taskId, executionId, submissionId) {
+    const key = watcherKey(executionId, submissionId);
+    // A dispatch retry or a restart may already be publishing this intent; a second body would only duplicate it.
+    if (publishing.has(key)) return 'retry';
+    publishing.add(key);
+    try {
       const current = await harness.snapshot(TaskExecution, taskId, context).catch(() => undefined);
-      // A continuation admitted while this report was in flight owns the execution now; a block for the old submission
-      // would only make the relay re-drive work that is already live again.
-      if (!current || current.executionId !== executionId || current.submissionId !== submissionId ||
-          current.state === 'cancelled' || current.finishAccepted) return false;
+      if (!current || current.executionId !== executionId || current.submissionId !== submissionId) return 'stale';
+      // A finished or cancelled execution has no recoverable block left to publish.
+      if (current.state === 'cancelled' || current.state === 'settled' || current.state === 'failed' || current.finishAccepted) return 'stale';
+      const intent = current.blockIntent;
+      if (intent === undefined) return 'stale';
+      const reason = boundedPlain(intent.message ?? intent.reason ?? 'The Task workspace is unavailable.', MAX_NOTE);
       const result = await relay(`/v1/tasks/${taskId}/block`, {
         key: idempotency('block', taskId, executionId, intent.reason),
         body: { executionId, reason },
       }).catch(() => ({ ok: false }));
-      reported = result.ok;
-      if (!reported) await sleep(settleRetryMs[Math.min(attempt, settleRetryMs.length - 1)]).catch(() => {});
+      if (!result.ok) return 'retry';
+      return await promoteBlocked(taskId, executionId, submissionId, intent) ? 'reported' : 'stale';
+    } finally {
+      publishing.delete(key);
     }
-    // An unacknowledged report keeps its durable intent and leaves the execution running, so a restart re-reports it and
-    // a dispatch retry answers "blocked" instead of stranding the Task in a running state with no relay obligation.
-    if (!reported) return false;
-    return promoteBlocked(taskId, executionId, submissionId, intent);
+  }
+
+  // The recovery driver. One publication in flight per intent, one attempt per intent per pass so a Task that keeps
+  // failing cannot starve the others, and a bounded backoff between passes. It ends when no current intent is left, so an
+  // idle worker holds no timer; a restart re-arms it from the durable intents.
+  function scheduleRecovery(taskId, executionId, submissionId) {
+    const key = watcherKey(executionId, submissionId);
+    if (recoveries.has(key)) return;
+    recoveries.set(key, { taskId, executionId, submissionId, attempt: 0, nextAt: 0 });
+    void drainRecoveries();
+  }
+
+  async function drainRecoveries() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (recoveries.size) {
+        const entries = [...recoveries.entries()];
+        const now = Date.now();
+        const due = entries.filter(([, entry]) => entry.nextAt <= now);
+        if (due.length === 0) {
+          const soonest = Math.min(...entries.map(([, entry]) => entry.nextAt));
+          await waitFor(soonest - now);
+          continue;
+        }
+        for (const [key, entry] of due) {
+          if (!recoveries.has(key)) continue;
+          const outcome = await publishBlock(entry.taskId, entry.executionId, entry.submissionId).catch(() => 'retry');
+          if (outcome === 'reported' || outcome === 'stale' || !recoveries.has(key)) {
+            recoveries.delete(key);
+            continue;
+          }
+          entry.attempt += 1;
+          entry.nextAt = Date.now() + blockRecoveryBackoffMs[Math.min(entry.attempt - 1, blockRecoveryBackoffMs.length - 1)];
+        }
+      }
+    } finally {
+      draining = false;
+    }
   }
 
   // The intent becomes the durable blocked state exactly once, for the submission that reported it. A newer submission
@@ -717,20 +798,25 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     return { ok: true, submissionId };
   }
 
-  async function applyTerminal(taskId, executionId, confirmation) {
+  async function applyTerminal(taskId, executionId, confirmation, submissionId) {
+    // The terminal report landed for this submission, but a newer one may have been admitted while the settle retried.
+    // Cleaning or relabelling the execution then would end work that is live again.
+    if (!(await ownsSubmission(taskId, executionId, submissionId))) return;
     const state = confirmation.state;
     const localState = state === 'done' ? 'settled' : state === 'cancelled' ? 'cancelled' : 'failed';
     await finish(taskId, executionId, localState, confirmation.summary);
     await taskGit?.cleanup(taskId, { terminal: true, successful: state === 'done' }).catch(() => {});
   }
 
+  // Returns whether this call acquired the watch. A caller that loses the race for a submission's key stops instead of
+  // sharing it: one submission has exactly one owner, and only that owner may report for it.
   function watch(taskId, executionId, submissionId) {
     const key = watcherKey(executionId, submissionId);
-    if (watchers.has(key)) return;
+    if (watchers.has(key)) return false;
     watchers.set(key, true);
     void (async () => {
       try {
-        let current = submissionId;
+        const current = submissionId;
         for (;;) {
           const submission = await harness.submission(current, context);
           if (!submission) return;
@@ -767,52 +853,62 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
                 record.finishSummary = remote.body.finishSummary;
                 record.finishEvidence = remote.body.evidence;
               }, context);
-              execution = await harness.snapshot(TaskExecution, taskId, context);
             }
+            // The relay read is a yield point: a continuation admitted while it was in flight now owns the execution, and
+            // this watcher must not act on the snapshot it took before the call.
+            if (!(await ownsSubmission(taskId, executionId, current))) return;
+            execution = await harness.snapshot(TaskExecution, taskId, context);
+            if (!execution) return;
           }
           // An accepted finish wins over a failed provider stop: the Task is already complete.
           if (execution.finishAccepted) {
             const summary = execution.finishSummary ?? await readResult(settled.conversationId, settled.answer);
-            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
-            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)', { submissionId: current });
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation, current);
             return;
           }
           // An active workspace that was lost or switched mid-run is a recoverable block: no corrective turn and no
           // terminal failure are spent on it, and a restored workspace continues this same Task.
           const workspace = await workspaceState(execution);
           if (!workspace.ok) {
-            // A block whose report never landed keeps its durable intent; a dispatch retry or a restart promotes and
-            // re-reports it instead of acknowledging a submission that has already ended.
+            // A block whose report never landed keeps its durable intent; the recovery driver, a dispatch retry or a
+            // restart promotes and re-reports it instead of acknowledging a submission that has already ended.
             await reportBlocked(taskId, executionId, current, workspace);
             return;
           }
           if (settled.status !== 'done') {
-            const confirmation = await settle(taskId, executionId, 'failed', 'The Task execution ended without an answer.');
-            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            const confirmation = await settle(taskId, executionId, 'failed', 'The Task execution ended without an answer.', { submissionId: current });
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation, current);
             return;
           }
           // Legacy/in-flight executions created before the finish protocol settle from a bare final turn.
           if (!execution.finishRequired) {
             const summary = await readResult(settled.conversationId, settled.answer);
-            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
-            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)', { submissionId: current });
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation, current);
             return;
           }
           const next = await correctiveTurn(taskId, executionId, current).catch(() => undefined);
           if (next) {
-            current = next;
-            continue;
+            // The corrective submission is a new owner, not an extension of this one. Hand the watch over under its own
+            // submission key and stop here; if a dispatch retry already took that key it owns the submission, and a
+            // second watcher would race it into a block and a settle for the same work.
+            watch(taskId, executionId, next);
+            return;
           }
           const latest = await harness.snapshot(TaskExecution, taskId, context);
-          if (latest?.executionId === executionId && latest.submissionId === current && latest.finishAccepted) {
+          // Nothing is settled unless this watcher still owns the current submission. A newer continuation may already be
+          // live, and a failure report for the old submission would end it at the relay.
+          if (!latest || latest.executionId !== executionId || latest.submissionId !== current) return;
+          if (latest.finishAccepted) {
             const summary = latest.finishSummary ?? await readResult(settled.conversationId, settled.answer);
-            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)');
-            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+            const confirmation = await settle(taskId, executionId, 'done', summary || '(No outcome text.)', { submissionId: current });
+            if (confirmation.state) await applyTerminal(taskId, executionId, confirmation, current);
             return;
           }
           const summary = 'The Task ended without calling its finish tool after one corrective turn.';
-          const confirmation = await settle(taskId, executionId, 'failed', summary);
-          if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
+          const confirmation = await settle(taskId, executionId, 'failed', summary, { submissionId: current });
+          if (confirmation.state) await applyTerminal(taskId, executionId, confirmation, current);
           return;
         }
       } catch {
@@ -821,6 +917,7 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         watchers.delete(key);
       }
     })();
+    return true;
   }
 
   function executionText({ title, input, context: extra }) {
@@ -1085,6 +1182,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       return { conversationId };
     }, context);
     if (decision.stale) return { ok: true };
+    // A cancelled execution is never re-reported: its block intent dies with the tombstone instead of publishing an
+    // obligation for work the owner already stopped.
+    for (const [key, entry] of recoveries) if (entry.taskId === taskId) recoveries.delete(key);
     // Nothing was admitted, so the tombstone is the whole stop.
     if (!decision.conversationId) return { ok: true };
     const conversation = await harness.conversation(decision.conversationId, context);
