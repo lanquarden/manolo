@@ -4,7 +4,8 @@ import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import {
   AssistantEntry, configure, defineDoc, defineDocFamily, defineExtension, defineSignal, defineTool, hook, LiveDoc, ToolTask,
 } from '@earendil-works/pi-durable';
-import { GITHUB_OPERATING_POLICY } from './github-policy.mjs';
+import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import { GITHUB_OPERATING_POLICY, githubRepository, validatePullRequestEvidence } from './github-policy.mjs';
 import { BLUEPRINT_ID, blueprintSnapshot, sealBlueprintSnapshot, verifyBlueprintSnapshot, verifyProfileSnapshot } from './work-blueprints.mjs';
 
 // Durable Tasks on the worker side. The relay owns the ledger and the scheduler; this module executes one Task per
@@ -21,6 +22,8 @@ const MAX_IDS = 500;
 const RELAY_TIMEOUT_MS = 8_000;
 const HEARTBEAT_MS = 15_000;
 const SETTLE_RETRY_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+const MAX_CONTINUATIONS = 5;
+const CONTINUE_TEXT = 'Your Task workspace was unavailable and is available again. Continue this Task in the same execution; call the finish tool when the work is complete and verified.';
 const EXECUTION_ID = /^[0-9a-f]{32}$/;
 const ID = /^[0-9a-f]{32}$/;
 const unsafe = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/gu;
@@ -29,7 +32,6 @@ export const TASK_ORCHESTRATOR_TOOLS = ['create_task', 'list_tasks', 'get_task',
 export const TASK_WORKER_TOOLS = ['report_progress', 'post_inbox', 'finish'];
 export const TASK_TOOL_NAMES = [...TASK_ORCHESTRATOR_TOOLS, ...TASK_WORKER_TOOLS];
 const TASK_PROTOCOL = 2;
-const PULL_REQUEST = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*$/;
 const CORRECTIVE_TEXT = 'You ended this Task without calling finish. Call the finish tool now with a concise summary of the work and the verification you performed. Do not start new work unless it is needed to make finish valid. A second final message without finish fails this Task.';
 
 export const TASK_PARENT_RULES = '\n\nYou can create durable Tasks with create_task. A Task keeps its own identity and runs in a separate pod session; it can wait for a person in Inbox without blocking this conversation. Use create_task for delegated work the user should be able to follow, list_tasks and get_task to read status, and cancel_task to stop one. Task notifications also arrive in this conversation; do not poll to learn that input is needed.';
@@ -155,18 +157,20 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     return blueprint;
   }
 
-  // The named profile is pinned as values. It must still resolve to the same provider, model and thinking level here;
-  // anything else is a refusal, never a silent substitution.
+  // A saved snapshot is the assignment. Its pinned provider, model, and reasoning level survive an edit or removal of
+  // the manifest profile (or of the whole manifest), and a profile whose current alias points elsewhere is not
+  // re-resolved: the values are validated against the models this worker can actually reach, and nothing is substituted.
   function modelFor(blueprint, profile) {
     const pinned = profile ?? blueprint?.profile;
     if (!pinned) return { model, ...(thinkingLevel ? { thinkingLevel } : {}) };
     try { verifyProfileSnapshot(pinned); } catch { throw Object.assign(new Error('The pinned model profile is invalid.'), { status: 409, reason: 'profile_unavailable' }); }
-    const known = profiles.get(pinned.id);
-    if (!known || known.model.modelId !== pinned.model || known.thinkingLevel !== pinned.thinkingLevel ||
-        (pinned.provider !== undefined && pinned.provider !== known.model.provider)) {
+    const provider = pinned.provider ?? model.provider;
+    let catalog;
+    try { catalog = models?.getModel?.(provider, pinned.model); } catch { catalog = undefined; }
+    if (!catalog || (pinned.thinkingLevel !== undefined && !getSupportedThinkingLevels(catalog).includes(pinned.thinkingLevel))) {
       throw Object.assign(new Error('The pinned model profile is not available on this worker.'), { status: 409, reason: 'profile_unavailable' });
     }
-    return { model: known.model, ...(known.thinkingLevel ? { thinkingLevel: known.thinkingLevel } : {}) };
+    return { model: { provider, modelId: pinned.model }, ...(pinned.thinkingLevel ? { thinkingLevel: pinned.thinkingLevel } : {}) };
   }
 
   // Exact tools, resolved by name at dispatch. An unknown name fails closed instead of quietly falling back to the
@@ -418,14 +422,21 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       const commit = check.commit ?? execution.workspace?.expectedHead;
       let pullRequest;
       if (execution.requiresPullRequest) {
-        if (typeof pullRequestUrl !== 'string' || !PULL_REQUEST.test(pullRequestUrl)) {
+        if (!commit) return toolResult({ error: 'A pull request needs a Task commit; no commit is available.', code: 'pull_request_required' }, true);
+        try {
+          // Structural evidence only: no GitHub request is made. It must name this Task's exact accepted commit and, when
+          // the repository has a GitHub destination, that destination - not an unrelated repository's pull request.
+          const evidence = validatePullRequestEvidence({
+            url: pullRequestUrl, commit, expectedCommit: commit,
+            destination: githubRepository(execution.workspace?.remote),
+          });
+          pullRequest = { url: redact(evidence.url), commit: evidence.commit };
+        } catch (error) {
           return toolResult({
-            error: 'This Task requires a pull request. Open it, then call finish with its GitHub pull-request URL.',
+            error: `This Task requires a pull request bound to its handed-off commit. ${error.message} Open it, then call finish again.`,
             code: 'pull_request_required',
           }, true);
         }
-        if (!commit) return toolResult({ error: 'A pull request needs a Task commit; no commit is available.', code: 'pull_request_required' }, true);
-        pullRequest = { url: redact(pullRequestUrl), commit };
       }
       const evidence = {
         ...(commit && { commit, base: check.base ?? execution.workspace?.baseSha ?? null }),
@@ -590,6 +601,79 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
   }
 
 
+  // A Task workspace that disappeared or was switched while the execution was live is a recoverable block, not a
+  // failure and not a corrective turn. The execution keeps its identity and conversation; the relay shows the reason and
+  // retries the same dispatch, and a restored workspace continues the same Task instead of failing it.
+  async function workspaceState(execution) {
+    if (!taskGit || !execution?.workspace) return { ok: true };
+    try {
+      await taskGit.assertWorkspace(execution.taskId);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: error.code ?? 'worktree_missing', message: error.message };
+    }
+  }
+
+  async function reportBlocked(taskId, executionId, state) {
+    const reason = boundedPlain(state.message ?? state.reason ?? 'The Task workspace is unavailable.', MAX_NOTE);
+    let reported = false;
+    for (let attempt = 0; attempt < 3 && !reported; attempt += 1) {
+      const result = await relay(`/v1/tasks/${taskId}/block`, {
+        key: idempotency('block', taskId, executionId, state.reason),
+        body: { executionId, reason },
+      }).catch(() => ({ ok: false }));
+      reported = result.ok;
+      if (!reported) await sleep(settleRetryMs[Math.min(attempt, settleRetryMs.length - 1)]).catch(() => {});
+    }
+    // The relay must know it owes a retry before the local execution stops watching. If the report never landed, leave
+    // the execution running so a restart reattaches and evaluates the workspace again instead of stranding the Task.
+    if (!reported) return false;
+    await harness.commit(async tx => {
+      const record = await tx.doc(TaskExecution, taskId, null);
+      if (record.executionId !== executionId || record.state === 'cancelled' || record.finishAccepted) return;
+      record.state = 'blocked';
+      record.blockedReason = reason;
+    }, context);
+    return true;
+  }
+
+  // Continue a blocked execution in its own conversation after the workspace is restored. The conversation already holds
+  // the assignment and the work so far, so this adds a short instruction (plus a response that arrived while it was
+  // blocked). It never starts a second execution and never consumes the one corrective turn.
+  async function continueExecution(taskId, executionId, { note, itemId } = {}) {
+    const execution = await harness.snapshot(TaskExecution, taskId, context);
+    if (!execution || execution.executionId !== executionId) return { ok: false, reason: 'unknown_execution' };
+    if (execution.state !== 'blocked') return { ok: false, reason: 'not_blocked' };
+    if ((execution.continuations ?? 0) >= MAX_CONTINUATIONS) return { ok: false, reason: 'continuation_limit' };
+    const conversation = execution.conversationId ? await harness.conversation(execution.conversationId, context) : undefined;
+    if (!conversation) return { ok: false, reason: 'unknown_execution' };
+    const submissionId = await harness.commit(async tx => {
+      const record = await tx.doc(TaskExecution, taskId, null);
+      if (record.executionId !== executionId || record.state !== 'blocked') return undefined;
+      const run = await tx.doc(TaskRun, record.conversationId, null);
+      if (run.yielded !== undefined) return undefined;
+      const next = (record.continuations ?? 0) + 1;
+      // The conversation already holds the assignment, the work so far, and the tool receipts, so the continuation is a
+      // short instruction rather than a replay of the original request (which could repeat destructive steps).
+      const admitted = await conversation.admit(tx, {
+        type: 'input', requestId: `task-${taskId}-${executionId}-continue-${next}`, whenBusy: 'reject',
+        content: `${CONTINUE_TEXT}${note ? `\n\n${note}` : ''}`,
+      });
+      record.continuations = next;
+      record.submissionId = admitted;
+      record.state = 'running';
+      delete record.blockedReason;
+      if (itemId) record.resumedItem = itemId;
+      Object.assign(run, { taskId, executionId, state: 'running' });
+      delete run.yielded;
+      delete run.itemId;
+      return admitted;
+    }, context);
+    if (!submissionId) return { ok: false, reason: 'not_blocked' };
+    watch(taskId, executionId, submissionId);
+    return { ok: true, submissionId };
+  }
+
   async function applyTerminal(taskId, executionId, confirmation) {
     const state = confirmation.state;
     const localState = state === 'done' ? 'settled' : state === 'cancelled' ? 'cancelled' : 'failed';
@@ -646,6 +730,14 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
             if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
             return;
           }
+          // An active workspace that was lost or switched mid-run is a recoverable block: no corrective turn and no
+          // terminal failure are spent on it, and a restored workspace continues this same Task.
+          const workspace = await workspaceState(execution);
+          if (!workspace.ok) {
+            // A block the relay did not record leaves the execution reattachable for a restart rather than stranded.
+            await reportBlocked(taskId, executionId, workspace);
+            return;
+          }
           if (settled.status !== 'done') {
             const confirmation = await settle(taskId, executionId, 'failed', 'The Task execution ended without an answer.');
             if (confirmation.state) await applyTerminal(taskId, executionId, confirmation);
@@ -694,10 +786,19 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     if (existing?.executionId === executionId) {
       // A dispatch retry reuses the execution ID: the same child submission, never a second one. The workspace must
       // still prove its identity; a replaced directory blocks recoverably instead of being recreated or failed.
-      if (existing.workspace && taskGit) {
-        try { await taskGit.assertWorkspace(taskId); } catch (error) {
-          return { status: 'blocked', reason: error.code ?? 'worktree_missing', message: error.message };
-        }
+      const workspace = await workspaceState(existing);
+      if (!workspace.ok) return { status: 'blocked', reason: workspace.reason, message: workspace.message };
+      if (existing.state === 'blocked') {
+        const continued = await continueExecution(taskId, executionId);
+        if (continued.ok) return { status: 'running' };
+        // A competing dispatch already continued it; that dispatch owns the watcher, so this retry only acknowledges.
+        if (continued.reason === 'not_blocked') return { status: 'running' };
+        return {
+          status: 'blocked', reason: 'worktree_missing',
+          message: continued.reason === 'continuation_limit'
+            ? 'The Task workspace was lost repeatedly; the Task was not resumed. Restore it and start a new Task, or finish it explicitly.'
+            : 'The blocked Task execution could not be resumed; restore its workspace.',
+        };
       }
       if (existing.submissionId) watch(taskId, executionId, existing.submissionId);
       return { status: existing.state ?? 'running' };
@@ -746,7 +847,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       }
     }
     const workspaceText = workspace?.kind === 'worktree'
-      ? `Your Task workspace is ${workspace.path}, branch ${workspace.branch}, ${workspace.review ? `at the exact handed-off commit ${workspace.expectedHead}` : `based on ${workspace.baseSha}`}. Work and commit only there. Do not fetch or rebase.${workspace.review ? '' : ` To hand off a commit, push it to ${workspace.handoff ?? 'the configured handoff remote'} on branch ${workspace.branch} (for example git push ${workspace.handoff ?? '<handoff>'} HEAD:refs/heads/${workspace.branch}); finish verifies that branch without writing to it.`}`
+      ? workspace.review
+        ? `Your Task workspace is ${workspace.path}, branch ${workspace.branch}, checked out at the exact handed-off commit ${workspace.expectedHead} (compare against base ${workspace.baseSha}).${workspace.review.sourceBranch ? ` The source Task handed off branch ${workspace.review.sourceBranch}` : ' The source Task handed off a commit'}${workspace.review.sourceHandoff ? ` to ${workspace.review.sourceHandoff}` : ''}. Review that exact commit, not a moving branch tip. Work only in this worktree; do not fetch or rebase.`
+        : `Your Task workspace is ${workspace.path}, branch ${workspace.branch}, based on ${workspace.baseSha}. Work and commit only there. Do not fetch or rebase. To hand off a commit, push it to ${workspace.handoff ?? 'the configured handoff remote'} on branch ${workspace.branch} (for example git push ${workspace.handoff ?? '<handoff>'} HEAD:refs/heads/${workspace.branch}); finish verifies that branch without writing to it.`
       : workspace ? `Your Task workspace is ${workspace.path}. Work only there.` : '';
     const instructions = `${TASK_CHILD_RULES}${TASK_CHILD_POLICY}${blueprint ? `\n\nApply the following Blueprint only within those limits:\n${redact(blueprint.instructions)}` : ''}${workspaceText ? `\n\n${workspaceText}` : ''}`;
     const conversationId = await harness.commit(async tx => {
@@ -761,7 +864,9 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
         path: workspace.path,
         ...(workspace.kind === 'worktree' && {
           branch: workspace.branch, baseSha: workspace.baseSha, expectedHead: workspace.expectedHead,
-          ...(workspace.handoff && { handoff: workspace.handoff }), ...(workspace.review && { review: workspace.review }),
+          ...(workspace.handoff && { handoff: workspace.handoff }),
+          ...(workspace.remote && { remote: workspace.remote }),
+          ...(workspace.review && { review: workspace.review }),
         }),
       });
       return id;
@@ -802,6 +907,8 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
           ...(workspace.baseSha && { baseSha: workspace.baseSha }),
           ...(workspace.expectedHead && { expectedHead: workspace.expectedHead }),
           ...(workspace.handoff && { handoff: workspace.handoff }),
+          ...(workspace.remote && { remote: workspace.remote }),
+          ...(workspace.seed && { seed: workspace.seed }),
           ...(workspace.review && { review: workspace.review }),
         } }),
       });
@@ -840,13 +947,26 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
     const execution = await harness.snapshot(TaskExecution, taskId, context);
     if (!execution || execution.executionId !== executionId) return { delivered: false, reason: 'unknown_execution' };
     if (execution.state === 'cancelled') return { delivered: false, reason: 'no_parked_call' };
+    if ((execution.deliveredItems ?? []).includes(itemId)) return { delivered: true, replay: true };
     // A lost worktree is not recreated under a resumed Task. Stop with an explicit recovery reason instead.
     try {
       if (taskGit && execution.workspace) await taskGit.assertWorkspace(taskId);
     } catch (error) {
       return { delivered: false, reason: 'worktree_missing', message: error.message };
     }
-    if ((execution.deliveredItems ?? []).includes(itemId)) return { delivered: true, replay: true };
+    if (execution.state === 'blocked') {
+      // The Task was blocked on its workspace while this answer was queued. The workspace is back, so the answer
+      // continues the same execution instead of being lost or failing the Task.
+      const value = status === 'declined'
+        ? 'The owner declined the pending Inbox item.'
+        : `The owner answered the pending Inbox item:\n${boundedPlain(String(response ?? ''), MAX_TASK)}`;
+      const continued = await continueExecution(taskId, executionId, { note: value, itemId });
+      if (continued.ok) {
+        await recordDelivery(taskId, executionId, itemId);
+        return { delivered: true };
+      }
+      return { delivered: false, reason: continued.reason === 'continuation_limit' ? 'worktree_missing' : 'not_yet_parked' };
+    }
     if (!execution.conversationId) return { delivered: false, reason: 'unknown_execution' };
     const run = await harness.snapshot(TaskRun, execution.conversationId, context);
     if (!run) return { delivered: false, reason: 'unknown_execution' };

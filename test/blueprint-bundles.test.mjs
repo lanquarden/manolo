@@ -89,6 +89,26 @@ test('invalid bundles fail closed: lifecycle tools, profiles, paths, and non-own
   await symlink('/etc/hostname', join(root, 'LINK.md'));
   await invalid(value => { value.blueprints.general.files = ['LINK.md']; }, /regular file|stay inside/);
 
+  // A duplicate member name survives JSON.parse (last wins), so the raw text is checked: two Blueprints may not share
+  // an id, whatever a parser would do with them.
+  const raw = JSON.stringify(manifest).replace('"general":', '"review":').replace('"blueprints":{', '"blueprints":{"review":' + JSON.stringify(manifest.blueprints.general) + ',');
+  await writeFile(join(root, 'manifest.json'), raw);
+  assert.throws(() => loadWorkBlueprints(undefined, { dir: root }), /repeats a member name/);
+
+  // Base branch strings are validated as Git refs at config load, not at fetch time.
+  await write(manifest);
+  for (const base of ['main//release', 'release/', '..', 'a/../b', '.hidden', 'main.lock', 'ma in']) {
+    await invalid(value => { value.repositories.sample.base = base; }, /safe base branch/);
+  }
+  await write(manifest);
+  for (const base of ['main', 'release/2026-01', 'feature/task-blueprint-bundles']) {
+    const value = structuredClone(manifest);
+    value.repositories.sample.base = base;
+    await write(value);
+    assert.equal(loadWorkBlueprints(undefined, { dir: root }).repositories.get('sample').base, base);
+  }
+  await write(manifest);
+
   // The legacy map still loads beside a bundle directory, and duplicate ids are refused.
   await write(manifest);
   const legacy = JSON.stringify({ review: { description: 'Review', instructions: 'Short.' } });

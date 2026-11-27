@@ -590,6 +590,7 @@ function capabilityInventory(value) {
     blueprints: rows('blueprints', item => typeof item?.id === 'string' && {
       id: item.id.slice(0, 64),
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+      ...(text(item, 'profile', 64) !== undefined && { profile: text(item, 'profile', 64) }),
     }, 16),
     agentsFiles: rows('agentsFiles', item => typeof item?.path === 'string' && {
       path: item.path.slice(0, 1024),
@@ -861,7 +862,7 @@ async function internal(req, res, path) {
     return respond(res, 200, store.openInboxQuestion(agent, body.turnId, body.prompt, idem[0],
       name => config.owners.get(name)?.agent === agent));
   }
-  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat|state))?)?$/.exec(path);
+  const taskRoute = /^\/v1\/tasks(?:\/([0-9a-f]{32})(?:\/(cancel|inbox|progress|settle|finish|heartbeat|state|block))?)?$/.exec(path);
   if (taskRoute) {
     if (!workSessionAgents.size) throw fail(404);
     if (!workSessionsEnabled(agent)) throw fail(403);
@@ -914,11 +915,15 @@ async function internal(req, res, path) {
           ...(source.handoff.handoff && { handoff: source.handoff.handoff }),
         };
       }
+      // A structured new-style Task pins a snapshot, profile, review binding, or required evidence. It always needs the
+      // finish protocol, even during a mixed-version rollout: `legacy` is only for genuinely pre-upgrade rows, which are
+      // the only ones the migration marks `finish_required=0`.
+      const structured = Boolean(blueprintSnapshot || profile || review || body.requiresPullRequest === true);
       const task = store.tasks.create({
         owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
         blueprint: body.blueprint, blueprintSnapshot, profile, review,
         requiresPr: body.requiresPullRequest === true,
-        finishRequired: taskFinishRequired, notBefore: body.notBefore ?? 0, key: operationKey,
+        finishRequired: taskFinishRequired || structured, notBefore: body.notBefore ?? 0, key: operationKey,
       });
       return respond(res, 200, task);
     }
@@ -1016,6 +1021,13 @@ async function internal(req, res, path) {
         taskId, executionId: body.executionId, outcome: body.outcome, summary: body.summary,
         deliveredItems: delivered, key: operationKey,
       }));
+    }
+    // The child reports a recoverable workspace loss mid-run instead of spending a corrective turn or failing the Task.
+    if (req.method === 'POST' && action === 'block') {
+      const body = await readJson(req);
+      if (!ownFields(body, 'executionId', 'reason') || typeof body.executionId !== 'string' ||
+          !TASK_ID.test(body.executionId) || !isTaskNote(body.reason)) throw fail(400);
+      return respond(res, 200, { ok: store.tasks.block(taskId, body.executionId, body.reason) });
     }
     if (req.method === 'POST' && action === 'heartbeat') {
       const body = await readJson(req);
@@ -1248,6 +1260,12 @@ async function runTask(task) {
       return;
     }
     if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
+      // An accepted finish is the durable boundary even when the execution that accepted it has ended before the answer
+      // was delivered. Settle from the receipt instead of failing a finished Task.
+      if (store.tasks.meta(task.id)?.finishAccepted) {
+        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The accepted finish was reconciled after the execution ended.');
+        return;
+      }
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
       store.tasks.resumeUnavailable({
         taskId: task.id, executionId, itemId: item.id,
@@ -1267,15 +1285,21 @@ async function runTask(task) {
     store.tasks.block(task.id, executionId, 'The worker does not support the Task protocol needed by this assignment. Upgrade it; the same assignment will resume.');
     return;
   }
+  // The versioned path is the contract. If the probe said v2 but the worker was replaced in between, the v2 POST is
+  // refused or missing; the assignment is then held (blocked) and is never downgraded onto the old path.
+  const dispatchPath = requiresV2 ? `/v1/tasks/${task.id}/executions/v2` : `/v1/tasks/${task.id}/executions`;
   let result;
   try {
-    result = await workerTaskRequest(task.agent, `/v1/tasks/${task.id}/executions`, {
+    result = await workerTaskRequest(task.agent, dispatchPath, {
       method: 'POST',
       body: {
         executionId,
-        task: {
+        // The two routes carry two contracts. The versioned route carries the explicit protocol, pinned snapshot,
+        // profile, review binding, and finish/PR requirements; the plain route carries only the legacy shape, so a worker
+        // holding either contract cannot misread the other.
+        task: requiresV2 ? {
           protocol: 2,
-          finishRequired: task.finish_required === 1,
+          finishRequired: true,
           title: task.title, input: task.input,
           ...(task.context && { context: task.context }),
           ...(task.blueprint_id && {
@@ -1287,11 +1311,20 @@ async function runTask(task) {
           ...(task.profile_snapshot && { profile: JSON.parse(task.profile_snapshot) }),
           ...(task.review_snapshot && { review: JSON.parse(task.review_snapshot) }),
           ...(task.requires_pr === 1 && { requiresPullRequest: true }),
+        } : {
+          title: task.title, input: task.input,
+          ...(task.context && { context: task.context }),
+          ...(task.blueprint_id && { blueprint: { id: task.blueprint_id, revision: task.blueprint_revision } }),
         },
       },
     });
   } catch {
     store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
+    return;
+  }
+  if (requiresV2 && !result.ok && [404, 405, 415, 422].includes(result.status)) {
+    // A worker that no longer has the v2 route is not fed the same assignment through the old path.
+    store.tasks.block(task.id, executionId, BLOCKING_START.get('worker_protocol'));
     return;
   }
   if (result.ok && result.body?.status === 'blocked') {

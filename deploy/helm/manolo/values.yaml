@@ -24,6 +24,10 @@ runtimeIngressFrom: []
 # comma-separated list of agent IDs (for example "primary,canary"). Update the relay and
 # each listed worker's image before opting in.
 workSessionAgent: ''
+# Relay-side finish enforcement for Tasks. Empty keeps the default `required`: a success settle without a `finish` is
+# refused. `legacy` is only for a mixed-version rollout whose workers predate `finish`; a structured new-style Task still
+# requires it, because the relay records that requirement per Task.
+taskFinish: ''
 relayConfig:
   owners:
     owner: {agent: primary, passwordEnv: MANOLO_OWNER_PASSWORD}
@@ -47,6 +51,14 @@ agents:
     # and provider key are refused even when named here.
     bashEnv: []
     workBlueprints: {} # Optional named, non-secret instructions for delegated work.
+    # Optional operator-managed Blueprint bundle directory (manifest.json plus Markdown files). Set one of:
+    #   blueprintsDir: /some/path/inside/the/container   (for example an image-baked or separately mounted checkout)
+    #   blueprintsMount: {configMap: my-blueprints}      (rendered at /blueprints, read-only)
+    #   blueprintsMount: {secret: my-blueprints}
+    # Unset means no bundle: the worker keeps its default tools and the legacy text Blueprints only. A configured
+    # directory without a readable manifest fails worker startup instead of running with a silent default.
+    blueprintsDir: ''
+    blueprintsMount: {}
     # Opt-in headed Chromium sidecar. The agent drives it over loopback CDP and the
     # relay proxies its web desktop into the Manolo UI. Needs an immutable image
     # digest, a persistent profile claim and roughly 2Gi of pod memory.

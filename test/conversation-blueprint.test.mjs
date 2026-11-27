@@ -86,6 +86,29 @@ test('the conversation Blueprint is reapplied each turn, retries keep the old se
   await put('second', 'fixture:model');
   assert.deepEqual(JSON.parse((await get('second')).text), { model: 'fixture-conv', reasoning: 'low' });
 
+  // Removing the optional tool list resets the conversation to the worker's default selection instead of keeping the
+  // previous explicit list, and an explicit empty list remains a valid exact selection.
+  delete manifest.blueprints.main.tools;
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  await put('reset-tools', 'fixture:setup');
+  const defaults = JSON.parse((await get('reset-tools')).text);
+  assert.notDeepEqual(defaults.tools, ['read'], 'an omitted list clears the previous exact tools');
+  assert.ok(defaults.tools.includes('read') && defaults.tools.includes('bash'), 'the worker default tool set applies');
+  assert.ok(!defaults.tools.includes('create_task'), 'orchestration stays opt-in per turn');
+  manifest.blueprints.main.tools = [];
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  await put('empty-tools', 'fixture:setup');
+  assert.deepEqual(JSON.parse((await get('empty-tools')).text).tools, [], 'an explicit empty list offers no tools');
+
+  // Removing the profile clears the reasoning level instead of leaving the previous one in place.
+  delete manifest.blueprints.main.profile;
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  await put('reset-model', 'fixture:model');
+  assert.deepEqual(JSON.parse((await get('reset-model')).text), { model: 'fixture', reasoning: null });
+  // The retry of an already admitted turn still keeps what it was admitted with.
+  await put('second', 'fixture:model');
+  assert.deepEqual(JSON.parse((await get('second')).text), { model: 'fixture-conv', reasoning: 'low' });
+
   child.kill('SIGKILL');
   await closed;
   assert.doesNotMatch(log, /Unhandled|AssertionError|startup failed/);

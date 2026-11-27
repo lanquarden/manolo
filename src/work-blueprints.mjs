@@ -27,6 +27,51 @@ const unsafeText = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Bidi_Control}/u
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const invalid = message => new Error(message);
 
+// A Git branch name this service will fetch or check out. It follows check-ref-format's shape rules for the parts a
+// manifest can supply: no empty component, no leading/trailing or doubled separator, no dot component, no component that
+// begins with a dot or ends in `.lock`. `main//release` and `release/` are refused at config load, not at fetch time.
+export function isSafeBranch(value) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 128 || !/^[A-Za-z0-9._/-]+$/.test(value)) return false;
+  if (value.startsWith('/') || value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return false;
+  if (value.includes('//') || value.includes('..') || value.includes('@{') || value.includes('\\')) return false;
+  return value.split('/').every(part => part !== '' && part !== '.' && part !== '..' && !part.startsWith('.') && !part.endsWith('.lock'));
+}
+
+// JSON.parse silently keeps the last of two identical member names, which would let a duplicate Blueprint or profile id
+// through validation. Scan the raw text instead: a member name that is already present in the enclosing object fails.
+function duplicateMember(text) {
+  const stack = [];
+  let i = 0;
+  const space = c => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length) {
+        if (text[j] === '\\') { j += 2; continue; }
+        if (text[j] === '"') break;
+        j += 1;
+      }
+      let name;
+      try { name = JSON.parse(text.slice(i, j + 1)); } catch { return undefined; }
+      i = j + 1;
+      let k = i;
+      while (k < text.length && space(text[k])) k += 1;
+      const frame = stack.at(-1);
+      if (text[k] === ':' && frame?.object) {
+        if (frame.keys.has(name)) return name;
+        frame.keys.add(name);
+      }
+      continue;
+    }
+    if (c === '{') stack.push({ object: true, keys: new Set() });
+    else if (c === '[') stack.push({ object: false, keys: undefined });
+    else if (c === '}' || c === ']') stack.pop();
+    i += 1;
+  }
+  return undefined;
+}
+
 const sortKeys = value => Array.isArray(value) ? value.map(sortKeys)
   : value !== null && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sortKeys(value[key])]))
   : value;
@@ -76,9 +121,7 @@ function repositoryConfig(name, value) {
     throw invalid('A repository must be an object with remote, base, and optional handoff.');
   }
   const base = value.base;
-  if (typeof base !== 'string' || !/^[A-Za-z0-9._/-]{1,128}$/.test(base) || base.startsWith('/') || base.includes('..')) {
-    throw invalid(`Repository ${name} needs a safe base branch name.`);
-  }
+  if (!isSafeBranch(base)) throw invalid(`Repository ${name} needs a safe base branch name.`);
   const handoff = value.handoff === undefined ? undefined : remoteText(value.handoff, `Repository ${name} handoff`);
   if (handoff !== undefined) {
     try { validateHandoffRemote(handoff); } catch (error) { throw invalid(`Repository ${name}: ${error.message}`); }
@@ -179,6 +222,8 @@ function legacyBlueprints(raw) {
   if (raw.length > 64 * 1024) throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 named, non-secret text blueprints with description and instructions.');
   let value;
   try { value = JSON.parse(raw); } catch { throw invalid('MANOLO_WORK_BLUEPRINTS must be valid JSON.'); }
+  const repeated = duplicateMember(raw);
+  if (repeated !== undefined) throw invalid(`MANOLO_WORK_BLUEPRINTS repeats a blueprint id: ${repeated}.`);
   if (!isObject(value) || Object.keys(value).length > 12) throw invalid('MANOLO_WORK_BLUEPRINTS must define at most 12 blueprints.');
   return new Map(Object.entries(value).map(([id, blueprint]) => {
     if (!BLUEPRINT_ID.test(id) || !isObject(blueprint) || Object.keys(blueprint).length !== 2 ||
@@ -218,7 +263,10 @@ export function loadWorkBlueprints(raw, { dir, env = process.env } = {}) {
   try {
     const bytes = readFileSync(join(root, 'manifest.json'));
     if (bytes.byteLength > MAX_MANIFEST_BYTES) throw invalid('Blueprint manifest is too large.');
-    manifest = JSON.parse(bytes.toString('utf8'));
+    const text = bytes.toString('utf8');
+    manifest = JSON.parse(text);
+    const repeated = duplicateMember(text);
+    if (repeated !== undefined) throw invalid(`Blueprint manifest repeats a member name: ${repeated}.`);
   } catch (error) {
     if (error.code === 'ENOENT') throw invalid('MANOLO_BLUEPRINTS_DIR has no manifest.json.');
     if (error.message?.startsWith('Blueprint manifest')) throw error;

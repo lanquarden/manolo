@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
 import { key } from '../src/relay-config.mjs';
-import { loadWorkBlueprints } from '../src/work-blueprints.mjs';
+import { loadWorkBlueprints, sealBlueprintSnapshot } from '../src/work-blueprints.mjs';
 
 const cwd = new URL('../', import.meta.url);
 const secret = () => randomBytes(24).toString('hex');
@@ -294,8 +294,8 @@ test('a durable Task queues, parks on Inbox, survives relay and worker restart, 
   const cancelledDetail = await (await request(relay.web, `/api/tasks/${cancellable.id}`, auth)).json();
   assert.deepEqual(cancelledDetail.task.items.map(entry => entry.status), ['cancelled']);
   // A dispatch that races the stop is refused by the worker's cancelled-execution tombstone.
-  const late = await request(worker.url, `/v1/tasks/${cancellable.id}/executions`, { authorization: `Bearer ${env.CANARY_TOKEN}` }, 'POST',
-    { executionId: 'f'.repeat(32), task: { title: 'Late dispatch', input: 'Should not run.' } });
+  const late = await request(worker.url, `/v1/tasks/${cancellable.id}/executions/v2`, { authorization: `Bearer ${env.CANARY_TOKEN}` }, 'POST',
+    { executionId: 'f'.repeat(32), task: { protocol: 2, finishRequired: true, title: 'Late dispatch', input: 'Should not run.' } });
   const lateBody = await late.json();
   assert.equal(late.status, 409, JSON.stringify(lateBody));
   assert.equal(lateBody.reason, 'task_cancelled');
@@ -420,6 +420,52 @@ test('a Task ledger refuses stale executions, keeps retries stable, and fences c
     assert.equal(store.get(scope, retried.id).status, 'failed');
     assert.equal(store.get(scope, retried.id).failure, 'Blueprint revision gone');
     assert.equal(store.failExecution(retried.id, claimedRetry.execution_id, 'again'), false, 'a terminal Task is fenced');
+
+    // A recoverable block is visible and is cleared only by the acknowledgement that matches the current obligation.
+    const blocked = store.create({ ...base, title: 'Blocked', key: 'create-blocked' });
+    const claimedBlocked = store.claim(5_000);
+    assert.equal(claimedBlocked.id, blocked.id);
+    assert.equal(store.block(blocked.id, claimedBlocked.execution_id, 'The Task worktree is missing.'), true);
+    assert.equal(store.get(scope, blocked.id).blocked, 'The Task worktree is missing.');
+    assert.equal(store.meta(blocked.id).blocked, 'The Task worktree is missing.');
+    const blockItem = store.park({ taskId: blocked.id, executionId: claimedBlocked.execution_id, kind: 'question', prompt: 'Resume?', key: 'i-block' });
+    store.respond(scope, blockItem.itemId, 'Yes');
+    const resumedBlock = store.claim(6_000);
+    assert.equal(resumedBlock.id, blocked.id);
+    // An older item's late acknowledgement cannot clear it.
+    assert.equal(store.resumeDelivered({ taskId: blocked.id, executionId: resumedBlock.execution_id, itemId: 'f'.repeat(32) }), true);
+    assert.equal(store.get(scope, blocked.id).blocked, 'The Task worktree is missing.');
+    assert.equal(store.resumeDelivered({ taskId: blocked.id, executionId: resumedBlock.execution_id, itemId: blockItem.itemId }), true);
+    assert.equal(store.get(scope, blocked.id).blocked, undefined, 'the matching resume acknowledgement clears the block');
+
+    // The accepted finish is authoritative over an exhausted dispatch retry budget.
+    const finished = store.create({ ...base, title: 'Finish then retry', key: 'create-finished' });
+    const claimedFinish = store.claim(7_000);
+    assert.equal(claimedFinish.id, finished.id);
+    assert.deepEqual(store.acceptFinish({ taskId: finished.id, executionId: claimedFinish.execution_id, summary: 'Finished.', key: 'f-retry' }), { accepted: true });
+    assert.equal(store.retryDispatch(finished.id, claimedFinish.execution_id, 7_100, 'Worker unreachable.'), 'settled');
+    const settledFinished = store.get(scope, finished.id);
+    assert.equal(settledFinished.status, 'done');
+    assert.equal(settledFinished.outcome, 'Finished.');
+
+    // Pull-request evidence is mandatory for a Task that requires it and is bound to the accepted commit.
+    const pr = store.create({ ...base, title: 'PR', key: 'create-pr', requiresPr: true, finishRequired: true });
+    const claimedPr = store.claim(8_000);
+    assert.equal(claimedPr.id, pr.id);
+    assert.throws(() => store.acceptFinish({ taskId: pr.id, executionId: claimedPr.execution_id, summary: 'No PR', key: 'f-pr-0' }),
+      { statusCode: 409 });
+    assert.throws(() => store.acceptFinish({
+      taskId: pr.id, executionId: claimedPr.execution_id, summary: 'Bad PR', key: 'f-pr-1',
+      evidence: { commit: 'a'.repeat(40), pullRequest: { url: 'https://github.com/./../pull/1', commit: 'a'.repeat(40) } },
+    }), { statusCode: 409 });
+    assert.throws(() => store.acceptFinish({
+      taskId: pr.id, executionId: claimedPr.execution_id, summary: 'Wrong commit', key: 'f-pr-2',
+      evidence: { commit: 'a'.repeat(40), pullRequest: { url: 'https://github.com/lanquarden/manolo/pull/2', commit: 'b'.repeat(40) } },
+    }), { statusCode: 409 });
+    assert.deepEqual(store.acceptFinish({
+      taskId: pr.id, executionId: claimedPr.execution_id, summary: 'With PR', key: 'f-pr-3',
+      evidence: { commit: 'a'.repeat(40), pullRequest: { url: 'https://github.com/lanquarden/manolo/pull/2', commit: 'a'.repeat(40) } },
+    }).accepted, true);
     // Owner isolation: another scope cannot read or respond.
     assert.equal(store.get('other', task.id), undefined);
     assert.throws(() => store.respond('other', parked.itemId, 'Answer'), { statusCode: 404 });
@@ -480,7 +526,7 @@ test('a definitively lost execution fails the Task, keeps the answer, and never 
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -534,11 +580,14 @@ test('a legacy row without the finish protocol still settles a queued Task', { t
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
-    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions(?:\/v2)?$/.test(req.url)) {
       let body = ''; for await (const chunk of req) body += chunk;
       const parsed = JSON.parse(body);
-      assert.equal(parsed.task.finishRequired, false);
-      const taskId = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url)[1];
+      // The plain route carries the legacy shape only: no protocol, no finish requirement, no pinned fields.
+      assert.equal(parsed.task.finishRequired, undefined);
+      assert.equal(parsed.task.protocol, undefined);
+      assert.match(req.url, /\/executions$/);
+      const taskId = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url)[1];
       await fetch(`${relayInternal}/v1/tasks/${taskId}/settle`, {
         method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': 'settle-legacy' },
         body: JSON.stringify({ executionId: parsed.executionId, outcome: 'done', summary: 'legacy done' }),
@@ -577,7 +626,7 @@ test('an unavailable pinned profile blocks and later resumes the same assignment
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
-    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions(?:\/v2)?$/.test(req.url)) {
       let body = ''; for await (const chunk of req) body += chunk;
       const parsed = JSON.parse(body);
       dispatch.push(parsed);
@@ -625,7 +674,7 @@ test('a new-style Task is blocked before an old worker is asked to run a substit
     const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.url === '/v1/task-protocol') return protocol === 2 ? json({ version: 2 }) : json({}, 404);
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
-    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions(?:\/v2)?$/.test(req.url)) {
       let body = ''; for await (const chunk of req) body += chunk;
       dispatch.push(JSON.parse(body));
       return json({ status: 'running' });
@@ -674,7 +723,7 @@ test('a lost dispatch acknowledgement retries the same execution and accepts a f
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -729,7 +778,7 @@ test('a lost resume acknowledgement is retried under the same IDs and is never r
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -798,7 +847,7 @@ test('a settle that carries the worker receipt records the delivery when the res
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -863,7 +912,7 @@ test('an ambiguous resume acknowledgement is retried with the same IDs and answe
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -935,7 +984,7 @@ test('a relay restart between claim and dispatch re-drives the same execution id
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push({ taskId: dispatch[1], ...body });
@@ -984,7 +1033,7 @@ test('cancelling a Task retries the worker stop, reports it as unconfirmed, and 
     if (req.url === '/v1/task-protocol') return json({ version: 2 });
     if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
     const read = async () => { let body = ''; for await (const chunk of req) body += chunk; return body ? JSON.parse(body) : {}; };
-    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions$/.exec(req.url);
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions(?:\/v2)?$/.exec(req.url);
     if (dispatch) {
       const body = await read();
       calls.dispatch.push(body);
@@ -1092,4 +1141,220 @@ test('the detail names the newest open item, and History pages and filters witho
   } finally {
     db.close();
   }
+});
+
+test('a legacy finish rollout still requires finish and pull-request evidence for a structured new Task', { timeout: 60_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-legacy-structured-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  const commit = 'a'.repeat(40);
+  const calls = { settle: [], finish: [], dispatch: [] };
+  const relayInternal = { url: 'http://127.0.0.1:1' };
+  const relayCall = async (path, body, idem) => {
+    const response = await fetch(`${relayInternal.url}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(idem && { 'idempotency-key': idem }) },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+    });
+    return [response.status, await response.json().catch(() => ({}))];
+  };
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const parsed = body ? JSON.parse(body) : {};
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions\/v2$/.exec(req.url);
+    if (dispatch) {
+      const taskId = dispatch[1];
+      const executionId = parsed.executionId;
+      calls.dispatch.push(taskId);
+      // In a legacy rollout a structured Task is still a new contract: a bare success is refused, and so is finish
+      // without canonical pull-request evidence bound to the accepted commit and the configured destination.
+      calls.settle.push((await relayCall(`/v1/tasks/${taskId}/settle`,
+        { executionId, outcome: 'done', summary: 'skipped finish' }, 'settle-skip'))[0]);
+      calls.finish.push((await relayCall(`/v1/tasks/${taskId}/finish`, { executionId, summary: 'no evidence' }, 'finish-none'))[0]);
+      calls.finish.push((await relayCall(`/v1/tasks/${taskId}/finish`, {
+        executionId, summary: 'malformed url',
+        evidence: { commit, pullRequest: { url: 'https://github.com/./../pull/1', commit } },
+      }, 'finish-malformed'))[0]);
+      calls.finish.push((await relayCall(`/v1/tasks/${taskId}/finish`, {
+        executionId, summary: 'wrong destination',
+        evidence: { commit, pullRequest: { url: 'https://github.com/someone-else/fork/pull/1', commit } },
+      }, 'finish-wrong-repo'))[0]);
+      calls.finish.push((await relayCall(`/v1/tasks/${taskId}/finish`, {
+        executionId, summary: 'with evidence',
+        evidence: { commit, pullRequest: { url: 'https://github.com/lanquarden/manolo/pull/12', commit } },
+      }, 'finish-good'))[0]);
+      calls.settle.push((await relayCall(`/v1/tasks/${taskId}/settle`,
+        { executionId, outcome: 'done', summary: 'with evidence' }, 'settle-done'))[0]);
+      return json({ status: 'running' });
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relay = await launchTaskRelay(t, {
+    root, dataDir: join(root, 'relay'), stubUrl: addr(server.address().port), token, password,
+    extraEnv: { MANOLO_TASK_FINISH: 'legacy' },
+  });
+  relayInternal.url = relay.internal;
+  const auth = basic('owner', password);
+  assert.equal((await request(relay.web, '/api/turns', auth, 'POST', { id: 'legacy-structured', text: 'Start' }, mutation)).status, 200);
+  const snapshot = sealBlueprintSnapshot({
+    id: 'repo', role: 'task', description: 'Repository Task', instructions: 'Work in the repository.',
+    tools: ['report_progress', 'post_inbox', 'finish'], files: [],
+    repository: { name: 'sample', remote: 'https://github.com/lanquarden/manolo.git', base: 'main' },
+  });
+  const created = await request(relay.internal, '/v1/tasks', { authorization: `Bearer ${token}` }, 'POST', {
+    turnId: key('web', 'owner', 'canary', 'legacy-structured'), title: 'Legacy PR Task', task: 'Do it.',
+    blueprint: { id: 'repo', revision: snapshot.revision, snapshot }, requiresPullRequest: true,
+  }, { 'idempotency-key': 'create-legacy-structured' });
+  assert.equal(created.status, 200, await created.clone().text());
+  const task = await created.json();
+  const done = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === task.id && row.status === 'done'), 'structured Task finishes');
+  assert.equal(done.outcome, 'with evidence');
+  assert.equal(done.handoff.commit, commit);
+  assert.equal(done.handoff.pullRequest.url, 'https://github.com/lanquarden/manolo/pull/12');
+  assert.deepEqual(calls.dispatch.length, 1);
+  assert.deepEqual(calls.settle, [409, 200], 'a bare success is refused even in legacy mode');
+  assert.deepEqual(calls.finish, [409, 409, 409, 200], 'pull-request evidence is structural and destination-bound');
+  const db = new DatabaseSync(join(root, 'relay', 'relay.sqlite'));
+  assert.equal(db.prepare('SELECT finish_required FROM tasks WHERE id=?').get(task.id).finish_required, 1, 'the ledger records the new contract per Task');
+  db.close();
+});
+
+test('a worker downgraded between the protocol probe and dispatch is blocked, never fed the assignment on the old path', { timeout: 60_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-downgrade-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  let upgraded = false;
+  const calls = { v2: [], plain: [] };
+  const relayInternal = { url: 'http://127.0.0.1:1' };
+  const relayCall = async (path, body, idem) => {
+    const response = await fetch(`${relayInternal.url}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(idem && { 'idempotency-key': idem }) },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+    });
+    return [response.status, await response.json().catch(() => ({}))];
+  };
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    // The probe still reports a modern worker: the replacement happens after it, before the assignment arrives.
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const parsed = body ? JSON.parse(body) : {};
+    const v2 = /^\/v1\/tasks\/([0-9a-f]{32})\/executions\/v2$/.exec(req.url);
+    if (v2) {
+      if (!upgraded) { res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"not found"}'); return; }
+      calls.v2.push({ taskId: v2[1], body: parsed });
+      const [status] = await finishAndSettle(relayCall, v2[1], { executionId: parsed.executionId, outcome: 'done', summary: 'Ran on v2.' }, 'settle-v2');
+      return json({ status: status === 200 ? 'running' : 'failed' });
+    }
+    if (/^\/v1\/tasks\/[0-9a-f]{32}\/executions$/.test(req.url)) {
+      calls.plain.push({ url: req.url, body: parsed });
+      return json({ status: 'running' });
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relay = await launchTaskRelay(t, { root, dataDir: join(root, 'relay'), stubUrl: addr(server.address().port), token, password });
+  relayInternal.url = relay.internal;
+  const auth = basic('owner', password);
+  assert.equal((await request(relay.web, '/api/turns', auth, 'POST', { id: 'downgrade', text: 'Start' }, mutation)).status, 200);
+  const created = await request(relay.internal, '/v1/tasks', { authorization: `Bearer ${token}` }, 'POST', {
+    turnId: key('web', 'owner', 'canary', 'downgrade'), title: 'Pinned on rollout', task: 'Do the work.',
+    profile: { id: 'deep', description: 'Deep profile', provider: 'manolo-fixture', model: 'fixture-deep', thinkingLevel: 'high' },
+  }, { 'idempotency-key': 'create-downgrade' });
+  assert.equal(created.status, 200, await created.clone().text());
+  const task = await created.json();
+  const blocked = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === task.id && row.blocked), 'downgraded worker is held');
+  assert.match(blocked.blocked, /protocol/i);
+  assert.equal(blocked.status, 'running');
+  assert.deepEqual(calls.plain, [], 'a new-style assignment is never sent to the old path');
+  // The worker comes back modern: the same Task, execution, and assignment resume on the versioned path only.
+  upgraded = true;
+  const db = new DatabaseSync(join(root, 'relay', 'relay.sqlite'));
+  db.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(task.id);
+  db.close();
+  const done = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === task.id && row.status === 'done'), 'same Task resumes');
+  assert.equal(done.outcome, 'Ran on v2.');
+  assert.equal(done.blocked, undefined, 'the healthy admission acknowledgement clears the block');
+  assert.equal(calls.v2.length, 1);
+  assert.equal(calls.v2[0].body.task.profile.model, 'fixture-deep', 'the pinned profile arrived unchanged');
+  assert.deepEqual(calls.plain, []);
+});
+
+test('an accepted finish survives a lost resume acknowledgement and a lost execution', { timeout: 60_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-finish-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const token = secret();
+  const password = secret();
+  let taskId;
+  let executionId;
+  let itemId;
+  let resumes = 0;
+  const dispatchCalls = [];
+  const relayInternal = { url: 'http://127.0.0.1:1' };
+  const post = async (path, body, idem) => {
+    const response = await fetch(`${relayInternal.url}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(idem && { 'idempotency-key': idem }) },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+    });
+    return [response.status, await response.json().catch(() => ({}))];
+  };
+  const server = createServer(async (req, res) => {
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url === '/v1/task-protocol') return json({ version: 2 });
+    if (req.url.startsWith('/v1/turns/')) { for await (const chunk of req) void chunk; return json({ status: 'done', text: 'ok' }); }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const parsed = body ? JSON.parse(body) : {};
+    const dispatch = /^\/v1\/tasks\/([0-9a-f]{32})\/executions\/v2$/.exec(req.url);
+    if (dispatch) {
+      taskId = dispatch[1];
+      executionId = parsed.executionId;
+      dispatchCalls.push(parsed);
+      const [status, parked] = await post(`/v1/tasks/${taskId}/inbox`,
+        { executionId, kind: 'question', prompt: 'Continue?' }, 'park-finish-resume');
+      assert.equal(status, 200);
+      itemId = parked.itemId;
+      return json({ status: 'parked' });
+    }
+    const resume = /^\/v1\/tasks\/([0-9a-f]{32})\/resume$/.exec(req.url);
+    if (resume) {
+      if (++resumes > 1) {
+        // The execution is gone by the second attempt; the accepted finish is the only authoritative fact left.
+        return json({ delivered: false, reason: 'unknown_execution' });
+      }
+      const [accepted] = await post(`/v1/tasks/${resume[1]}/finish`,
+        { executionId: parsed.executionId, summary: 'Completed with your answer.' }, 'finish-during-resume');
+      assert.equal(accepted, 200);
+      res.writeHead(502).end();
+      return;
+    }
+    res.writeHead(404).end();
+  }).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const relay = await launchTaskRelay(t, { root, dataDir: join(root, 'relay'), stubUrl: addr(server.address().port), token, password });
+  relayInternal.url = relay.internal;
+  const auth = basic('owner', password);
+  await createTaskForTest(relay.web, relay.internal, token, auth, { title: 'Resume then finish' });
+  await until(() => itemId, 'stub parks');
+  assert.equal((await request(relay.web, `/api/tasks/${taskId}/inbox/${itemId}/respond`, auth, 'POST', { answer: 'yes' }, mutation)).status, 200);
+  const done = await until(async () => (await taskList(relay.web, auth)).find(row => row.id === taskId && ['done', 'failed'].includes(row.status)), 'Task settles from the accepted finish');
+  assert.equal(done.status, 'done', JSON.stringify(done));
+  assert.equal(done.outcome, 'Completed with your answer.');
+  assert.equal(done.blocked, undefined);
+  assert.equal(dispatchCalls.length, 1, 'no replacement child is started');
+  assert.equal(done.executionId, undefined, 'the terminal row no longer advertises a live execution');
 });

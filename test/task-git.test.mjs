@@ -58,7 +58,7 @@ test('repository Tasks get independent worktrees, isolated handoffs, restart reu
   const { version, mirror, remoteHash, expectedHead, ...legacyRecord } = oldRecord;
   await writeFile(join(repo.dataDir, 'task-worktrees', `${a}.json`), JSON.stringify(legacyRecord));
   const upgraded = await restarted.assertWorkspace(a);
-  assert.equal(upgraded.version, 2);
+  assert.equal(upgraded.version, 3);
   assert.equal(upgraded.expectedHead, repo.baseSha);
 
   // Read-only work can finish without a handoff.
@@ -207,4 +207,130 @@ test('a replaced or missing worktree is reported and never accepted as the recor
   await rm(join(scratch.path, 'only-copy.txt'));
   assert.deepEqual(await taskGit.cleanup(scratchId, { terminal: true }), { removed: true });
   await assert.rejects(taskGit.prepareScratch(scratchId), error => error.code === 'worktree_missing');
+});
+
+test('two Tasks in one repository get independent Git common dirs, stashes, checkouts, and config', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const a = id();
+  const b = id();
+  const [first, second] = await Promise.all([
+    taskGit.prepare(a, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }),
+    taskGit.prepare(b, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }),
+  ]);
+  // A Task's Git common dir is its own clone, not the shared seed store.
+  assert.notEqual(first.mirror, second.mirror);
+  assert.notEqual(first.mirror, first.seed);
+  assert.equal(await git(first.path, 'rev-parse', '--git-common-dir'), first.mirror);
+  assert.equal(await git(second.path, 'rev-parse', '--git-common-dir'), second.mirror);
+
+  // Ordinary stash operations stay inside the Task that ran them.
+  await writeFile(join(first.path, 'stashed-a.txt'), 'only in task A\n');
+  await git(first.path, 'stash', 'push', '--include-untracked', '-m', 'a-stash');
+  assert.match(await git(first.path, 'stash', 'list'), /a-stash/);
+  assert.equal(await git(second.path, 'stash', 'list'), '');
+  await writeFile(join(second.path, 'stashed-b.txt'), 'only in task B\n');
+  await git(second.path, 'stash', 'push', '--include-untracked', '-m', 'b-stash');
+  assert.match(await git(second.path, 'stash', 'list'), /b-stash/);
+  assert.doesNotMatch(await git(first.path, 'stash', 'list'), /b-stash/);
+  assert.notEqual(await git(first.path, 'rev-parse', 'refs/stash'), await git(second.path, 'rev-parse', 'refs/stash'));
+
+  // Config written by one Task is invisible to the other.
+  await git(first.path, 'config', 'manolo.marker', 'task-a');
+  await assert.rejects(git(second.path, 'config', '--get', 'manolo.marker'), /Command failed/);
+  assert.equal(await git(second.path, 'config', '--get', 'manolo.marker').catch(() => ''), '');
+
+  // Same-repository work runs concurrently without sharing a branch, index, or push destination.
+  await writeFile(join(first.path, 'a.txt'), 'a\n');
+  await writeFile(join(second.path, 'b.txt'), 'b\n');
+  await Promise.all([first.path, second.path].map(async path => {
+    const name = path === first.path ? 'a' : 'b';
+    await git(path, 'add', `${name}.txt`);
+    await git(path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', `${name} work`);
+  }));
+  const firstHead = await git(first.path, 'rev-parse', 'HEAD');
+  const secondHead = await git(second.path, 'rev-parse', 'HEAD');
+  assert.notEqual(firstHead, secondHead);
+  assert.equal(await git(first.path, 'symbolic-ref', '--short', 'HEAD'), `task/${a}`);
+  assert.equal(await git(second.path, 'symbolic-ref', '--short', 'HEAD'), `task/${b}`);
+  assert.equal(await git(first.path, 'rev-parse', `refs/heads/task/${b}`).catch(() => 'absent'), 'absent');
+  assert.equal(await git(second.path, 'rev-parse', `refs/heads/task/${a}`).catch(() => 'absent'), 'absent');
+});
+
+test('ignored and nested ignored additions are detected, blocked at finish, and preserved at cleanup', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const taskId = id();
+  const prepared = await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  // The Task commits its own ignore rules, then produces ignored output in a nested directory.
+  await writeFile(join(prepared.path, '.gitignore'), 'out/\n');
+  await mkdir(join(prepared.path, 'sub'), { recursive: true });
+  await writeFile(join(prepared.path, 'sub', '.gitignore'), 'nested.log\n');
+  await git(prepared.path, 'add', '.gitignore', 'sub/.gitignore');
+  await git(prepared.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'ignore rules');
+  const head = await git(prepared.path, 'rev-parse', 'HEAD');
+  await mkdir(join(prepared.path, 'out'), { recursive: true });
+  await writeFile(join(prepared.path, 'out', 'artifact.bin'), 'build output\n');
+  await mkdir(join(prepared.path, 'sub', 'cache'), { recursive: true });
+  await writeFile(join(prepared.path, 'sub', 'cache', 'nested.log'), 'nested output\n');
+  // Plain status would call this clean; finish refuses to lose it silently.
+  assert.equal(await git(prepared.path, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+  const refused = await taskGit.checkFinish(taskId);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, 'ignored_worktree_files');
+  assert.match(refused.message, /out\/|nested\.log/);
+  // Cleanup keeps the whole worktree and both ignored files, even for a relay-confirmed success.
+  const preserved = await taskGit.cleanup(taskId, { terminal: true, successful: true });
+  assert.equal(preserved.removed, false);
+  assert.equal(preserved.reason, 'ignored_worktree_files');
+  assert.equal(existsSync(prepared.path), true);
+  assert.equal(await readFile(join(prepared.path, 'out', 'artifact.bin'), 'utf8'), 'build output\n');
+  assert.equal(await readFile(join(prepared.path, 'sub', 'cache', 'nested.log'), 'utf8'), 'nested output\n');
+  const meta = await taskGit.readMeta(taskId);
+  assert.equal(meta.kind, 'preserved');
+  assert.equal(meta.preservedHead, head);
+});
+
+test('a review opens its exact pinned commit and base even after the upstream base ref is renamed or deleted', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const sourceId = id();
+  const source = await taskGit.prepare(sourceId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  await writeFile(join(source.path, 'reviewed.txt'), 'reviewed change\n');
+  await git(source.path, 'add', 'reviewed.txt');
+  await git(source.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'reviewed work');
+  const commit = await git(source.path, 'rev-parse', 'HEAD');
+  await git(source.path, 'push', repo.remote, `HEAD:refs/heads/task/${sourceId}`);
+  // The upstream branch moves on, is renamed, and its old name disappears: none of that changes the bound SHAs.
+  await git(repo.root, 'clone', repo.remote, join(repo.root, 'advance'));
+  const advance = join(repo.root, 'advance');
+  await git(advance, 'config', 'user.email', 'test@example.invalid');
+  await git(advance, 'config', 'user.name', 'Test');
+  await writeFile(join(advance, 'later.txt'), 'later\n');
+  await git(advance, 'add', 'later.txt');
+  await git(advance, 'commit', '-m', 'later upstream work');
+  const later = await git(advance, 'rev-parse', 'HEAD');
+  await git(advance, 'push', repo.remote, `HEAD:refs/heads/main`);
+  await git(advance, 'push', repo.remote, `HEAD:refs/heads/trunk`);
+  await git(repo.remote, 'update-ref', '-d', 'refs/heads/main');
+
+  const reviewId = id();
+  const review = await taskGit.prepareReview(reviewId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }, {
+    sourceTaskId: sourceId, commit, baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote,
+  });
+  assert.equal(await git(review.path, 'rev-parse', 'HEAD'), commit);
+  assert.notEqual(await git(review.path, 'rev-parse', 'HEAD'), later, 'a review never checks out a moving tip');
+  assert.equal(review.baseSha, repo.baseSha);
+  assert.equal(review.review.sourceBranch, `task/${sourceId}`);
+  assert.equal(review.review.sourceHandoff, repo.remote);
+  const finished = await taskGit.checkFinish(reviewId);
+  assert.equal(finished.ok, true);
+  assert.equal(finished.commit, commit);
+  assert.equal(finished.base, repo.baseSha);
+  assert.deepEqual(finished.review, review.review);
+
+  // A commit that is not in any configured remote fails closed; it is not replaced by the current tip.
+  await assert.rejects(taskGit.prepareReview(id(), { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }, {
+    sourceTaskId: sourceId, commit: 'f'.repeat(40), baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote,
+  }), error => error.code === 'review_commit_missing');
 });

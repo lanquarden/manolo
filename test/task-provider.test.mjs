@@ -90,3 +90,75 @@ test('the selected profile reaches the model request and explicitly listed defer
     await harness.close(context);
   }
 });
+
+test('a saved snapshot keeps its pinned provider, model, reasoning, tools, and text after the manifest profile changes', async t => {
+  const cfg = { mode: 'fixture', relay: 'http://in-process.invalid', token: 'fixture' };
+  const { models, model } = await createWorkerModels(cfg, {}, ['fixture-deep', 'fixture-alt']);
+  const registry = createRegistry();
+  // No current manifest at all: no blueprints and no profiles are configured on this worker.
+  const tasks = installTasks(registry, { cfg, model, models, profiles: new Map(), blueprints: new Map(), redact: text => text });
+  const harness = await Harness.open(new MemoryStorage(), {
+    models, registry, settings: () => ({ extensions: [], followUpMode: 'one-at-a-time', retry: { baseDelayMs: 1 } }),
+  }, context);
+  tasks.attach(harness);
+  harness.resume();
+  const store = openTaskStore(new DatabaseSync(':memory:'));
+  t.after(() => harness.close(context));
+  const pinned = sealBlueprintSnapshot({
+    id: 'general', role: 'task', description: 'saved recipe', instructions: 'saved instructions',
+    profile: { id: 'deep', description: 'Saved profile', provider: 'manolo-fixture', model: 'fixture-deep', thinkingLevel: 'high' },
+    tools: ['report_progress', 'post_inbox', 'finish'], files: [],
+  });
+  try {
+    for (const [label, expected] of [['removed profile', 'selected:fixture-deep:high'], ['re-pointed alias', 'selected:fixture-deep:high']]) {
+      const assignment = store.create({ owner: 'owner', agent: 'agent', scope: 'scope', originTurnId: 'turn', title: label, input: 'fixture:finish' });
+      const { execution_id: executionId } = store.claim(Date.now());
+      const settled = Promise.withResolvers();
+      globalThis.fetch = async (url, options) => {
+        const path = new URL(url).pathname;
+        const body = options.body ? JSON.parse(options.body) : {};
+        if (path.endsWith('/state')) return Response.json({ status: 'running', executionId, finishAccepted: false });
+        if (path.endsWith('/finish')) return Response.json(store.acceptFinish({ taskId: assignment.id, key: options.headers['idempotency-key'], ...body }));
+        if (path.endsWith('/settle')) {
+          const receipt = store.settle({ taskId: assignment.id, key: options.headers['idempotency-key'], ...body });
+          settled.resolve(body);
+          return Response.json(receipt);
+        }
+        if (path.endsWith('/heartbeat')) return Response.json({ ok: true });
+        throw new Error(`unexpected ${path}`);
+      };
+      assert.deepEqual(await tasks.dispatch({
+        taskId: assignment.id, executionId,
+        task: { protocol: 2, finishRequired: true, title: label, input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
+      }), { status: 'running' });
+      assert.equal((await settled.promise).summary, expected, label);
+    }
+    // An edited alias for the same profile id must not redirect an already-pinned Task.
+    const alias = new Map([['deep', { id: 'deep', description: 'Now cheap', model: { provider: 'manolo-fixture', modelId: 'fixture-alt' }, thinkingLevel: 'low' }]]);
+    const retargeted = installTasks(createRegistry(), { cfg, model, models, profiles: alias, blueprints: new Map(), redact: text => text });
+    retargeted.attach(harness);
+    const assignment = store.create({ owner: 'owner', agent: 'agent', scope: 'scope', originTurnId: 'turn', title: 'edited alias', input: 'fixture:finish' });
+    const { execution_id: executionId } = store.claim(Date.now());
+    const settled = Promise.withResolvers();
+    globalThis.fetch = async (url, options) => {
+      const path = new URL(url).pathname;
+      const body = options.body ? JSON.parse(options.body) : {};
+      if (path.endsWith('/state')) return Response.json({ status: 'running', executionId, finishAccepted: false });
+      if (path.endsWith('/finish')) return Response.json(store.acceptFinish({ taskId: assignment.id, key: options.headers['idempotency-key'], ...body }));
+      if (path.endsWith('/settle')) {
+        const receipt = store.settle({ taskId: assignment.id, key: options.headers['idempotency-key'], ...body });
+        settled.resolve(body);
+        return Response.json(receipt);
+      }
+      if (path.endsWith('/heartbeat')) return Response.json({ ok: true });
+      throw new Error(`unexpected ${path}`);
+    };
+    assert.deepEqual(await retargeted.dispatch({
+      taskId: assignment.id, executionId,
+      task: { protocol: 2, finishRequired: true, title: 'edited alias', input: 'fixture:finish', blueprint: { id: 'general', revision: pinned.revision, snapshot: pinned } },
+    }), { status: 'running' });
+    assert.equal((await settled.promise).summary, 'selected:fixture-deep:high');
+  } finally {
+    await harness.close(context);
+  }
+});

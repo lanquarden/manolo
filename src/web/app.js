@@ -1079,6 +1079,8 @@ function renderCapabilities(state) {
   capabilityList('capability-blueprints', state.blueprints ?? [], 'No blueprints configured.', blueprint => {
     const item = document.createElement('li');
     item.append(textNode('span', blueprint.id, 'capability-name'));
+    // The profile is the same one create_task pins, so the panel and the tool cannot disagree about a Blueprint.
+    if (blueprint.profile) item.append(textNode('span', blueprint.profile, 'badge'));
     if (blueprint.description) item.append(textNode('p', blueprint.description, 'capability-detail'));
     return item;
   });
@@ -1273,6 +1275,9 @@ function taskSummary(raw) {
     outcome: typeof raw.outcome === 'string' ? raw.outcome : undefined,
     failure: typeof raw.failure === 'string' ? raw.failure : undefined,
     progress: typeof raw.progress === 'string' ? raw.progress : undefined,
+    // A recoverable block (an unavailable profile, a lost or switched workspace) is visible where the owner looks: the
+    // active list and the Task detail, not only an event in the conversation.
+    blocked: typeof raw.blocked === 'string' && raw.blocked.trim() ? raw.blocked : undefined,
     inboxItem,
     // Cancelling the ledger row and stopping the worker are separate facts.
     stopPending: raw.stopPending === true,
@@ -1296,6 +1301,7 @@ function taskMeta(task) {
     textNode('span', `Status: ${TASK_STATUS_LABEL.get(task.status) ?? 'Unknown'}`),
     textNode('span', `Blueprint: ${blueprintLabel(task)}`, 'plain-text'),
     ...(task.scheduled && task.notBefore ? [textNode('span', `Scheduled for ${new Date(task.notBefore).toLocaleString()}`)] : []),
+    ...(task.blocked ? [textNode('span', `Blocked: ${task.blocked}`, 'plain-text')] : []),
     ...(task.progress ? [textNode('span', `Latest: ${task.progress}`, 'plain-text')] : []),
     ...(task.status === 'waiting' && task.inboxItem?.status === 'open'
       ? [textNode('span', task.inboxItem.kind === 'question' ? 'Waiting for your answer' : 'Waiting for your review', 'plain-text')]

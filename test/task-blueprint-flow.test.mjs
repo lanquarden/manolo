@@ -3,10 +3,11 @@ import { execFile } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
@@ -242,6 +243,31 @@ test('Blueprint snapshots pin profiles and tools; model/reasoning reach the requ
   }, 'lost worktree blocks recoverably');
   assert.equal(blocked.status, 'running');
   assert.match(blocked.blocked, /worktree|workspace/i);
+
+  // An active repository workspace that disappears mid-run blocks recoverably: the execution is not failed and its one
+  // corrective turn is not spent. Restoring the exact recorded path continues the same Task and execution.
+  await createTask('repo-active-loss', {
+    title: 'Active worktree loss', task: fixtureTool('bash', { command: 'mv "$PWD" "$PWD.lost"' }), blueprint: 'repo',
+  });
+  const active = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.title === 'Active worktree loss');
+    return row?.blocked && row;
+  }, 'active worktree loss blocks recoverably');
+  assert.equal(active.status, 'running');
+  assert.match(active.blocked, /worktree|workspace/i);
+  const activePath = join(workerData, 'task-worktrees', active.id);
+  await rename(`${activePath}.lost`, activePath);
+  const relayDb = new DatabaseSync(join(relayData, 'relay.sqlite'));
+  relayDb.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(active.id);
+  relayDb.close();
+  const continued = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === active.id);
+    return row?.status === 'done' && row;
+  }, 'restored workspace continues the same Task');
+  assert.equal(continued.id, active.id);
+  assert.equal(continued.failure, undefined);
+  assert.equal(continued.blocked, undefined, 'the healthy continuation clears the block');
+  assert.equal(continued.outcome, 'corrective finish', 'the block did not consume the corrective turn');
 
   // A required pull request fails closed without structured evidence and succeeds with a URL bound to the exact commit.  // A required pull request fails closed without structured evidence and succeeds with a URL bound to the exact commit.
   await createTask('review-pr', {

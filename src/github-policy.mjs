@@ -9,6 +9,44 @@ export const GITHUB_OPERATING_POLICY =
 
 const GITHUB = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/;
 const LOCAL = /^(?:\/|file:\/\/)/;
+const PULL_REQUEST = /^https:\/\/github\.com\/([A-Za-z0-9_-][A-Za-z0-9._-]*)\/([A-Za-z0-9_-][A-Za-z0-9._-]*)\/pull\/([1-9][0-9]{0,9})$/;
+
+/**
+ * Structural pull-request evidence: one canonical `https://github.com/<owner>/<repository>/pull/<number>` URL bound to
+ * the accepted Task commit. This is not a live GitHub check - no request is made - but it is strict about the shape:
+ * `new URL` normalizes `.` and `..` segments, so a URL such as `https://github.com/./../pull/1` must be refused rather
+ * than accepted as something that only looks like a pull request after normalization. When the Task's repository has a
+ * known GitHub destination, the URL must name exactly that owner/repository, so evidence from another repository cannot
+ * stand in for this Task's handoff.
+ */
+export function validatePullRequestEvidence({ url, commit, expectedCommit, destination } = {}) {
+  if (typeof url !== 'string' || url.length > 2048) throw new Error('A pull-request URL is required.');
+  const match = PULL_REQUEST.exec(url);
+  if (!match) throw new Error('A pull-request URL must be https://github.com/<owner>/<repository>/pull/<number>.');
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new Error('A pull-request URL must be a valid URL.'); }
+  const [, owner, repo, number] = match;
+  // A canonical pull-request URL has the bare repository name: `.git`, a dot segment, or a trailing dot is a different
+  // string that only normalization would hide.
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..' || owner.includes('..') || repo.includes('..') ||
+      repo.endsWith('.git') || repo.endsWith('.') || owner.endsWith('.') ||
+      parsed.origin !== 'https://github.com' || parsed.pathname !== `/${owner}/${repo}/pull/${number}` ||
+      parsed.search !== '' || parsed.hash !== '' || parsed.href !== url) {
+    throw new Error('A pull-request URL must be exactly https://github.com/<owner>/<repository>/pull/<number>.');
+  }
+  if (typeof commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(commit)) {
+    throw new Error('Pull-request evidence must name the accepted commit.');
+  }
+  if (expectedCommit !== undefined && commit !== expectedCommit) {
+    throw new Error('Pull-request evidence must name the accepted Task commit.');
+  }
+  if (destination !== undefined) {
+    if (destination.owner.toLowerCase() !== owner.toLowerCase() || destination.repo.toLowerCase() !== repo.toLowerCase()) {
+      throw new Error(`The pull request must target ${destination.owner}/${destination.repo}.`);
+    }
+  }
+  return { url, owner, repo, number: Number(number), commit };
+}
 
 export function githubRepository(remote) {
   if (typeof remote !== 'string') return undefined;

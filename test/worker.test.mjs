@@ -760,6 +760,11 @@ test('an idle fixture worker can rebind to a proxy without losing history', { ti
 
   const requests = [];
   const proxy = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'opencode-go/deepseek-v4.1-flash' }] }));
+      return;
+    }
     let data = '';
     for await (const chunk of req) data += chunk;
     requests.push({ url: req.url, headers: req.headers, body: JSON.parse(data) });
@@ -932,4 +937,70 @@ test('the worker exposes a bounded, read-only capabilities inventory behind its 
 
   const post = await request(url, '/v1/capabilities', { method: 'POST', headers: auth });
   assert.equal(post.code, 405);
+});
+
+test('the model proxy catalog is authoritative: unserved aliases and their Blueprints are not advertised', { timeout: 30_000 }, async t => {
+  const dir = await dataDir(t);
+  const bundles = join(dir, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  const manifest = {
+    version: 1,
+    profiles: {
+      served: { description: 'Served alias', model: 'served-model', thinkingLevel: 'high' },
+      absent: { description: 'Not in the proxy catalog', model: 'absent-model' },
+    },
+    blueprints: {
+      general: { description: 'Served Task', role: 'task', profile: 'served', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+      missing: { description: 'Absent Task', role: 'task', profile: 'absent', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  };
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  const catalogRequests = [];
+  const proxy = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      catalogRequests.push(req.headers.authorization);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'served-model' }] }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const chunk = (delta, finish_reason) => `data: ${JSON.stringify({ id: 'chunk', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(chunk({ role: 'assistant', content: 'Proxy reply' }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+  const settings = {
+    MANOLO_MODE: 'live', MANOLO_PROVIDER: 'model-proxy', MANOLO_MODEL: 'served-model',
+    MANOLO_MODEL_PROXY_URL: `http://127.0.0.1:${proxy.address().port}/v1`, MANOLO_MODEL_PROXY_KEY: 'synthetic-proxy-key',
+    MANOLO_BLUEPRINTS_DIR: bundles,
+  };
+  const worker = launch(t, dir, settings);
+  const url = await worker.start();
+  assert.equal(catalogRequests[0], 'Bearer synthetic-proxy-key');
+  const capabilities = (await request(url, '/v1/capabilities', { headers: auth })).body;
+  assert.deepEqual(capabilities.profiles.map(profile => profile.id), ['served']);
+  assert.deepEqual(capabilities.blueprints.map(blueprint => blueprint.id), ['general']);
+  assert.equal(capabilities.blueprints[0].profile, 'served');
+  await worker.stop();
+
+  // A configured default the proxy does not serve fails startup instead of advertising a dead model.
+  const refused = launch(t, await dataDir(t), { ...settings, MANOLO_MODEL: 'not-served' });
+  assert.deepEqual(await refused.closed, [1, null]);
+  assert.match(refused.logs(), /does not serve the configured model/);
+});
+
+test('a configured Blueprint bundle without a readable manifest fails startup instead of running silently unconfigured', { timeout: 15_000 }, async t => {
+  const empty = await dataDir(t);
+  const noManifest = launch(t, await dataDir(t), { MANOLO_BLUEPRINTS_DIR: empty });
+  assert.deepEqual(await noManifest.closed, [1, null]);
+  assert.match(noManifest.logs(), /no manifest\.json/);
+  const broken = await dataDir(t);
+  await writeFile(join(broken, 'manifest.json'), '{"version":1,"blueprints":{');
+  const invalid = launch(t, await dataDir(t), { MANOLO_BLUEPRINTS_DIR: broken });
+  assert.deepEqual(await invalid.closed, [1, null]);
+  assert.match(invalid.logs(), /not valid JSON/);
 });

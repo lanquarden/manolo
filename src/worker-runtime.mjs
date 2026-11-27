@@ -5,6 +5,27 @@ import { defineDoc, defineExtension, defineTool, ProviderDoc, wrapTool } from '@
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
 import { WORK_TOOL_NAMES } from './work-sessions.mjs';
 
+// The proxy exposes an OpenAI-compatible model list. It is read once at startup: the id it returns are the ids a profile
+// may resolve to. A request that fails or does not parse means the catalog is unknown, and only the explicit default is
+// advertised rather than every alias the manifest happens to name.
+async function proxyCatalog(url, apiKey) {
+  try {
+    const response = await fetch(`${url.href}/models`, {
+      headers: { authorization: `Bearer ${apiKey}` }, redirect: 'error', signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      return undefined;
+    }
+    const body = await response.json();
+    if (!Array.isArray(body?.data)) return undefined;
+    const ids = body.data.map(entry => entry?.id).filter(id => typeof id === 'string' && id.length <= 128);
+    return new Set(ids);
+  } catch {
+    return undefined;
+  }
+}
+
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
 const PROVIDERS = new Map(Object.entries({
   anthropic: ['anthropicProvider', 'ANTHROPIC_API_KEY'],
@@ -143,6 +164,12 @@ async function createProxyModels(modelId, env, profileModelIds = []) {
   if (!apiKey || !modelId || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(modelId) || !url ||
       !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash ||
       url.pathname !== '/v1') throw new Error('Invalid model proxy configuration');
+  // The proxy is the authority on what it serves. A configured alias that the proxy does not list is not advertised to
+  // the model, the capability panel, or a profile; a proxy that cannot answer the catalog request serves only the
+  // explicitly configured default model, so a stale alias can never look reachable.
+  const listed = await proxyCatalog(url, apiKey);
+  if (listed && !listed.has(modelId)) throw new Error('The model proxy does not serve the configured model.');
+  // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.
   const { openrouterProvider } = await import('@earendil-works/pi-ai/providers/openrouter');
   const transport = openrouterProvider();
   const provider = 'model-proxy';
@@ -153,7 +180,8 @@ async function createProxyModels(modelId, env, profileModelIds = []) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: true },
   });
-  const catalogModels = [...new Set([modelId, ...profileModelIds])].map(catalogModelFor);
+  const catalogIds = [...new Set([modelId, ...(listed ? profileModelIds.filter(id => listed.has(id)) : [])])];
+  const catalogModels = catalogIds.map(catalogModelFor);
   if (thinkingLevel && !getSupportedThinkingLevels(catalogModels[0]).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
   // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.
   const optionsFor = opts => ({ ...opts, headers: { ...opts?.headers, 'user-agent': 'Manolo/1.0',

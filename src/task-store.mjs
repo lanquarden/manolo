@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { githubRepository, validatePullRequestEvidence } from './github-policy.mjs';
 
 // The durable Task ledger. The relay owns it: a Task keeps its identity through queuing, one execution at a time,
 // pauses for a person, and a terminal outcome. The scheduler claims eligible rows here; the worker executes them and
@@ -357,8 +358,9 @@ export function openTaskStore(db) {
         const executionId = next.execution_id ?? newId();
         // `dispatch_pending` is the durable marker that an outbound RPC is owed for this execution identity. It survives
         // a relay restart, so a claim committed just before a crash is re-driven with the same IDs instead of being lost.
+        // The claim is not an acknowledgement: a visible block stays until the matching dispatch/resume ACK clears it.
         const changed = db.prepare(`UPDATE tasks SET status='running', execution_id=?, claim_at=?, heartbeat_at=?, next_at=0,
-          dispatch_pending=1, dispatch_attempts=0, blocked_reason=NULL, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
+          dispatch_pending=1, dispatch_attempts=0, updated_at=? WHERE id=? AND status='queued' AND not_before<=?`)
           .run(executionId, now, now, iso(now), next.id, now);
         if (changed.changes !== 1) return undefined;
         return row.get(next.id);
@@ -371,6 +373,15 @@ export function openTaskStore(db) {
       return transaction(() => {
         const task = row.get(taskId);
         if (!task || task.status !== 'running' || task.execution_id !== executionId) return false;
+        // The accepted finish is the durable terminal boundary. A lost acknowledgement, an exhausted retry budget, or a
+        // lost answer must not downgrade it to a failure: settle it from the receipt instead.
+        if (task.finish_accepted_at) {
+          db.prepare(`UPDATE tasks SET status='done', outcome=?, failure=NULL, execution_kind='start', resume_item_id=NULL,
+            context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=?`)
+            .run(plain(task.finish_summary ?? 'The Task finished.', MAX_SUMMARY), iso(now), taskId);
+          addEvent.run(taskId, task.scope, 'outcome', `Task “${task.title}” finished.`, iso(now));
+          return 'settled';
+        }
         const attempts = task.dispatch_attempts + 1;
         if (attempts > MAX_DISPATCH_ATTEMPTS) {
           db.prepare(`UPDATE tasks SET status='failed', failure=?, outcome=NULL, execution_kind='start', resume_item_id=NULL,
@@ -458,7 +469,7 @@ export function openTaskStore(db) {
         const task = row.get(taskId);
         if (!task || task.status !== 'running' || task.execution_id !== executionId || task.finish_accepted_at) return false;
         db.prepare(`UPDATE tasks SET status='failed', outcome=NULL, failure=?, execution_kind='start', resume_item_id=NULL,
-          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`).run(plain(reason, MAX_NOTE), iso(now), taskId);
+          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=?`).run(plain(reason, MAX_NOTE), iso(now), taskId);
         addEvent.run(taskId, task.scope, 'outcome', `Task “${task.title}” failed.`, iso(now));
         return true;
       });
@@ -471,6 +482,8 @@ export function openTaskStore(db) {
         finishAccepted: Boolean(task.finish_accepted_at), finishSummary: task.finish_summary ?? null,
         blocked: task.blocked_reason ?? null, handoff: task.handoff_evidence ? JSON.parse(task.handoff_evidence) : null,
         review: task.review_snapshot ? JSON.parse(task.review_snapshot) : null,
+        requiresPullRequest: task.requires_pr === 1, finishRequired: task.finish_required === 1,
+        repository: task.blueprint_snapshot ? (JSON.parse(task.blueprint_snapshot).repository ?? null) : null,
       };
     },
 
@@ -493,8 +506,23 @@ export function openTaskStore(db) {
           return { accepted: true, replay: true, summary: task.finish_summary ?? null,
             ...(task.handoff_evidence && { evidence: JSON.parse(task.handoff_evidence) }) };
         }
+        // A pull request is mandatory evidence for this Task, whatever the rollout mode says about finish enforcement.
+        if (task.requires_pr === 1) {
+          const commit = evidence?.commit;
+          if (commit === undefined) throw bad(409, 'A pull request and its Task commit are required for this Task');
+          try {
+            const repository = task.blueprint_snapshot ? JSON.parse(task.blueprint_snapshot)?.repository : undefined;
+            validatePullRequestEvidence({
+              url: evidence?.pullRequest?.url, commit: evidence?.pullRequest?.commit, expectedCommit: commit,
+              destination: githubRepository(repository?.remote),
+            });
+          } catch (error) {
+            throw bad(409, error.message);
+          }
+        }
         db.prepare(`UPDATE tasks SET finish_accepted_at=?, finish_summary=?, handoff_evidence=?, blocked_reason=NULL,
-          updated_at=? WHERE id=?`)
+          dispatch_pending=0, dispatch_attempts=0, next_at=0,
+          execution_kind='start', resume_item_id=NULL, updated_at=? WHERE id=?`)
           .run(iso(now), plain(summary, MAX_SUMMARY), evidence === undefined ? null : JSON.stringify(evidence), iso(now), taskId);
         return remember(key, taskId, 'finish', { accepted: true, ...(evidence && { evidence }) }, now);
       });
@@ -505,10 +533,14 @@ export function openTaskStore(db) {
         const task = row.get(taskId);
         // Delivery is recorded only from the worker's own receipt for that item. A settle can land while the answer is
         // still queued, or while the resume RPC is in flight, so the settle alone proves nothing about delivery; the
-        // outcome is recorded below either way, and the two facts never collapse into one.
-        if (task && task.execution_id === executionId && task.resume_item_id && deliveredItems.includes(task.resume_item_id)) {
-          db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND delivered_at IS NULL`)
-            .run(iso(now), task.resume_item_id);
+        // outcome is recorded below either way, and the two facts never collapse into one. The accepted finish may already
+        // have cleared the resume obligation, so the receipt is matched against this Task's items, not only the current
+        // resume slot.
+        if (task && task.execution_id === executionId) {
+          for (const itemId of deliveredItems) {
+            db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND task_id=? AND delivered_at IS NULL`)
+              .run(iso(now), itemId, taskId);
+          }
         }
         // Stamping is idempotent and stays ahead of the receipt, so evidence that arrives with a retried settle is still
         // recorded when the first attempt's receipt answers the call.
@@ -581,7 +613,7 @@ export function openTaskStore(db) {
         db.prepare(`UPDATE task_inbox_items SET delivered_at=? WHERE id=? AND task_id=? AND delivered_at IS NULL`).run(iso(now), itemId, taskId);
         // A late acknowledgement of an older item must not clear a newer response that is queued for resume.
         if (task.status === 'running' && task.resume_item_id === itemId) {
-          db.prepare(`UPDATE tasks SET resume_item_id=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=? AND resume_item_id=?`)
+          db.prepare(`UPDATE tasks SET resume_item_id=NULL, dispatch_pending=0, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=? AND resume_item_id=?`)
             .run(iso(now), taskId, itemId);
         }
         return true;
@@ -597,7 +629,7 @@ export function openTaskStore(db) {
         if (!task || task.execution_id !== executionId || TERMINAL.has(task.status)) return false;
         const record = item.get(itemId);
         db.prepare(`UPDATE tasks SET status='failed', outcome=NULL, failure=?, execution_kind='start', resume_item_id=NULL,
-          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, updated_at=? WHERE id=?`)
+          context=NULL, claim_at=NULL, dispatch_pending=0, next_at=0, blocked_reason=NULL, updated_at=? WHERE id=?`)
           .run(plain(reason, MAX_NOTE), iso(now), taskId);
         addEvent.run(taskId, task.scope, 'outcome',
           `Task “${task.title}” failed: its execution is no longer available.` +
@@ -623,7 +655,7 @@ export function openTaskStore(db) {
         // been sent yet; a dispatch that already reached the worker is stopped by the same step.
         const stopPending = task.execution_id === null ? 0 : 1;
         db.prepare(`UPDATE tasks SET status='cancelled', execution_kind='start', resume_item_id=NULL, context=NULL, claim_at=NULL,
-          dispatch_pending=0, next_at=0, stop_pending=?, stop_attempts=0, stop_next_at=0, updated_at=? WHERE id=?`)
+          dispatch_pending=0, next_at=0, blocked_reason=NULL, stop_pending=?, stop_attempts=0, stop_next_at=0, updated_at=? WHERE id=?`)
           .run(stopPending, iso(now), id);
         addEvent.run(id, task.scope, 'outcome', `Task “${task.title}” was cancelled.`, iso(now));
         return { task: taskView(row.get(id), now), executionId: task.execution_id ?? null, stopPending: stopPending === 1 };
