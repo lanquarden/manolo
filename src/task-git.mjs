@@ -30,6 +30,10 @@ async function git(args, cwd) {
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const inside = (path, root) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
+// `symbolic-ref --short` cannot shorten a branch that shares its name with a tag and then reports `heads/task/<id>`.
+// Identity is therefore compared on the full ref; the shortened form is only kept as human recovery metadata.
+const branchRef = branch => `refs/heads/${branch}`;
+const shortRef = ref => (ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref.replace(/^refs\//, ''));
 
 /**
  * Per-Task Git state. Repositories are operator-managed: a Blueprint pins a repository configuration snapshot, never a
@@ -118,16 +122,16 @@ export function openTaskGit({ dataDir }) {
     if (!existsSync(path)) throw failure('worktree_missing', 'The Task worktree is missing. Its work cannot be recovered automatically.');
     let top;
     let common;
-    let branch;
+    let ref;
     try {
       top = (await git(['rev-parse', '--show-toplevel'], path)).trim();
       common = (await git(['rev-parse', '--git-common-dir'], path)).trim();
-      branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], path)).trim();
+      ref = (await git(['symbolic-ref', '--quiet', 'HEAD'], path)).trim();
     } catch {
       throw failure('worktree_missing', 'The Task path exists but is not the recorded Git worktree.');
     }
     const commonPath = isAbsolute(common) ? resolve(common) : resolve(path, common);
-    if (resolve(top) !== path || resolve(commonPath) !== resolve(meta.mirror) || branch !== meta.branch ||
+    if (resolve(top) !== path || resolve(commonPath) !== resolve(meta.mirror) || ref !== branchRef(meta.branch) ||
         meta.remoteHash !== hash(meta.remote)) {
       throw failure('worktree_missing', 'The Task worktree identity does not match the recorded worktree.');
     }
@@ -347,7 +351,7 @@ export function openTaskGit({ dataDir }) {
       } catch {
         return preserve('identity_mismatch', { preservedHead: null });
       }
-      let branch;
+      let ref;
       // Recovery data for a workspace that is no longer on its recorded Task branch: name both branches and, read-only,
       // the commit the Task branch still holds so the unpublished work is findable by ref and SHA.
       const switched = async actual => ({
@@ -355,15 +359,16 @@ export function openTaskGit({ dataDir }) {
         handoff: meta.handoff ?? null,
       });
       try {
-        branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], meta.path)).trim();
+        ref = (await git(['symbolic-ref', '--quiet', 'HEAD'], meta.path)).trim();
       } catch {
         return preserve('detached_or_switched_branch', await switched(null));
       }
+      const branch = shortRef(ref);
       const state = await status(meta);
       if (state.dirty) return preserve('dirty_worktree', { preservedHead: head, preservedBranch: branch, files: state.files });
       // A named branch other than the recorded one is not the Task workspace, whatever HEAD happens to be: the Task's own
       // branch may still carry unpublished commits. Checked before `safe`, so an expected HEAD cannot authorize removal.
-      if (branch !== meta.branch) return preserve('detached_or_switched_branch', await switched(branch));
+      if (ref !== branchRef(meta.branch)) return preserve('detached_or_switched_branch', await switched(branch));
       const handedOff = await remoteHandoff(meta, head).catch(() => false);
       const safe = head === meta.expectedHead || (successful && handedOff);
       if (!safe) {

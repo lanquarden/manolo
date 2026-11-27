@@ -155,6 +155,37 @@ test('cleanup preserves a worktree that moved to another named branch at the ini
   assert.equal(await git(prepared.mirror, 'rev-parse', `refs/heads/task/${taskId}`), taskCommit);
 });
 
+test('a tag named like the Task branch does not break identity or a safe cleanup', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const taskId = id();
+  const prepared = await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  // refs/tags/task/<id> next to refs/heads/task/<id> makes the short form ambiguous: Git then prints heads/task/<id>.
+  await git(prepared.path, 'tag', `task/${taskId}`);
+  assert.equal(await git(prepared.path, 'symbolic-ref', '--short', 'HEAD'), `heads/task/${taskId}`);
+  assert.equal(await git(prepared.path, 'symbolic-ref', 'HEAD'), `refs/heads/task/${taskId}`);
+
+  // An untouched workspace still verifies, reuses, and finishes, then is removed as clean.
+  assert.equal((await taskGit.assertWorkspace(taskId)).branch, `task/${taskId}`);
+  assert.equal((await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote })).path, prepared.path);
+  assert.equal((await taskGit.checkFinish(taskId)).unchanged, true);
+  assert.deepEqual(await taskGit.cleanup(taskId, { terminal: true, successful: true }), { removed: true });
+  assert.equal(existsSync(prepared.path), false);
+
+  // Handed-off work under the same shadowing tag is still the recorded branch, not a switched one.
+  const handedId = id();
+  const handed = await taskGit.prepare(handedId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  await git(handed.path, 'tag', `task/${handedId}`);
+  await writeFile(join(handed.path, 'work.txt'), 'handed off\n');
+  await git(handed.path, 'add', 'work.txt');
+  await git(handed.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'task work');
+  const head = await git(handed.path, 'rev-parse', 'HEAD');
+  await git(handed.path, 'push', repo.remote, `HEAD:refs/heads/task/${handedId}`);
+  assert.equal((await taskGit.checkFinish(handedId)).commit, head);
+  assert.deepEqual(await taskGit.cleanup(handedId, { terminal: true, successful: true }), { removed: true });
+  assert.equal(existsSync(handed.path), false);
+});
+
 test('a replaced or missing worktree is reported and never accepted as the recorded workspace', async t => {
   const repo = await repository(t);
   const taskGit = openTaskGit({ dataDir: repo.dataDir });
