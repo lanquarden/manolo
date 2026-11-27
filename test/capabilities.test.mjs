@@ -202,8 +202,19 @@ test('the relay forwards capabilities for the owner and reports a stopped worker
   const root = await temp(t, 'manolo-capabilities-relay-');
   const token = randomBytes(24).toString('hex');
   const password = randomBytes(24).toString('hex');
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'Task identity.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    profiles: { fast: { description: 'Fast alias', model: 'fixture-fast', thinkingLevel: 'low' } },
+    blueprints: {
+      general: { description: 'Generic Task', role: 'task', profile: 'fast', files: ['IDENTITY.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  }));
   const worker = startProcess(t, process.execPath, [workerPath], {
     MANOLO_DATA_DIR: join(root, 'data'), MANOLO_MODE: 'fixture', MANOLO_AGENT_ID: 'primary', MANOLO_AGENT_TOKEN: token, PORT: '0',
+    MANOLO_BLUEPRINTS_DIR: bundles,
   });
   const workerPort = await worker.listen(/Manolo worker listening on (\d+)/);
   const configPath = join(root, 'relay.json');
@@ -227,6 +238,16 @@ test('the relay forwards capabilities for the owner and reports a stopped worker
   assert.equal(body.agent.id, 'primary');
   assert.ok(Array.isArray(body.tools) && body.tools.some(tool => tool.name === 'read' && tool.source === 'coding-tools'));
   assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 8192);
+  // The owner route forwards the same catalog and profiles the worker itself reports: the projection neither drops the
+  // profile list nor substitutes the Tasks view's history filter for it.
+  const workerInventory = await (await fetch(`http://127.0.0.1:${workerPort}/v1/capabilities`, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000),
+  })).json();
+  assert.deepEqual(body.profiles, workerInventory.profiles);
+  assert.deepEqual(body.blueprints, workerInventory.blueprints);
+  assert.deepEqual(body.profiles.map(profile => [profile.id, profile.model, profile.thinkingLevel]),
+    [['fast', 'manolo-fixture/fixture-fast', 'low']]);
+  assert.deepEqual(body.blueprints.map(blueprint => [blueprint.id, blueprint.profile]), [['general', 'fast']]);
   // The route is read-only, like the capability view itself.
   const post = await fetch(`${url}/api/capabilities`, {
     method: 'POST', headers: { ...basic, 'x-manolo-request': '1' }, signal: AbortSignal.timeout(5000),

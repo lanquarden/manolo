@@ -576,6 +576,11 @@ function capabilityInventory(value) {
     if (!Array.isArray(list)) throw fail(503);
     return list.slice(0, limit).map(project).filter(Boolean);
   };
+  // A worker that predates a section returns no field at all; that is an empty inventory, not a broken response.
+  const optionalRows = (key, project, limit) => {
+    const list = value[key];
+    return Array.isArray(list) ? list.slice(0, limit).map(project).filter(Boolean) : [];
+  };
   return {
     agent: {
       id: agent.id.slice(0, 128),
@@ -587,10 +592,19 @@ function capabilityInventory(value) {
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'source', 64) !== undefined && { source: text(item, 'source', 64) }),
     }, 128),
+    // The catalog for creating work, forwarded exactly as the worker filtered it. History filters in the Tasks view are a
+    // separate projection and never stand in for this list.
     blueprints: rows('blueprints', item => typeof item?.id === 'string' && {
       id: item.id.slice(0, 64),
       ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
       ...(text(item, 'profile', 64) !== undefined && { profile: text(item, 'profile', 64) }),
+    }, 16),
+    profiles: optionalRows('profiles', item => typeof item?.id === 'string' && {
+      id: item.id.slice(0, 64),
+      ...(text(item, 'description', 200) !== undefined && { description: text(item, 'description', 200) }),
+      ...(text(item, 'model', 128) !== undefined && { model: text(item, 'model', 128) }),
+      ...(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(item?.thinkingLevel) &&
+        { thinkingLevel: item.thinkingLevel }),
     }, 16),
     agentsFiles: rows('agentsFiles', item => typeof item?.path === 'string' && {
       path: item.path.slice(0, 1024),
@@ -916,8 +930,11 @@ async function internal(req, res, path) {
         };
       }
       // A structured new-style Task pins a snapshot, profile, review binding, or required evidence. It always needs the
-      // finish protocol, even during a mixed-version rollout: `legacy` is only for genuinely pre-upgrade rows, which are
-      // the only ones the migration marks `finish_required=0`.
+      // finish protocol, even during a mixed-version rollout. `MANOLO_TASK_FINISH=legacy` is an explicit, relay-wide
+      // override for a worker that predates `finish`: it marks a new *unstructured* Task `finish_required=0` so an old
+      // worker can still settle its bare final. The override is narrow by construction and enforced in the ledger, not
+      // here: `settle` accepts a bare success only for a row that records no snapshot, no profile, no review binding, and
+      // no pull-request requirement, so structured evidence can never be bypassed by the rollout mode or a migrated row.
       const structured = Boolean(blueprintSnapshot || profile || review || body.requiresPullRequest === true);
       const task = store.tasks.create({
         owner: turn.owner, agent, scope, originTurnId: turn.id, title: body.title, input: body.task,
@@ -1219,6 +1236,10 @@ const START_ACK = new Set(['running', 'parked', 'settled', 'failed', 'cancelled'
 // parked one. Nothing here starts a second execution while the previous one can still be live.
 async function runTask(task) {
   const executionId = task.execution_id;
+  // The exact dispatch obligation this pass is driving. A late answer or report from an earlier one (an RPC that was in
+  // flight when the worker reported a block, a newer response, or an accepted finish) carries a stale epoch and can
+  // neither clear the newer recovery nor reset its backoff.
+  const epoch = task.dispatch_epoch;
   if (task.execution_kind === 'resume') {
     const item = store.tasks.inboxItem(task.resume_item_id);
     if (!item) {
@@ -1230,7 +1251,7 @@ async function runTask(task) {
     }
     // The item's delivery time is the durable resume receipt. A retried delivery reads it instead of calling again.
     if (item.delivered_at !== null) {
-      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch });
       return;
     }
     let result;
@@ -1240,30 +1261,30 @@ async function runTask(task) {
         body: { executionId, itemId: item.id, status: item.status, response: item.response ?? '' },
       });
     } catch {
-      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.');
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached for the resume.', { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === true) {
-      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id });
+      store.tasks.resumeDelivered({ taskId: task.id, executionId, itemId: item.id, epoch });
       return;
     }
     if (result.ok && result.body?.delivered === false && result.body.reason === 'not_yet_parked') {
       // The execution is live but had not stored its park marker when the answer arrived, so the answer may still reach
       // it. That is ambiguous, not a lost call: retry the same delivery under the same IDs.
-      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.');
+      store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The execution had not parked for the response yet.', { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === false && result.body.reason === 'worktree_missing') {
       // A lost or replaced worktree is recoverable. Keep the answered item and block; restoring the workspace retries
       // the same resume instead of terminally failing the Task.
-      store.tasks.block(task.id, executionId, result.body.message ?? 'The Task worktree is missing; restore it and the response will resume.');
+      store.tasks.block(task.id, executionId, result.body.message ?? 'The Task worktree is missing; restore it and the response will resume.', Date.now(), 60_000, { epoch });
       return;
     }
     if (result.ok && result.body?.delivered === false && DEFINITIVE_RESUME.has(result.body.reason)) {
       // An accepted finish is the durable boundary even when the execution that accepted it has ended before the answer
       // was delivered. Settle from the receipt instead of failing a finished Task.
       if (store.tasks.meta(task.id)?.finishAccepted) {
-        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The accepted finish was reconciled after the execution ended.');
+        store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The accepted finish was reconciled after the execution ended.', { epoch });
         return;
       }
       // Never replace the child for Inbox input: end the Task clearly and keep the response on the item.
@@ -1273,7 +1294,7 @@ async function runTask(task) {
       });
       return;
     }
-    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.');
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not confirm the resume.', { epoch });
     return;
   }
   // A new-style assignment must not reach a worker that would ignore its snapshot/profile/review fields or its finish
@@ -1282,7 +1303,7 @@ async function runTask(task) {
   const requiresV2 = Boolean(task.blueprint_snapshot || task.profile_snapshot || task.review_snapshot ||
     task.requires_pr === 1 || task.finish_required === 1);
   if (requiresV2 && await workerTaskProtocol(task.agent) < 2) {
-    store.tasks.block(task.id, executionId, 'The worker does not support the Task protocol needed by this assignment. Upgrade it; the same assignment will resume.');
+    store.tasks.block(task.id, executionId, 'The worker does not support the Task protocol needed by this assignment. Upgrade it; the same assignment will resume.', Date.now(), 60_000, { epoch });
     return;
   }
   // The versioned path is the contract. If the probe said v2 but the worker was replaced in between, the v2 POST is
@@ -1319,27 +1340,27 @@ async function runTask(task) {
       },
     });
   } catch {
-    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.');
+    store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker could not be reached.', { epoch });
     return;
   }
   if (requiresV2 && !result.ok && [404, 405, 415, 422].includes(result.status)) {
     // A worker that no longer has the v2 route is not fed the same assignment through the old path.
-    store.tasks.block(task.id, executionId, BLOCKING_START.get('worker_protocol'));
+    store.tasks.block(task.id, executionId, BLOCKING_START.get('worker_protocol'), Date.now(), 60_000, { epoch });
     return;
   }
   if (result.ok && result.body?.status === 'blocked') {
-    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.');
+    store.tasks.block(task.id, executionId, result.body.message ?? BLOCKING_START.get(result.body.reason) ?? 'The Task is blocked on a recoverable worker condition.', Date.now(), 60_000, { epoch });
     return;
   }
   if (result.ok && START_ACK.has(result.body?.status)) {
     // Only a parsed acknowledgement naming a state the worker reports: the child is admitted, and a later restart must
     // not re-drive this dispatch. Anything else leaves the dispatch owed and retried under the same identity.
-    store.tasks.ackDispatch(task.id, executionId);
+    store.tasks.ackDispatch(task.id, executionId, epoch);
     return;
   }
   if (result.body?.reason === 'task_cancelled') {
     // The Task was cancelled while the dispatch was in flight; the ledger already decided.
-    store.tasks.ackDispatch(task.id, executionId);
+    store.tasks.ackDispatch(task.id, executionId, epoch);
     return;
   }
   const definitive = DEFINITIVE_START.get(result.body?.reason);
@@ -1349,10 +1370,10 @@ async function runTask(task) {
   }
   const blocking = BLOCKING_START.get(result.body?.reason);
   if (blocking) {
-    store.tasks.block(task.id, executionId, blocking);
+    store.tasks.block(task.id, executionId, blocking, Date.now(), 60_000, { epoch });
     return;
   }
-  store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.');
+  store.tasks.retryDispatch(task.id, executionId, Date.now(), 'The worker did not accept the execution.', { epoch });
 }
 
 // Cancelling is a ledger decision; this is the separate, retried step that asks the worker to stop. A dispatch that was

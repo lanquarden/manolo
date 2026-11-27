@@ -413,8 +413,10 @@ export function installTasks(registry, { cfg, model, thinkingLevel, models, prof
       }
       let check = { ok: true };
       try {
-        // A legacy/in-flight execution has no recorded workspace: keep its old protocol without inventing one.
-        if (taskGit && execution.workspace) check = await taskGit.checkFinish(run.taskId);
+        // A legacy/in-flight execution has no recorded workspace: keep its old protocol without inventing one. The
+        // recorded dispatch binding is passed as provenance only, so a review recorded before source branch and handoff
+        // were part of its evidence still reports them.
+        if (taskGit && execution.workspace) check = await taskGit.checkFinish(run.taskId, { review: execution.review });
       } catch (error) {
         return toolResult({ error: error.message ?? 'The Task workspace could not be checked.', code: error.code ?? 'workspace_check_failed' }, true);
       }

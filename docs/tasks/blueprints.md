@@ -59,7 +59,9 @@ substituting another.
 
 The three selections are applied explicitly, so removing one resets the conversation instead of leaving the previous
 value behind: an omitted or `null` tool list restores the worker's default tool set, an empty list offers no tools, and a
-removed profile clears the stored reasoning level back to the worker default.
+removed profile restores the worker's default model and configured reasoning level (clearing the stored level only when
+this worker has no default). Removing the whole conversation Blueprint takes the same path: the conversation returns to
+the worker defaults, while already admitted turns and retries keep the settings they were admitted with.
 
 A conversation Blueprint is never a delegation target. Only legacy text Blueprints are offered to `delegate_work`; a
 configured Task bundle cannot run as an ungoverned work-session child.
@@ -73,7 +75,9 @@ mutable path. A Task queued before an edit keeps its old text and policy, and a 
 
 A saved snapshot is self-contained: it survives an edit or removal of the manifest Blueprint, and of the named profile
 it pinned. The worker validates the pinned provider, model, and reasoning level against the catalog it can actually
-reach, never against a current alias, and never substitutes. An unavailable pinned profile, unknown tool, invalid
+reach, never against a current alias, and never substitutes. On a `model-proxy` worker that catalog is the proxy's own
+`GET /v1/models` list, so a pinned alias keeps resolving after the manifest profile that introduced it is removed;
+discovery stays restricted to the profiles the current manifest declares. An unavailable pinned profile, unknown tool, invalid
 repository, or missing worktree blocks the Task with a visible reason and the same execution identity; restoring the
 worker or workspace resumes it.
 
@@ -93,8 +97,11 @@ The `model-proxy` catalog is authoritative. The worker reads the proxy's OpenAI-
 and advertises only the ids it lists; a configured alias the proxy does not serve is not offered, its profile is
 dropped, and a Blueprint pinned to it is not discoverable. A configured default model that the catalog omits fails
 startup. A proxy that cannot answer the catalog request serves only the explicitly configured default model, so no
-unverified alias is ever advertised. The same set is what `create_task`, `inspect_manolo`, the capability API, and the
-Tasks view see.
+unverified alias is ever advertised. The served ids are also the authorized runtime catalog an already-pinned Task is
+validated against, which is deliberately wider than today's role aliases: `create_task`, `inspect_manolo`, the
+capability API, and the Tasks view list only the profiles the manifest declares, while a pinned profile that the proxy
+still serves keeps running after its alias is edited or removed. A model or reasoning level the trusted catalog does not
+support fails closed.
 
 `create_task` accepts `profile` to override the Blueprint profile, or to pin a profile with no Blueprint. The
 orchestrator sees short Blueprint and profile descriptions in the tool description and in `inspect_manolo`, chooses the
@@ -129,14 +136,24 @@ actionable error instead of ending a dirty or unverifiable Task. Acceptance is a
 
 A final turn without `finish` is never success. The first one gets exactly one durable corrective turn in the same Task
 and session; a second one fails the Task. The counter lives in the execution record, so a worker restart does not grant
-another correction. The relay refuses a success settle for a finish-required Task that has no finish acceptance.
-Tasks created before this protocol keep the legacy settle behavior so a queued or in-flight Task is not stranded.
+another correction. The relay refuses a success settle that has no finish acceptance unless the row is a genuinely
+legacy assignment: one that records no pinned snapshot, no profile, no review binding, and no pull-request requirement.
+That condition is checked independently of `finish_required`, so a migrated or hand-edited row cannot bare-settle its way
+around a required pull request or a pinned assignment. Tasks created before this protocol keep the legacy settle behavior
+so a queued or in-flight Task is not stranded.
 
 Settlement is confirmed from the relay, not assumed. A 409, timeout, or exhausted retry budget leaves the local
 execution non-terminal and preserves the workspace; a restart replays the same settle. Cleanup runs only after an
 authoritative done/failed/cancelled state, and only a successfully handed-off or untouched tree is removed. Clean
 detached work, worktrees switched to another branch, unhanded commits, dirty work, and local-only scratch files are
 preserved with recovery metadata.
+
+Every outbound dispatch or resume is an obligation with an **epoch**, not just an execution identity. The relay stamps
+the epoch on the RPC it sends, a block opens a new one, and an acknowledgement only clears the obligation it belongs to.
+A delayed start acknowledgement therefore cannot erase a block the worker reported while that RPC was in flight and leave
+the Task running with nothing scheduled. A delivered Inbox response clears the resume slot *and* returns the Task to a
+plain execution obligation in the same statement: if the workspace is lost after the answer reached the child, recovery
+re-dispatches to the same admitted execution (continuing it) instead of scheduling a resume with no item left to deliver.
 
 ## Repository Tasks and worktrees
 
@@ -155,20 +172,32 @@ and once the recorded path is restored the same execution continues in the same 
 
 Two Tasks in one repository get independent worktrees *and* independent Git common dirs. The shared seed mirror
 (`<remote hash>.git`) is a read-only object store: the worker fetches it, never checks it out, and it carries no Task
-remote. Each Task gets its own persistent bare clone (`task-<task id>.git`) seeded from that store with a local clone,
-so its worktree, refs, `git stash`, hooks, and config cannot be read or rewritten by another Task. Only the service's
-short admin operations (fetch, worktree add/remove) serialize, never Task runs. A record written before per-Task clones
-keeps its existing worktree and Git directory in place rather than being migrated and risking data.
+remote. Each Task gets its own persistent bare store (`task-<task id>.git`) seeded with **objects only** plus the refs
+this service fetched from the configured remote (kept under a private namespace, never as a branch). It is deliberately
+not a clone: a clone of a shared mirror would inherit every local branch that mirror happens to hold — including other
+Tasks' unpublished work — and would leave a writable `origin` pointing at another Task's future. The Task store has no
+remote at all, so a routine `git push --all` has no destination and cannot publish another Task's refs; the handoff URL
+in the instructions is the only push target. Its worktree, refs, `git stash`, hooks, and config cannot be read or
+rewritten by another Task. Only the service's short admin operations (fetch, worktree add/remove) serialize, never Task
+runs. Immutable seed packs are hardlinked (copied across filesystems) so seeding stays cheap. A record written before
+per-Task stores keeps its existing worktree and Git directory in place: it is adopted only after the record's shared-mirror
+registration is proven (the worktree's Git common dir is exactly the mirror the recorded remote names, the worktree is
+registered there at its recorded path, and HEAD is still the recorded branch), and a replacement clone at the old path
+fails closed with the old record untouched rather than being adopted.
 
 A Task's handoff destination is metadata, not a named remote in its clone, so creating Task B cannot rewrite Task A's
 push destination. The child receives the exact handoff URL and its `task/<task id>` branch in its instructions.
 
 A **review Task** binds a finished source Task's exact handed-off commit and comparison base. It gets its own worktree
 on branch `review/<task id>` at that commit, never a mutable branch tip, and it does not depend on the current upstream
-base branch still existing: the pinned commit and base are objects. If upstream advanced, renamed, or deleted the base
-ref, an object already in the store still opens the review; a commit that no configured remote can provide fails
-`review_commit_missing` rather than falling back to the tip. Its finish evidence and instructions record the source Task,
-both SHAs, the source branch, and the handoff remote. The Orchestrator and Task history expose the same evidence.
+base branch still existing: the pinned commit and base are objects. Sources are tried in order — the source Task's own
+retained store (resolved from its trusted workspace record, and only after its recorded remote, handoff, and location
+inside this service check out), its shared store, this repository's seed, then the configured handoff by exact object.
+Only the two pinned commits move, under a private ref; no branch is copied and no tip is ever chosen. A commit that no
+proven source can provide fails `review_commit_missing` rather than falling back to the tip. Its finish evidence and
+instructions record the source Task, both SHAs, the source branch, and the handoff remote. A review binding recorded
+before the source branch and handoff were part of that evidence is completed from its validated dispatch evidence — the
+same exact commit and base — without moving the checkout. The Orchestrator and Task history expose the same evidence.
 
 When an assignment explicitly requires a pull request, `finish` fails closed without a structured GitHub pull-request
 URL bound to the accepted commit. This is evidence validation, not a live GitHub API check; no pull request is
@@ -204,8 +233,10 @@ These are measured limits of this slice, not silent downgrades:
 - Terminal cleanup is opportunistic in the worker that observes the terminal outcome. A worker crash before cleanup
   leaves the worktree and tombstone untouched for recovery; nothing recreates it.
 - A mixed-version rollout needs `MANOLO_TASK_FINISH=legacy` until every worker can call `finish`; then return it to
-  `required`. Only genuinely pre-upgrade rows (migrated with `finish_required=0`) keep the legacy settle behavior. A
-  structured new-style Task always records `finish_required=1` and its pull-request evidence, whatever the rollout mode.
+  `required`. In `legacy` mode a new unstructured Task is itself marked `finish_required=0` — an explicit override for a
+  worker that predates `finish` — while a structured new-style Task (snapshot, profile, review binding, or pull request)
+  always records `finish_required=1`. The override is narrow by construction: a bare settle is accepted only for a row
+  that carries none of those fields and no pull-request requirement, whatever its `finish_required` says.
 - A worktree preserved for ignored or unhanded work stays until an operator removes it, because cleanup is
   opportunistic. A workspace lost repeatedly stops continuing after five attempts.
 
@@ -218,13 +249,16 @@ Worker environment:
 | `MANOLO_BLUEPRINTS_DIR` | Bundle directory with `manifest.json`. |
 | `MANOLO_WORK_BLUEPRINTS` | Legacy text map; still accepted beside a bundle directory. |
 | `MANOLO_PROVIDER`, `MANOLO_MODEL`, `MANOLO_THINKING_LEVEL` | Default model and reasoning when no profile applies. |
-| `MANOLO_MODEL_PROXY_URL`, `MANOLO_MODEL_PROXY_KEY` | Proxy runtime; profile model ids are added to its catalog. |
-| `MANOLO_TASK_FINISH` | Relay-side finish enforcement. `required` (default) refuses a success settle with no finish. `legacy` is only for a mixed-version rollout with a worker that predates `finish`. |
+| `MANOLO_MODEL_PROXY_URL`, `MANOLO_MODEL_PROXY_KEY` | Proxy runtime; the proxy's `GET /v1/models` list is the authorized catalog, and profiles are resolved from it. |
+| `MANOLO_TASK_FINISH` | Relay-side finish enforcement. `required` (default) refuses a success settle with no finish. `legacy` is only for a mixed-version rollout with a worker that predates `finish`: new unstructured Tasks are marked `finish_required=0`, while structured and pull-request Tasks still require `finish`. |
 | `/v1/task-protocol` | Worker capability handshake. Version 2 is required before a new-style snapshot/profile/review/finish assignment is sent, and the assignment itself goes to the versioned `/v1/tasks/<id>/executions/v2` route. |
 
 The Task surfaces remain gated by `MANOLO_WORK_SESSION_AGENT`. An unconfigured worker keeps its old default model, no
 Blueprint, and the default tool set, but still requires `finish` for new Tasks. Drop `MANOLO_BLUEPRINTS_DIR` to return to
-the legacy behavior without changing the ledger; pinned snapshots already stored on Tasks remain runnable.
+the legacy behavior without changing the ledger; pinned snapshots already stored on Tasks remain runnable, and on a
+`model-proxy` worker a pinned profile keeps resolving as long as the proxy still serves that model. Nothing here is
+enabled in the checked-in production configuration yet: the Tasks rollout still needs `MANOLO_WORK_SESSION_AGENT`, and a
+demo credential guard would reject simply flipping it.
 
 The Helm chart wires the same settings with safe defaults. `agents.<id>.blueprintsDir` points at a bundle directory
 already inside the container; `agents.<id>.blueprintsMount.configMap` or `.secret` renders an operator-owned bundle

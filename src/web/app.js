@@ -1084,6 +1084,14 @@ function renderCapabilities(state) {
     if (blueprint.description) item.append(textNode('p', blueprint.description, 'capability-detail'));
     return item;
   });
+  capabilityList('capability-profiles', state.profiles ?? [], 'No model profiles configured.', profile => {
+    const item = document.createElement('li');
+    item.append(textNode('span', profile.id, 'capability-name'));
+    if (profile.thinkingLevel) item.append(textNode('span', profile.thinkingLevel, 'badge'));
+    if (profile.model) item.append(textNode('p', profile.model, 'capability-path'));
+    if (profile.description) item.append(textNode('p', profile.description, 'capability-detail'));
+    return item;
+  });
   capabilityList('capability-skills', state.skills ?? [], 'No skills in this repository.', skill => {
     const item = document.createElement('li');
     item.append(textNode('span', skill.name, 'capability-name'), textNode('span', 'SKILL.md', 'badge'));

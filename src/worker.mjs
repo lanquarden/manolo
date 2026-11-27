@@ -402,7 +402,8 @@ function turnService(harness, model, thinkingLevel, instructions, redact, runtim
           extensions: workSessions ? { add: [workExtension, taskExtension] } : null,
           // A live Blueprint is applied explicitly every turn: `null` clears a reasoning level or tool list it no longer
           // declares. Only a removed Blueprint needs that reset on an unselected turn; otherwise a conversation keeps its
-          // own tool state.
+          // own tool state. A reset returns the conversation to this worker's own defaults, not to "no reasoning level":
+          // the worker's configured level applies again, and only a worker without one clears the stored level.
           ...(selection
             ? {
               thinkingLevel: selectedThinking ?? null,
@@ -411,7 +412,7 @@ function turnService(harness, model, thinkingLevel, instructions, redact, runtim
                 : { tools: null, modelTools: null }),
             }
             : clearsBlueprint
-              ? { thinkingLevel: null, tools: null, modelTools: null }
+              ? { thinkingLevel: thinkingLevel ?? null, tools: null, modelTools: null }
               : isRoom ? { tools: [], modelTools: null }
                 : runtimeExec ? { tools: targets.length ? null : { remove: [runtimeExec] } }
                   : {}),
@@ -703,6 +704,8 @@ async function main() {
   const redact = redactSecrets([cfg.token, apiKey, ...mcp.secrets].filter(Boolean));
   const workSessions = installWorkSessions(registry, {
     cfg, model, thinkingLevel, Turns, redact, blueprints: legacyWorkBlueprints,
+    // inspect_manolo reports the same filtered Task catalog and resolved profiles the capability panel and create_task use.
+    taskBlueprints, profiles,
     // Report what a child actually receives: every installed tool except this orchestration extension.
     childTools: () => registry.snapshot().installed()
       .filter(extension => extension.name !== workSessions.extension.name && !extension.name.startsWith('manolo-task-'))
@@ -730,7 +733,8 @@ async function main() {
       const reachable = resolveProfiles({ models, model, thinkingLevel, profiles: fresh.profiles }).get(blueprint.profile.id);
       if (!reachable) throw new RequestError(409, 'Conversation Blueprint model profile is not available on this worker.');
       selectedModel = reachable.model;
-      selectedThinking = reachable.thinkingLevel;
+      // A profile that does not name a reasoning level keeps the worker's default rather than clearing it.
+      selectedThinking = reachable.thinkingLevel ?? thinkingLevel;
     }
     // `null` and an omitted list both mean the worker's default tool set. Only an explicit array narrows it, and every
     // named tool must be installed here: an unavailable one fails the turn instead of being dropped.

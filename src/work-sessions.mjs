@@ -64,10 +64,21 @@ export function selectableWorkBlueprints(blueprints) {
   return new Map([...blueprints].filter(([, blueprint]) => blueprint?.legacy === true));
 }
 
-export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints = new Map(), childTools = () => [] }) {
+export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns, redact, blueprints = new Map(), taskBlueprints = new Map(), profiles = new Map(), childTools = () => [] }) {
   const legacyBlueprints = selectableWorkBlueprints(blueprints);
   const publicBlueprints = [...legacyBlueprints.values()].map(({ id, description, revision }) => ({
     id, description: redact(description), revision,
+  }));
+  // The Task catalog is reported next to the delegate targets, never as one of them: a bundle Task needs its pinned
+  // snapshot, tools, profile, and finish gate, so it is not an ungoverned delegate_work recipe.
+  const publicTaskBlueprints = [...taskBlueprints.values()].filter(blueprint => blueprint?.role === 'task').slice(0, 24)
+    .map(({ id, description, profile }) => ({
+      id, description: redact(description), ...(profile && { profile: profile.id }),
+    }));
+  const publicProfiles = [...profiles.values()].slice(0, 16).map(profile => ({
+    id: profile.id, description: redact(profile.description),
+    model: `${profile.model.provider}/${profile.model.modelId}`,
+    ...(profile.thinkingLevel && { thinkingLevel: profile.thinkingLevel }),
   }));
   let harness;
 
@@ -237,7 +248,10 @@ export function installWorkSessions(registry, { cfg, model, thinkingLevel, Turns
       return toolResult({
         version: app.version, identity: { id: redact(cfg.agentId), name: 'Manolo' },
         capabilities: { podCodingTools: cfg.codingTools, relayTools: Boolean(cfg.relay), workSessions: { target: TARGET, childTools: childTools() } },
+        // `blueprints` stays the delegate_work target list; the Task catalog and its model profiles are a separate,
+        // read-only projection of the same filtered set create_task offers.
         ...(publicBlueprints.length && { blueprints: publicBlueprints }),
+        tasks: { blueprints: publicTaskBlueprints, profiles: publicProfiles },
       });
     },
   });

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -53,13 +53,6 @@ test('repository Tasks get independent worktrees, isolated handoffs, restart reu
   const again = await restarted.prepare(a, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
   assert.equal(again.path, first.path);
   assert.equal((await restarted.assertWorkspace(a)).branch, `task/${a}`);
-  // A workspace record from the first candidate is upgraded in place, not rejected or recreated.
-  const oldRecord = JSON.parse(await readFile(join(repo.dataDir, 'task-worktrees', `${a}.json`), 'utf8'));
-  const { version, mirror, remoteHash, expectedHead, ...legacyRecord } = oldRecord;
-  await writeFile(join(repo.dataDir, 'task-worktrees', `${a}.json`), JSON.stringify(legacyRecord));
-  const upgraded = await restarted.assertWorkspace(a);
-  assert.equal(upgraded.version, 3);
-  assert.equal(upgraded.expectedHead, repo.baseSha);
 
   // Read-only work can finish without a handoff.
   assert.deepEqual(await taskGit.checkFinish(a), {
@@ -333,4 +326,175 @@ test('a review opens its exact pinned commit and base even after the upstream ba
   await assert.rejects(taskGit.prepareReview(id(), { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }, {
     sourceTaskId: sourceId, commit: 'f'.repeat(40), baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote,
   }), error => error.code === 'review_commit_missing');
+});
+
+// The pre-per-Task layout the service itself created: one shared bare mirror per remote, the worktree attached to it, and
+// a record with no version, mirror, or expected-head binding. `unpublished` adds an older Task's branch and a tag that
+// live only in that shared directory.
+function seedPathOf(remote, dataDir) {
+  return join(dataDir, 'task-repos', `${createHash('sha256').update(remote).digest('hex').slice(0, 16)}.git`);
+}
+
+async function legacyMirror(repo, taskId, { unpublished = false, branch = `task/${taskId}` } = {}) {
+  const mirror = seedPathOf(repo.remote, repo.dataDir);
+  await mkdir(join(repo.dataDir, 'task-repos'), { recursive: true });
+  if (!existsSync(mirror)) await run('git', ['clone', '--bare', repo.remote, mirror]);
+  await run('git', ['-C', mirror, 'fetch', '--force', '--prune', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+  if (unpublished) {
+    await run('git', ['-C', mirror, 'update-ref', 'refs/heads/task/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', repo.baseSha]);
+    await run('git', ['-C', mirror, 'tag', 'older-task-tag', repo.baseSha]);
+  }
+  const path = join(repo.dataDir, 'task-worktrees', taskId);
+  await mkdir(join(repo.dataDir, 'task-worktrees'), { recursive: true });
+  await run('git', ['-C', mirror, 'worktree', 'add', '-B', branch, path, repo.baseSha]);
+  const meta = {
+    kind: 'worktree', taskId, path, branch, baseSha: repo.baseSha,
+    remote: repo.remote, base: 'main', handoff: repo.remote, repository: 'sample',
+    createdAt: new Date().toISOString(),
+  };
+  await writeFile(join(repo.dataDir, 'task-worktrees', `${taskId}.json`), JSON.stringify(meta));
+  return { mirror, path, meta };
+}
+
+const refsOf = async path => (await git(path, 'for-each-ref', '--format=%(refname) %(objectname)')).split('\n').sort().join('\n');
+
+test('a legacy shared-mirror record is upgraded only when its mirror registration is proven', async t => {
+  const repo = await repository(t);
+  const taskId = id();
+  const legacy = await legacyMirror(repo, taskId);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  // A genuine record: the recorded remote names exactly the shared mirror the worktree is registered in.
+  const upgraded = await taskGit.assertWorkspace(taskId);
+  assert.equal(upgraded.version, 3);
+  assert.equal(upgraded.mirror, legacy.mirror);
+  assert.equal(upgraded.seed, legacy.mirror);
+  assert.equal(upgraded.expectedHead, repo.baseSha);
+  assert.equal(await git(legacy.path, 'rev-parse', '--git-common-dir'), legacy.mirror);
+
+  // A replacement clone at the same filesystem path with the same branch name is not this Task's worktree. Its observed
+  // common dir is never adopted, nothing is rewritten, and the original v1 record is left exactly as it was.
+  await rm(legacy.path, { recursive: true, force: true });
+  await run('git', ['-C', legacy.mirror, 'worktree', 'prune']);
+  const replacement = join(repo.root, 'replacement');
+  await run('git', ['clone', repo.remote, replacement]);
+  await run('git', ['-C', replacement, 'checkout', '-B', `task/${taskId}`]);
+  await run('git', ['-C', replacement, 'config', 'user.email', 'test@example.invalid']);
+  await run('git', ['-C', replacement, 'config', 'user.name', 'Test']);
+  await rename(replacement, legacy.path);
+  await writeFile(join(repo.dataDir, 'task-worktrees', `${taskId}.json`), JSON.stringify(legacy.meta));
+  await assert.rejects(taskGit.assertWorkspace(taskId), error => error.code === 'worktree_missing' || error.code === 'invalid_task_git_state');
+  const untouched = JSON.parse(await readFile(join(repo.dataDir, 'task-worktrees', `${taskId}.json`), 'utf8'));
+  assert.equal(untouched.version, undefined, 'a rejected migration writes nothing');
+  assert.equal(untouched.mirror, undefined);
+});
+
+test('a Task store is seeded with objects and proven refs only, with no inherited Task branch and no pushable seed', async t => {
+  const repo = await repository(t);
+  // The old layout's shared mirror, including an older Task's branch and tag that exist only in that directory.
+  const seed = seedPathOf(repo.remote, repo.dataDir);
+  await mkdir(join(repo.dataDir, 'task-repos'), { recursive: true });
+  await run('git', ['clone', '--bare', repo.remote, seed]);
+  await run('git', ['-C', seed, 'fetch', '--force', '--prune', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+  await run('git', ['-C', seed, 'update-ref', 'refs/heads/task/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', repo.baseSha]);
+  await run('git', ['-C', seed, 'tag', 'older-task-tag', repo.baseSha]);
+  const seedBefore = await refsOf(seed);
+
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const taskId = id();
+  const prepared = await taskGit.prepare(taskId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  assert.equal(prepared.seed, seed);
+  assert.notEqual(prepared.mirror, seed);
+  // The worktree starts at the pinned base and holds only this Task's branch: nothing inherited from the shared mirror.
+  assert.equal(await git(prepared.path, 'rev-parse', 'HEAD'), repo.baseSha);
+  assert.equal(await git(prepared.path, 'for-each-ref', '--format=%(refname)', 'refs/heads/'), `refs/heads/task/${taskId}`);
+  assert.doesNotMatch(await refsOf(prepared.mirror), /task\/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|older-task-tag/);
+  assert.equal(await git(prepared.path, 'remote'), '', 'the Task store has no remote at all');
+  await assert.rejects(git(prepared.path, 'push', '--all'), /No configured push destination|fatal/i);
+
+  // Even after the child configures a deliberate handoff destination, a routine `git push --all` publishes only its own
+  // branch: the older Task's ref and tag are not in this store to be published.
+  await writeFile(join(prepared.path, 'work.txt'), 'task work\n');
+  await git(prepared.path, 'add', 'work.txt');
+  await git(prepared.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'task work');
+  await git(prepared.path, 'push', '--all', repo.remote);
+  const published = await git(repo.remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/', 'refs/tags/');
+  assert.match(published, new RegExp(`refs/heads/task/${taskId}`));
+  assert.doesNotMatch(published, /task\/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|older-task-tag/);
+  assert.equal(await refsOf(seed), seedBefore, 'nothing in the shared store was written');
+});
+
+test('a review opens the exact handed-off commit from the source Task store after the remote branch rewinds', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const sourceId = id();
+  const source = await taskGit.prepare(sourceId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  await writeFile(join(source.path, 'handed.txt'), 'handed off\n');
+  await git(source.path, 'add', 'handed.txt');
+  await git(source.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'handed work');
+  const commit = await git(source.path, 'rev-parse', 'HEAD');
+  await git(source.path, 'push', repo.remote, `HEAD:refs/heads/task/${sourceId}`);
+  assert.equal((await taskGit.checkFinish(sourceId)).commit, commit);
+  // The relay confirms the Task, so terminal cleanup removes the clean, handed-off worktree and leaves its store and
+  // branch behind.
+  assert.deepEqual(await taskGit.cleanup(sourceId, { terminal: true, successful: true }), { removed: true });
+  // The handoff remote then loses the branch: neither the remote nor the shared store can advertise the handed-off commit
+  // any more, and the retained source store is the only place that still holds it.
+  await git(repo.remote, 'update-ref', '-d', `refs/heads/task/${sourceId}`);
+  await assert.rejects(git(repo.remote, 'rev-parse', `refs/heads/task/${sourceId}`));
+  const seed = seedPathOf(repo.remote, repo.dataDir);
+  await assert.rejects(git(seed, 'cat-file', '-e', `${commit}^{commit}`));
+
+  const reviewId = id();
+  const review = await taskGit.prepareReview(reviewId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }, {
+    sourceTaskId: sourceId, commit, baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote,
+  });
+  assert.equal(await git(review.path, 'rev-parse', 'HEAD'), commit, 'the exact handed-off commit, never a new tip');
+  assert.equal(review.review.commit, commit);
+  assert.equal(review.review.sourceBranch, `task/${sourceId}`);
+  assert.equal(review.review.sourceHandoff, repo.remote);
+  // The transfer used a private ref: no source or Task branch was copied into the review store.
+  assert.equal(await git(review.mirror, 'for-each-ref', '--format=%(refname)', `refs/heads/task/${sourceId}`), '');
+  assert.equal(await git(review.mirror, 'for-each-ref', '--format=%(refname)', `refs/manolo/pinned/${commit}`), `refs/manolo/pinned/${commit}`);
+  assert.equal((await taskGit.checkFinish(reviewId)).review.sourceBranch, `task/${sourceId}`);
+});
+
+test('a review record written without source provenance is completed from its validated dispatch evidence', async t => {
+  const repo = await repository(t);
+  const taskGit = openTaskGit({ dataDir: repo.dataDir });
+  const sourceId = id();
+  const source = await taskGit.prepare(sourceId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote });
+  await writeFile(join(source.path, 'reviewed.txt'), 'reviewed change\n');
+  await git(source.path, 'add', 'reviewed.txt');
+  await git(source.path, '-c', 'user.email=test@example.invalid', '-c', 'user.name=Test', 'commit', '-m', 'reviewed work');
+  const commit = await git(source.path, 'rev-parse', 'HEAD');
+  await git(source.path, 'push', repo.remote, `HEAD:refs/heads/task/${sourceId}`);
+  const reviewId = id();
+  const prepared = await taskGit.prepareReview(reviewId, { name: 'sample', remote: repo.remote, base: 'main', handoff: repo.remote }, {
+    sourceTaskId: sourceId, commit, baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote,
+  });
+  // A record written by the previous candidate binds the same exact commits but has no source provenance.
+  const metaPath = join(repo.dataDir, 'task-worktrees', `${reviewId}.json`);
+  const record = JSON.parse(await readFile(metaPath, 'utf8'));
+  const { sourceBranch, sourceHandoff, ...legacyReview } = record.review;
+  assert.equal(sourceBranch, `task/${sourceId}`);
+  await writeFile(metaPath, JSON.stringify({ ...record, review: legacyReview }));
+
+  // Evidence that names different commits or another source Task can add nothing: it never redirects the binding.
+  const mismatched = await taskGit.checkFinish(reviewId, {
+    review: { sourceTaskId: id(), commit: 'f'.repeat(40), baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote },
+  });
+  assert.equal(mismatched.review.sourceBranch, undefined);
+  assert.equal((await taskGit.readMeta(reviewId)).review.sourceBranch, undefined);
+
+  // The recorded dispatch evidence names the same exact commit and base, so the missing provenance is completed and kept.
+  const checked = await taskGit.checkFinish(reviewId, {
+    review: { sourceTaskId: sourceId, commit, baseSha: repo.baseSha, branch: `task/${sourceId}`, handoff: repo.remote },
+  });
+  assert.equal(checked.review.commit, commit);
+  assert.equal(checked.review.sourceBranch, `task/${sourceId}`);
+  assert.equal(checked.review.sourceHandoff, repo.remote);
+  const persisted = JSON.parse(await readFile(metaPath, 'utf8'));
+  assert.equal(persisted.review.sourceBranch, `task/${sourceId}`);
+  assert.equal(persisted.review.commit, commit);
+  assert.equal(await git(prepared.path, 'rev-parse', 'HEAD'), commit, 'the checkout never moved');
 });

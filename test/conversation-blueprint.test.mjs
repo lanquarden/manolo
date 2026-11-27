@@ -113,3 +113,73 @@ test('the conversation Blueprint is reapplied each turn, retries keep the old se
   await closed;
   assert.doesNotMatch(log, /Unhandled|AssertionError|startup failed/);
 });
+
+test('removing the whole conversation Blueprint restores the worker default model and reasoning level', { timeout: 60_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-conversation-removal-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'CONVERSATION.md'), 'CONVERSATION-MARKER\n');
+  const manifest = {
+    version: 1,
+    profiles: { conv: { description: 'Conversation profile', model: 'fixture-conv', thinkingLevel: 'low' } },
+    blueprints: {
+      main: { description: 'Main conversation', role: 'conversation', profile: 'conv', files: ['CONVERSATION.md'] },
+      general: { description: 'Generic Task', role: 'task', files: ['CONVERSATION.md'], tools: ['report_progress', 'post_inbox', 'finish'] },
+    },
+  };
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  const child = spawn(process.execPath, ['src/worker.mjs'], {
+    cwd, stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      PATH: process.env.PATH, MANOLO_AGENT_ID: 'canary', MANOLO_AGENT_TOKEN: token,
+      MANOLO_DATA_DIR: join(root, 'data'), MANOLO_MODE: 'fixture', MANOLO_THINKING_LEVEL: 'high',
+      MANOLO_BLUEPRINTS_DIR: bundles, PORT: '0',
+    },
+  });
+  let log = '';
+  child.stdout.on('data', chunk => { log += chunk; });
+  child.stderr.on('data', chunk => { log += chunk; });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  const closed = once(child, 'exit');
+  const port = await until(() => {
+    assert.equal(child.exitCode, null, log);
+    return Number(/worker listening on (\d+)/.exec(log)?.[1]) || null;
+  }, 'worker listener');
+  const url = `http://127.0.0.1:${port}`;
+  const put = async (sessionId, id, text) => {
+    const response = await fetch(`${url}/v1/turns/${id}`, {
+      method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, text }), signal: AbortSignal.timeout(5000),
+    });
+    assert.ok([200, 202].includes(response.status), await response.clone().text());
+  };
+  const model = async id => {
+    const body = await until(async () => {
+      const response = await fetch(`${url}/v1/turns/${id}`, { headers: { authorization: `Bearer ${token}` } });
+      const value = await response.json();
+      return value.status === 'done' && value;
+    }, `turn ${id}`);
+    return JSON.parse(body.text);
+  };
+
+  await put('session', 'blueprint', 'fixture:model');
+  assert.deepEqual(await model('blueprint'), { model: 'fixture-conv', reasoning: 'low' });
+
+  // The whole conversation Blueprint is removed while its manifest stays valid. The admitted selection does not linger:
+  // the conversation returns to this worker's own defaults, not to "no reasoning level".
+  delete manifest.blueprints.main;
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify(manifest));
+  await put('session', 'removed', 'fixture:model');
+  assert.deepEqual(await model('removed'), { model: 'fixture', reasoning: 'high' });
+  // A fresh chat in the same state sees the same worker defaults.
+  await put('fresh', 'fresh', 'fixture:model');
+  assert.deepEqual(await model('fresh'), { model: 'fixture', reasoning: 'high' });
+  // A retry of the already admitted turn keeps the selection it was admitted with.
+  await put('session', 'blueprint', 'fixture:model');
+  assert.deepEqual(await model('blueprint'), { model: 'fixture-conv', reasoning: 'low' });
+
+  child.kill('SIGKILL');
+  await closed;
+  assert.doesNotMatch(log, /Unhandled|AssertionError|startup failed/);
+});

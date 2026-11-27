@@ -26,6 +26,9 @@ async function proxyCatalog(url, apiKey) {
   }
 }
 
+// A pinned Task profile is validated against the trusted catalog, which is bounded like every other inventory here.
+const MAX_PROXY_CATALOG = 128;
+
 // Explicit API-key providers only. No OAuth, CLI credential stores, cloud profiles, or token files.
 const PROVIDERS = new Map(Object.entries({
   anthropic: ['anthropicProvider', 'ANTHROPIC_API_KEY'],
@@ -133,7 +136,14 @@ export async function createWorkerModels(cfg, env, profileModelIds = []) {
       };
     }
     models.setProvider(provider);
-    return { models, model: { provider: provider.id, modelId: 'fixture' } };
+    // The fixture honors the configured default reasoning level, so a test can tell the worker default apart from a
+    // Blueprint's profile. An unsupported level fails startup like a real provider would.
+    const thinkingLevel = env.MANOLO_THINKING_LEVEL || undefined;
+    const catalogModel = models.getModel(provider.id, 'fixture');
+    if (thinkingLevel && (!catalogModel || !getSupportedThinkingLevels(catalogModel).includes(thinkingLevel))) {
+      throw new Error('Unsupported thinking level');
+    }
+    return { models, model: { provider: provider.id, modelId: 'fixture' }, ...(thinkingLevel && { thinkingLevel }) };
   }
   const providerId = env.MANOLO_PROVIDER;
   const modelId = env.MANOLO_MODEL;
@@ -180,7 +190,14 @@ async function createProxyModels(modelId, env, profileModelIds = []) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: true },
   });
-  const catalogIds = [...new Set([modelId, ...(listed ? profileModelIds.filter(id => listed.has(id)) : [])])];
+  // The proxy's own list is the authorized runtime catalog. A Task that pinned an exact served alias keeps resolving it
+  // after the manifest profile that introduced it is edited or removed, because the values are validated against what the
+  // trusted upstream actually serves, not against today's role aliases. Discovery stays restricted to the profiles the
+  // current manifest declares (`resolveProfiles`), so widening the catalog never advertises an unconfigured role.
+  const served = listed
+    ? [...listed].filter(id => /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(id)).sort().slice(0, MAX_PROXY_CATALOG)
+    : [];
+  const catalogIds = [...new Set([modelId, ...served, ...(listed ? profileModelIds.filter(id => listed.has(id)) : [])])];
   const catalogModels = catalogIds.map(catalogModelFor);
   if (thinkingLevel && !getSupportedThinkingLevels(catalogModels[0]).includes(thinkingLevel)) throw new Error('Unsupported proxy thinking level');
   // Reuse only the Chat Completions transport, never OpenRouter's URL, catalog or OAuth resolver.

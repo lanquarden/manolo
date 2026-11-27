@@ -287,3 +287,136 @@ test('Blueprint snapshots pin profiles and tools; model/reasoning reach the requ
   await worker.end();
   assert.doesNotMatch(worker.log(), /Task request failed|Unhandled|AssertionError/);
 });
+
+test('a workspace lost after the Inbox answer reached the child resumes the same execution, never an empty resume', { timeout: 120_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'manolo-task-post-answer-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const remote = await seedRemote(root);
+  const bundles = join(root, 'bundles');
+  await mkdir(bundles, { recursive: true });
+  await writeFile(join(bundles, 'IDENTITY.md'), 'You are a Task agent for this repository.\n');
+  await writeFile(join(bundles, 'manifest.json'), JSON.stringify({
+    version: 1,
+    repositories: { sample: { remote, base: 'main', handoff: remote } },
+    blueprints: {
+      repo: { description: 'Repository Task', role: 'task', repository: 'sample', files: ['IDENTITY.md'],
+        tools: ['bash', 'read', 'write', 'edit', 'finish', 'post_inbox', 'report_progress'] },
+    },
+  }));
+
+  const token = secret();
+  const password = secret();
+  const workerData = join(root, 'worker');
+  const relayData = join(root, 'relay');
+  const configPath = join(root, 'relay.json');
+  let internal = 'http://127.0.0.1:1';
+  const proxy = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    try {
+      const response = await fetch(internal + req.url, {
+        method: req.method,
+        headers: Object.fromEntries(Object.entries(req.headers)
+          .filter(([name]) => ['authorization', 'content-type', 'idempotency-key'].includes(name))),
+        body: Buffer.concat(chunks),
+      });
+      res.writeHead(response.status, { 'content-type': 'application/json' });
+      res.end(await response.text());
+    } catch {
+      res.writeHead(503).end();
+    }
+  }).listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => proxy.close());
+
+  // The delay gives the test the window a real child has: the answer is already delivered, the turn has not ended yet.
+  const worker = start(t, 'worker', {
+    MANOLO_AGENT_ID: 'canary', MANOLO_AGENT_TOKEN: token, MANOLO_DATA_DIR: workerData,
+    MANOLO_MODE: 'fixture', MANOLO_CODING_TOOLS: '1', MANOLO_FIXTURE_TOOLS: '1', MANOLO_FIXTURE_DELAY_MS: '1200', PORT: '0',
+    MANOLO_BLUEPRINTS_DIR: bundles, MANOLO_RELAY_URL: addr(proxy.address().port),
+  });
+  const workerUrl = addr(await worker.port(/worker listening on (\d+)/));
+  await writeFile(configPath, JSON.stringify({
+    agents: { canary: { url: workerUrl, tokenEnv: 'CANARY_TOKEN' } },
+    owners: { owner: { agent: 'canary', passwordEnv: 'OWNER_PASSWORD' } }, routes: [], inbox: [],
+  }));
+  const relay = start(t, 'relay', {
+    CANARY_TOKEN: token, OWNER_PASSWORD: password, MANOLO_RELAY_CONFIG: configPath,
+    MANOLO_DATA_DIR: relayData, MANOLO_WORK_SESSION_AGENT: 'canary', PORT: '0', MANOLO_INTERNAL_PORT: '0',
+  });
+  const web = addr(await relay.port(/web listening on .*:(\d+)/));
+  internal = addr(await relay.port(/internal listening on .*:(\d+)/));
+  const auth = basic('owner', password);
+  const tasksOf = async () => {
+    const response = await request(web, '/api/tasks', auth);
+    assert.equal(response.status, 200, await response.clone().text());
+    const payload = await response.json();
+    return [...payload.active, ...payload.history];
+  };
+  const detailOf = async id => (await (await request(web, `/api/tasks/${id}`, auth)).json()).task;
+  const ledger = () => {
+    const db = new DatabaseSync(join(relayData, 'relay.sqlite'), { readOnly: true });
+    try { return db.prepare('SELECT id, status, execution_id, execution_kind, resume_item_id, blocked_reason, failure FROM tasks').all(); }
+    finally { db.close(); }
+  };
+
+  assert.equal((await request(web, '/api/turns', auth, 'POST', {
+    id: 'post-answer', text: fixtureTool('create_task', {
+      title: 'Post-answer loss', task: fixtureTool('post_inbox', { kind: 'question', prompt: 'Proceed?' }), blueprint: 'repo',
+    }),
+  }, mutation)).status, 200);
+  const waiting = await until(async () => (await tasksOf()).find(row => row.title === 'Post-answer loss' && row.status === 'waiting'), 'repository Task waits in Inbox');
+  const item = (await (await request(web, '/api/inbox', auth)).json()).taskItems.find(entry => entry.taskId === waiting.id);
+  const firstExecution = ledger().find(row => row.id === waiting.id).execution_id;
+  assert.match(firstExecution, /^[0-9a-f]{32}$/);
+
+  // The owner answers. Once the response has reached the parked call, the workspace is invalidated while that same
+  // execution is still live.
+  assert.equal((await request(web, `/api/tasks/${waiting.id}/inbox/${item.id}/respond`, auth, 'POST', { answer: 'Yes' }, mutation)).status, 200);
+  const delivered = await until(async () => {
+    const task = await detailOf(waiting.id);
+    return task.items[0]?.deliveredAt && task;
+  }, 'the Inbox answer reaches the child');
+  assert.equal(delivered.status, 'running');
+  const path = join(workerData, 'task-worktrees', waiting.id);
+  await rename(path, `${path}.lost`);
+  const blocked = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === waiting.id);
+    return row?.blocked && row;
+  }, 'the lost workspace blocks after delivery');
+  assert.equal(blocked.status, 'running');
+  assert.match(blocked.blocked, /worktree|workspace/i);
+  const blockedRow = ledger().find(row => row.id === waiting.id);
+  assert.equal(blockedRow.execution_id, firstExecution, 'the block keeps the delivery execution');
+  assert.equal(blockedRow.execution_kind, 'start', 'a delivered answer leaves no resume obligation behind');
+  assert.equal(blockedRow.resume_item_id, null);
+  // Wait for the worker to record its own blocked state too, so the recovery below cannot race its watcher teardown.
+  await until(async () => {
+    const response = await fetch(`${workerUrl}/v1/tasks/${waiting.id}/transcript`, { headers: { authorization: `Bearer ${token}` } });
+    const body = await response.json();
+    return body.state === 'blocked' && body;
+  }, 'the worker records the blocked execution');
+
+  // Restoring the exact recorded path continues the same Task and execution; it is never an empty resume and never fails.
+  await rename(`${path}.lost`, path);
+  const relayDb = new DatabaseSync(join(relayData, 'relay.sqlite'));
+  relayDb.prepare('UPDATE tasks SET next_at=0 WHERE id=?').run(waiting.id);
+  relayDb.close();
+  const recovered = await until(async () => {
+    const row = (await tasksOf()).find(entry => entry.id === waiting.id);
+    return row?.status === 'done' && row;
+  }, 'the restored workspace resumes the same execution');
+  assert.equal(recovered.id, waiting.id);
+  assert.equal(recovered.failure, undefined);
+  assert.equal(recovered.blocked, undefined);
+  const finalRow = ledger().find(row => row.id === waiting.id);
+  assert.equal(finalRow.execution_id, firstExecution, 'the answer was never delivered to a replacement execution');
+  assert.equal(finalRow.failure, null);
+  const finalDetail = await detailOf(waiting.id);
+  assert.ok(finalDetail.items[0].deliveredAt, 'the answer stays recorded as delivered');
+  assert.equal(finalDetail.items.length, 1, 'the answer was not delivered again');
+
+  await relay.end();
+  await worker.end();
+  assert.doesNotMatch(worker.log(), /Task request failed|Unhandled|AssertionError/);
+});
